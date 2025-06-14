@@ -8,10 +8,7 @@ from .models import LinearQNet
 from .trainer import QTrainer
 from src.game.constants import Direction, Point
 from src.game.snake_game import SnakeGameAI
-from src.config.settings import (
-    MAX_MEMORY, BATCH_SIZE, LEARNING_RATE, GAMMA, EPSILON_DECAY,
-    INPUT_SIZE, HIDDEN_SIZE, OUTPUT_SIZE, BLOCK_SIZE, MODEL_DIR
-)
+from src.config.settings import *
 from src.utils.helpers import (
     get_next_model_version, save_model_metadata,
     get_best_model_info, get_latest_model_info
@@ -26,6 +23,7 @@ class Agent:
         self.memory = deque(maxlen=MAX_MEMORY)
         self.current_version = None
         self.loaded_metadata = None
+        self.previous_distances = deque(maxlen=4)  # Track last 4 distances to food
 
         self.model = LinearQNet(INPUT_SIZE, HIDDEN_SIZE, OUTPUT_SIZE)
         self.trainer = QTrainer(self.model, learning_rate=LEARNING_RATE, gamma=self.gamma)
@@ -72,6 +70,38 @@ class Agent:
 
         return np.array(state, dtype=int)
 
+    def get_distance_to_food(self, game: SnakeGameAI) -> float:
+        return abs(game.head.x - game.food.x) + abs(game.head.y - game.food.y)
+
+    def calculate_reward(self, game: SnakeGameAI, done: bool, score: int, old_score: int) -> int:
+        reward = 0
+
+        if done:
+            if game.is_collision():
+                reward = COLLISION_PENALTY
+            else:  # Timeout
+                reward = LOOP_PENALTY
+        elif score > old_score:  # Ate food
+            reward = 10
+        else:
+            # Distance-based reward
+            current_distance = self.get_distance_to_food(game)
+            self.previous_distances.append(current_distance)
+
+            if len(self.previous_distances) >= 2:
+                if current_distance < self.previous_distances[-2]:
+                    reward = CLOSER_TO_FOOD_REWARD
+                elif current_distance > self.previous_distances[-2]:
+                    reward = FARTHER_FROM_FOOD_PENALTY
+
+            # Penalty for loops (same position repeated)
+            if len(self.previous_distances) >= 4:
+                if (self.previous_distances[-1] == self.previous_distances[-3] and
+                        self.previous_distances[-2] == self.previous_distances[-4]):
+                    reward = LOOP_PENALTY
+
+        return reward
+
     def remember(self, state: np.ndarray, action: List[int], reward: int,
                  next_state: np.ndarray, done: bool) -> None:
         self.memory.append((state, action, reward, next_state, done))
@@ -90,7 +120,8 @@ class Agent:
         self.trainer.train_step(state, action, reward, next_state, done)
 
     def get_action(self, state: np.ndarray) -> List[int]:
-        self.epsilon = EPSILON_DECAY - self.n_games
+        # Improved epsilon decay
+        self.epsilon = max(EPSILON_MIN, EPSILON_DECAY - self.n_games)
         final_move = [0, 0, 0]
 
         if random.randint(0, 200) < self.epsilon:
