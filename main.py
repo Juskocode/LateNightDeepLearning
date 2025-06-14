@@ -26,17 +26,22 @@ def main():
     try:
         while True:
             state_old = agent.get_state(game)
+            old_score = game.score
             action = agent.get_action(state_old)
             reward, done, score = game.play_step(action)
             state_new = agent.get_state(game)
 
-            agent.train_short_memory(state_old, action, reward, state_new, done)
-            agent.remember(state_old, action, reward, state_new, done)
+            # Use improved reward calculation
+            improved_reward = agent.calculate_reward(game, done, score, old_score)
+
+            agent.train_short_memory(state_old, action, improved_reward, state_new, done)
+            agent.remember(state_old, action, improved_reward, state_new, done)
 
             if done:
                 game.reset()
                 agent.n_games += 1
                 agent.train_long_memory()
+                agent.previous_distances.clear()  # Reset distance tracking
 
                 if score > record:
                     record = score
