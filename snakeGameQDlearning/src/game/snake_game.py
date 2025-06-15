@@ -4,9 +4,9 @@ import numpy as np
 from typing import Tuple, List, Optional
 
 from .constants import Direction, Point, FOOD_REWARD, COLLISION_PENALTY, FRAME_TIMEOUT_MULTIPLIER
-from src.config.settings import (
+from snakeGameQDlearning.src.config.settings import (
     GAME_WIDTH, GAME_HEIGHT, BLOCK_SIZE, GAME_SPEED,
-    WHITE, RED, BLUE1, BLUE2, BLACK, FONT_PATH
+    WHITE, RED, BLUE1, BLUE2, BLACK, FONT_PATH, BLUE3
 )
 
 pygame.init()
@@ -111,13 +111,20 @@ class SnakeGameAI:
 
     def _update_ui(self) -> None:
         self.display.fill(BLACK)
-
+        i = 0
         # Draw snake
         for pt in self.snake:
-            pygame.draw.rect(self.display, BLUE1,
-                             pygame.Rect(pt.x, pt.y, BLOCK_SIZE, BLOCK_SIZE))
-            pygame.draw.rect(self.display, BLUE2,
-                             pygame.Rect(pt.x + 4, pt.y + 4, 12, 12))
+            if i == 0:
+                pygame.draw.rect(self.display, BLUE3,
+                                 pygame.Rect(pt.x, pt.y, BLOCK_SIZE, BLOCK_SIZE))
+                pygame.draw.rect(self.display, BLUE2,
+                                 pygame.Rect(pt.x + 4, pt.y + 4, 12, 12))
+            else:
+                pygame.draw.rect(self.display, BLUE1,
+                                 pygame.Rect(pt.x, pt.y, BLOCK_SIZE, BLOCK_SIZE))
+                pygame.draw.rect(self.display, BLUE2,
+                                 pygame.Rect(pt.x + 4, pt.y + 4, 12, 12))
+            i += 1
 
         # Draw food
         pygame.draw.rect(self.display, RED,
