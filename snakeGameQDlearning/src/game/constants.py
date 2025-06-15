@@ -1,6 +1,3 @@
-
-"""Game-specific constants and enums."""
-
 from enum import Enum
 from collections import namedtuple
 
