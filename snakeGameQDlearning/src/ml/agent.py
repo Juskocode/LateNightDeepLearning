@@ -2,15 +2,15 @@ import torch
 import random
 import numpy as np
 from collections import deque
-from typing import List, Tuple, Optional
+from typing import List
 
 from .models import LinearQNet
 from .trainer import QTrainer
-from src.game.constants import Direction, Point
-from src.game.snake_game import SnakeGameAI
-from src.config.settings import *
-from src.utils.helpers import (
-    get_next_model_version, save_model_metadata,
+from snakeGameQDlearning.src.game.constants import Direction, Point
+from snakeGameQDlearning.src.game.snake_game import SnakeGameAI
+from snakeGameQDlearning.src.config.settings import *
+from snakeGameQDlearning.src.utils.helpers import (
+    get_next_model_version, save_model_metadata, update_model_metadata,
     get_best_model_info, get_latest_model_info
 )
 
@@ -23,7 +23,7 @@ class Agent:
         self.memory = deque(maxlen=MAX_MEMORY)
         self.current_version = None
         self.loaded_metadata = None
-        self.previous_distances = deque(maxlen=4)  # Track last 4 distances to food
+        self.previous_distances = deque(maxlen=4)
 
         self.model = LinearQNet(INPUT_SIZE, HIDDEN_SIZE, OUTPUT_SIZE)
         self.trainer = QTrainer(self.model, learning_rate=LEARNING_RATE, gamma=self.gamma)
@@ -79,12 +79,11 @@ class Agent:
         if done:
             if game.is_collision():
                 reward = COLLISION_PENALTY
-            else:  # Timeout
+            else:
                 reward = LOOP_PENALTY
-        elif score > old_score:  # Ate food
+        elif score > old_score:
             reward = 10
         else:
-            # Distance-based reward
             current_distance = self.get_distance_to_food(game)
             self.previous_distances.append(current_distance)
 
@@ -94,7 +93,6 @@ class Agent:
                 elif current_distance > self.previous_distances[-2]:
                     reward = FARTHER_FROM_FOOD_PENALTY
 
-            # Penalty for loops (same position repeated)
             if len(self.previous_distances) >= 4:
                 if (self.previous_distances[-1] == self.previous_distances[-3] and
                         self.previous_distances[-2] == self.previous_distances[-4]):
@@ -120,7 +118,6 @@ class Agent:
         self.trainer.train_step(state, action, reward, next_state, done)
 
     def get_action(self, state: np.ndarray) -> List[int]:
-        # Improved epsilon decay
         self.epsilon = max(EPSILON_MIN, EPSILON_DECAY - self.n_games)
         final_move = [0, 0, 0]
 
@@ -135,14 +132,19 @@ class Agent:
 
         return final_move
 
-    def save_model(self, score: int) -> None:
-        if self.current_version is None:
-            self.current_version = get_next_model_version(MODEL_DIR)
-
+    def save_model_new_record(self, best_score: int, mean_score: float) -> None:
+        """Save model with new version for new record"""
+        self.current_version = get_next_model_version(MODEL_DIR)
         filename = f"model_v{self.current_version:03d}.pth"
         self.model.save(filename)
-        save_model_metadata(MODEL_DIR, self.current_version, score, self.n_games)
-        print(f"Model saved as version {self.current_version} with score {score}")
+        save_model_metadata(MODEL_DIR, self.current_version, best_score, mean_score, self.n_games)
+        print(f"New record! Model saved as version {self.current_version} with score {best_score}")
+
+    def update_model_mean_score(self, mean_score: float) -> None:
+        """Update only mean_score in existing model metadata"""
+        if self.current_version is not None:
+            update_model_metadata(MODEL_DIR, self.current_version, mean_score, self.n_games)
+            print(f"Updated model v{self.current_version} mean score to {mean_score:.2f}")
 
     def load_best_model(self) -> bool:
         model_info = get_best_model_info(MODEL_DIR)
@@ -151,9 +153,11 @@ class Agent:
             try:
                 self.model.load(model_file)
                 self.loaded_metadata = metadata
+                self.current_version = metadata.get('version')
                 print(f"Loaded best model: {model_file}")
                 print(f"  - Version: {metadata['version']}")
                 print(f"  - Best Score: {metadata['best_score']}")
+                print(f"  - Mean Score: {metadata.get('mean_score', 'N/A')}")
                 print(f"  - Games Played: {metadata['games_played']}")
                 return True
             except Exception as e:
@@ -168,9 +172,11 @@ class Agent:
             try:
                 self.model.load(model_file)
                 self.loaded_metadata = metadata
+                self.current_version = metadata.get('version')
                 print(f"Loaded latest model: {model_file}")
                 print(f"  - Version: {metadata['version']}")
                 print(f"  - Best Score: {metadata['best_score']}")
+                print(f"  - Mean Score: {metadata.get('mean_score', 'N/A')}")
                 print(f"  - Games Played: {metadata['games_played']}")
                 return True
             except Exception as e:
@@ -182,3 +188,8 @@ class Agent:
         if self.loaded_metadata:
             return self.loaded_metadata.get('best_score', 0)
         return 0
+
+    def get_loaded_mean_score(self) -> float:
+        if self.loaded_metadata:
+            return self.loaded_metadata.get('mean_score', 0.0)
+        return 0.0
