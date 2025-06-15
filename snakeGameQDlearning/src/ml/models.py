@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 from typing import Optional
 
-from src.config.settings import MODEL_DIR
+from snakeGameQDlearning.src.config.settings import MODEL_DIR
 
 
 class LinearQNet(nn.Module):

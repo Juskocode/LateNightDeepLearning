@@ -57,15 +57,41 @@ def get_next_model_version(model_dir: str) -> int:
     return max(versions) + 1 if versions else 1
 
 
-def save_model_metadata(model_dir: str, version: int, score: int, games: int) -> None:
+def save_model_metadata(model_dir: str, version: int, best_score: int, mean_score: float, games: int) -> None:
     metadata_file = os.path.join(model_dir, f"model_v{version:03d}_metadata.json")
     metadata = {
         'version': version,
-        'best_score': score,
+        'best_score': best_score,
+        'mean_score': mean_score,
         'games_played': games,
         'timestamp': time.time(),
         'model_file': f"model_v{version:03d}.pth"
     }
+
+    with open(metadata_file, 'w') as f:
+        json.dump(metadata, f, indent=2)
+
+
+def update_model_metadata(model_dir: str, version: int, mean_score: float, games: int) -> None:
+    """Update only mean_score and games_played, keep best_score unchanged"""
+    metadata_file = os.path.join(model_dir, f"model_v{version:03d}_metadata.json")
+
+    # Read existing metadata
+    try:
+        with open(metadata_file, 'r') as f:
+            metadata = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        # If file doesn't exist, create with minimal data
+        metadata = {
+            'version': version,
+            'best_score': 0,
+            'model_file': f"model_v{version:03d}.pth"
+        }
+
+    # Update only specific fields
+    metadata['mean_score'] = mean_score
+    metadata['games_played'] = games
+    metadata['timestamp'] = time.time()
 
     with open(metadata_file, 'w') as f:
         json.dump(metadata, f, indent=2)
