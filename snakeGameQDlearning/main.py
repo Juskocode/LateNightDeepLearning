@@ -2,7 +2,6 @@ from snakeGameQDlearning.src.ml.agent import Agent
 from snakeGameQDlearning.src.game import SnakeGameAI
 from snakeGameQDlearning.src.utils import plot_training_progress
 
-
 def main():
     print("Starting Snake AI Training...")
 
