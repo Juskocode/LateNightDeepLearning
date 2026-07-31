@@ -76,6 +76,9 @@ Useful run modes:
 # Visual training; automatically resumes the matching checkpoint
 python -m pacManRf.main --rl --algorithm double_dqn
 
+# Start at the slowest visual preset
+python -m pacManRf.main --rl --speed 1
+
 # Train 100 episodes without opening a window
 python -m pacManRf.main --rl --headless --games 100
 
@@ -97,10 +100,17 @@ Visual controls:
 | `Tab` or a tab click | Cycle or select views |
 | `Space` | Pause or resume training |
 | `N` or `.` | Advance one decision while paused |
-| `[` / `]` | Halve or double decisions per second |
+| `[` / `]` or `-` / `+` | Select the previous or next speed preset |
+| `1`–`7` | Jump directly from SLOW to MAX |
+| `Home` / `End` | Jump to SLOW or MAX |
+| Click the speed scale | Select any preset with the mouse |
 | `R` | Reset the current episode |
 | `S` | Save a checkpoint immediately |
 | `Esc` | Save and quit |
+
+The seven visual presets are **1, 5, 15, 30, 60, 120, and 240 decisions per second**. The header shows the current label, target rate, and position on the clickable SLOW-to-MAX scale. `--speed` accepts any starting value in that range; the next speed key moves to the adjacent preset.
+
+Rendering remains responsive at 60 FPS independently of the selected training rate. Slow presets wait between agent decisions without freezing input, while faster presets can process several decisions per rendered frame. Delayed frames use a bounded catch-up budget so the interface cannot enter an update spiral.
 
 ### What the Pacman agent sees
 

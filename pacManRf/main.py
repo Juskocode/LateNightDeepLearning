@@ -15,7 +15,12 @@ def parse_args():
     parser.add_argument("--headless", action="store_true", help="Train without opening a window")
     parser.add_argument("--games", type=int, default=0, help="Headless episodes; 0 runs continuously")
     parser.add_argument("--steps", type=int, help="Optional maximum headless decisions")
-    parser.add_argument("--speed", type=int, default=30, help="Visual decisions per second")
+    parser.add_argument(
+        "--speed",
+        type=int,
+        default=30,
+        help="Initial visual speed from 1 to 240 decisions/s; use 1-7 or [ ] at runtime",
+    )
     parser.add_argument(
         "--tab",
         choices=("game", "vision", "metrics", "network"),
@@ -73,12 +78,22 @@ def _run_rl(args) -> None:
         )
     )
     if args.gif:
-        output = capture_observatory_gif(session, args.gif, frames=args.gif_frames)
+        output = capture_observatory_gif(
+            session,
+            args.gif,
+            frames=args.gif_frames,
+            speed=args.speed,
+        )
         print(f"Saved Pacman RL GIF to {output}")
         session.close()
         return
     if args.screenshot:
-        output = capture_observatory_png(session, args.screenshot, tab=args.tab)
+        output = capture_observatory_png(
+            session,
+            args.screenshot,
+            tab=args.tab,
+            speed=args.speed,
+        )
         print(f"Saved Pacman RL screenshot to {output}")
         session.close()
         return

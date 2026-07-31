@@ -35,6 +35,7 @@ class ObservatoryLayout:
     header: pygame.Rect
     content: pygame.Rect
     tabs: Mapping[ObservatoryTab, pygame.Rect]
+    speed_presets: tuple[pygame.Rect, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -65,6 +66,10 @@ class PacmanObservatory:
     set ``weight_layout="in_out"`` when the matrices use the opposite layout.
     Missing fields are rendered as explicit empty states, never as synthetic
     zeroes or fabricated history.
+
+    When speed telemetry is supplied, the header exposes preset hitboxes in
+    :class:`ObservatoryLayout`; hosts can route a click with
+    :meth:`speed_preset_at` while retaining ownership of the runtime rate.
     """
 
     MIN_WIDTH = 620
@@ -100,6 +105,16 @@ class PacmanObservatory:
         """Select a tab by enum or case-insensitive name."""
 
         self.active_tab = self._coerce_tab(tab)
+
+    def speed_preset_at(self, position: tuple[int, int]) -> Optional[int]:
+        """Return the clicked speed-preset index from the latest layout."""
+
+        if self._layout is None:
+            return None
+        for index, rect in enumerate(self._layout.speed_presets):
+            if rect.collidepoint(position):
+                return index
+        return None
 
     def handle_event(self, event: pygame.event.Event) -> bool:
         """Handle observatory navigation and report whether it was consumed."""
@@ -164,8 +179,8 @@ class PacmanObservatory:
             max(0, bounds.width - self.PADDING * 2),
             max(0, bounds.height - header.bottom - self.PADDING * 2),
         )
-        tab_rects = self._draw_header(surface, header, data)
-        self._layout = ObservatoryLayout(header, content, tab_rects)
+        tab_rects, speed_rects = self._draw_header(surface, header, data)
+        self._layout = ObservatoryLayout(header, content, tab_rects, speed_rects)
 
         if bounds.width < self.MIN_WIDTH or bounds.height < self.MIN_HEIGHT:
             self._empty_state(
@@ -212,11 +227,11 @@ class PacmanObservatory:
         surface: pygame.Surface,
         rect: pygame.Rect,
         telemetry: Mapping[str, Any],
-    ) -> dict[ObservatoryTab, pygame.Rect]:
+    ) -> tuple[dict[ObservatoryTab, pygame.Rect], tuple[pygame.Rect, ...]]:
         pygame.draw.rect(surface, self.theme.header, rect)
         pygame.draw.line(surface, self.theme.grid, rect.bottomleft, rect.bottomright, 1)
 
-        compact = rect.width < 880
+        compact = rect.width < 980
         title = "PACMAN / DQN" if compact else "PACMAN / DQN OBSERVATORY"
         self._text(surface, title, (self.PADDING, 13), self.theme.text, 17, bold=True)
         algorithm = _first(telemetry, "algorithm", "agent", "mode")
@@ -257,10 +272,68 @@ class PacmanObservatory:
             surface.blit(label, label.get_rect(center=tab_rect.center))
             tab_rects[tab] = tab_rect
 
-        shortcut = self._font(9).render("F1   F2   F3   F4", True, self.theme.muted)
-        if rect.width - shortcut.get_width() - self.PADDING > start_x + total_width:
-            surface.blit(shortcut, (rect.width - shortcut.get_width() - self.PADDING, 28))
-        return tab_rects
+        status_rect = pygame.Rect(
+            start_x + total_width + 12,
+            0,
+            max(0, rect.right - self.PADDING - start_x - total_width - 12),
+            rect.height,
+        )
+        speed_rects: tuple[pygame.Rect, ...] = ()
+        if status_rect.width >= 105:
+            speed_rects = self._draw_speed_status(surface, status_rect, telemetry)
+        return tab_rects, speed_rects
+
+    def _draw_speed_status(
+        self,
+        surface: pygame.Surface,
+        rect: pygame.Rect,
+        telemetry: Mapping[str, Any],
+    ) -> tuple[pygame.Rect, ...]:
+        hint = "[ ]  1-7  CLICK TO SET SPEED" if rect.width >= 205 else "[ ]  1-7 SPEED"
+        hint_image = self._font(8).render(hint, True, self.theme.muted)
+        surface.blit(hint_image, (rect.right - hint_image.get_width(), 8))
+
+        speed = _number(_first(telemetry, "decisions_per_second", "speed"))
+        if speed is None:
+            return ()
+        raw_label = _first(telemetry, "speed_label", "speed_mode")
+        label = "CUSTOM" if raw_label in (_MISSING, None) else str(raw_label).upper()
+        value_text = f"{label}  ·  target {int(speed)}/s"
+        value_color = self.theme.yellow if label == "MAX" else self.theme.cyan
+        value_image = self._font(10, bold=True).render(value_text, True, value_color)
+        surface.blit(value_image, (rect.right - value_image.get_width(), 27))
+
+        count = _number(_first(telemetry, "speed_preset_count"))
+        active = _number(_first(telemetry, "speed_preset_index"))
+        if rect.width < 155 or count is None or active is None or count < 2:
+            return ()
+        preset_count = max(2, int(count))
+        active_index = max(0, min(preset_count - 1, int(active)))
+        gap = 3
+        slow_image = self._font(7, bold=True).render("SLOW", True, self.theme.muted)
+        max_image = self._font(7, bold=True).render("MAX", True, self.theme.muted)
+        available_track = rect.width - slow_image.get_width() - max_image.get_width() - 18
+        track_width = min(142, max(82, available_track))
+        segment_width = max(3, (track_width - gap * (preset_count - 1)) // preset_count)
+        actual_width = segment_width * preset_count + gap * (preset_count - 1)
+        total_width = slow_image.get_width() + actual_width + max_image.get_width() + 12
+        label_x = rect.right - total_width
+        start_x = label_x + slow_image.get_width() + 6
+        surface.blit(slow_image, (label_x, 50))
+        surface.blit(max_image, (start_x + actual_width + 6, 50))
+        hitboxes: list[pygame.Rect] = []
+        for index in range(preset_count):
+            segment = pygame.Rect(start_x + index * (segment_width + gap), 51, segment_width, 6)
+            hitboxes.append(
+                pygame.Rect(segment.x, segment.y - 5, segment.width, segment.height + 10)
+            )
+            color = self.theme.grid
+            if index < active_index:
+                color = self.theme.blue
+            elif index == active_index:
+                color = value_color
+            pygame.draw.rect(surface, color, segment, border_radius=3)
+        return tuple(hitboxes)
 
     def _draw_game_tab(
         self,

@@ -14,7 +14,14 @@ from pacManRf.src.game.pacman_env import ACTION_LABELS, OBSERVATION_LABELS, Pacm
 from pacManRf.src.ml import DQNConfig, PacmanDQNAgent, PacmanQNetwork
 from pacManRf.src.ml.trainer import DQNTrainer
 from pacManRf.src.observatory_capture import capture_observatory_gif
-from pacManRf.src.rl_session import PacmanRLSession, SessionConfig, WINDOW_SIZE
+from pacManRf.src.rl_session import (
+    SPEED_PRESETS,
+    DecisionScheduler,
+    PacmanRLSession,
+    SessionConfig,
+    SpeedController,
+    WINDOW_SIZE,
+)
 from pacManRf.src.visualization import PacmanObservatory
 
 
@@ -187,6 +194,54 @@ class PacmanLearningTests(unittest.TestCase):
         session.close()
 
 
+class PacmanSpeedControlTests(unittest.TestCase):
+    def test_presets_cover_slow_through_max(self):
+        self.assertEqual(SPEED_PRESETS[0], ("SLOW", 1))
+        self.assertEqual(SPEED_PRESETS[-1], ("MAX", 240))
+        values = [value for _, value in SPEED_PRESETS]
+        self.assertEqual(values, sorted(values))
+
+    def test_speed_steps_and_direct_keys_are_bounded(self):
+        controller = SpeedController(30)
+        self.assertEqual((controller.label, controller.value), ("FAST", 30))
+
+        controller.handle_key(pygame.K_LEFTBRACKET)
+        self.assertEqual((controller.label, controller.value), ("NORMAL", 15))
+        controller.handle_key(pygame.K_RIGHTBRACKET)
+        self.assertEqual(controller.value, 30)
+        controller.handle_key(pygame.K_1)
+        self.assertEqual(controller.value, 1)
+        controller.handle_key(pygame.K_7)
+        self.assertEqual(controller.value, 240)
+        controller.step(1)
+        self.assertEqual(controller.value, 240)
+        controller.handle_key(pygame.K_HOME)
+        self.assertEqual(controller.value, 1)
+        controller.handle_key(pygame.K_END)
+        self.assertEqual(controller.value, 240)
+        self.assertFalse(controller.handle_key(pygame.K_a))
+
+    def test_custom_speed_moves_to_adjacent_preset(self):
+        slower = SpeedController(42)
+        faster = SpeedController(42)
+        self.assertEqual(slower.label, "CUSTOM")
+        self.assertEqual(slower.step(-1), 30)
+        self.assertEqual(faster.step(1), 60)
+        self.assertEqual(SpeedController(0).value, 1)
+        self.assertEqual(SpeedController(999).value, 240)
+
+    def test_decision_scheduler_keeps_rendering_separate_and_bounded(self):
+        scheduler = DecisionScheduler()
+        total = sum(scheduler.steps_for_frame(0.1, 30) for _ in range(10))
+        self.assertEqual(total, 30)
+
+        scheduler.reset()
+        self.assertEqual(scheduler.steps_for_frame(1 / 60, 240), 4)
+        self.assertEqual(scheduler.steps_for_frame(0.25, 240), 16)
+        self.assertEqual(scheduler.steps_for_frame(0.1, 30, paused=True), 0)
+        self.assertEqual(scheduler.steps_for_frame(0.1, 30, paused=True, single_step=True), 1)
+
+
 class PacmanObservatoryTests(unittest.TestCase):
     def test_all_tabs_render_live_session_data(self):
         session = small_session(seed=17)
@@ -226,6 +281,29 @@ class PacmanObservatoryTests(unittest.TestCase):
             ui.handle_event(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_TAB))
             cycled.append(ui.active_tab.value)
         self.assertEqual(cycled, ["VISION", "METRICS", "NETWORK", "GAME"])
+
+    def test_speed_scale_is_clickable_and_does_not_overlap_tabs(self):
+        controller = SpeedController(30)
+        telemetry = controller.telemetry()
+        telemetry["algorithm"] = "double_dqn"
+        ui = PacmanObservatory()
+
+        for width in (620, 879, 880, 980, 1120):
+            with self.subTest(width=width):
+                layout = ui.render(pygame.Surface((width, 720)), telemetry)
+                for rect in (*layout.tabs.values(), *layout.speed_presets):
+                    self.assertTrue(layout.header.contains(rect))
+                for tab_rect in layout.tabs.values():
+                    overlaps_speed = any(
+                        tab_rect.colliderect(rect) for rect in layout.speed_presets
+                    )
+                    self.assertFalse(overlaps_speed)
+
+        layout = ui.render(pygame.Surface(WINDOW_SIZE), telemetry)
+        self.assertEqual(len(layout.speed_presets), len(SPEED_PRESETS))
+        for index, rect in enumerate(layout.speed_presets):
+            self.assertEqual(ui.speed_preset_at(rect.center), index)
+        self.assertIsNone(ui.speed_preset_at((0, 719)))
 
     def test_gif_capture_is_animated(self):
         session = small_session(seed=19)

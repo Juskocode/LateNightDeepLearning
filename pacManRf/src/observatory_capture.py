@@ -7,7 +7,7 @@ from pathlib import Path
 from PIL import Image
 import pygame
 
-from pacManRf.src.rl_session import WINDOW_SIZE, PacmanRLSession
+from pacManRf.src.rl_session import WINDOW_SIZE, PacmanRLSession, SpeedController
 from pacManRf.src.visualization import PacmanObservatory
 
 
@@ -24,12 +24,19 @@ def _prime(session: PacmanRLSession, steps: int) -> None:
         session.step()
 
 
+def _telemetry(session: PacmanRLSession, speed: SpeedController) -> dict:
+    data = session.telemetry()
+    data.update(speed.telemetry())
+    return data
+
+
 def capture_observatory_png(
     session: PacmanRLSession,
     path: str | Path,
     *,
     tab: str = "GAME",
     prime_steps: int = 80,
+    speed: int = 30,
 ) -> Path:
     pygame.init()
     output = Path(path)
@@ -37,9 +44,10 @@ def capture_observatory_png(
     _prime(session, prime_steps)
     canvas = pygame.Surface(WINDOW_SIZE)
     ui = PacmanObservatory(initial_tab=tab)
+    speed_controller = SpeedController(speed)
     ui.render(
         canvas,
-        session.telemetry(),
+        _telemetry(session, speed_controller),
         history=session.history_snapshot(),
         game_surface=session.render_game(),
     )
@@ -55,6 +63,7 @@ def capture_observatory_gif(
     prime_steps: int = 80,
     duration_ms: int = 140,
     output_width: int = 800,
+    speed: int = 30,
 ) -> Path:
     """Capture GAME → VISION → METRICS → NETWORK with live values."""
     pygame.init()
@@ -64,6 +73,7 @@ def capture_observatory_gif(
     _prime(session, prime_steps)
     canvas = pygame.Surface(WINDOW_SIZE)
     ui = PacmanObservatory(initial_tab="GAME")
+    speed_controller = SpeedController(speed)
     images: list[Image.Image] = []
 
     for index in range(frame_count):
@@ -72,7 +82,7 @@ def capture_observatory_gif(
         ui.set_tab(("GAME", "VISION", "METRICS", "NETWORK")[section])
         ui.render(
             canvas,
-            session.telemetry(),
+            _telemetry(session, speed_controller),
             history=session.history_snapshot(),
             game_surface=session.render_game(),
         )

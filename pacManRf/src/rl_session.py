@@ -18,6 +18,153 @@ from pacManRf.src.visualization import PacmanObservatory
 
 WINDOW_SIZE = (1120, 720)
 DEFAULT_CHECKPOINT_DIR = REPO_ROOT / "pacManRf" / "models" / "checkpoints"
+SPEED_PRESETS: tuple[tuple[str, int], ...] = (
+    ("SLOW", 1),
+    ("WATCH", 5),
+    ("NORMAL", 15),
+    ("FAST", 30),
+    ("TURBO", 60),
+    ("ULTRA", 120),
+    ("MAX", 240),
+)
+RENDER_FPS = 60
+
+
+class SpeedController:
+    """Clamp visual speed and expose predictable keyboard-selectable presets."""
+
+    minimum = SPEED_PRESETS[0][1]
+    maximum = SPEED_PRESETS[-1][1]
+
+    def __init__(self, initial_speed: int = 30):
+        self._value = self._clamp(initial_speed)
+
+    @classmethod
+    def _clamp(cls, value: int) -> int:
+        return max(cls.minimum, min(cls.maximum, int(value)))
+
+    @property
+    def value(self) -> int:
+        return self._value
+
+    @property
+    def exact_preset_index(self) -> int | None:
+        for index, (_, value) in enumerate(SPEED_PRESETS):
+            if value == self._value:
+                return index
+        return None
+
+    @property
+    def nearest_preset_index(self) -> int:
+        return min(
+            range(len(SPEED_PRESETS)),
+            key=lambda index: abs(SPEED_PRESETS[index][1] - self._value),
+        )
+
+    @property
+    def label(self) -> str:
+        index = self.exact_preset_index
+        return SPEED_PRESETS[index][0] if index is not None else "CUSTOM"
+
+    def select(self, index: int) -> int:
+        if not 0 <= index < len(SPEED_PRESETS):
+            raise ValueError("speed preset index is out of range")
+        self._value = SPEED_PRESETS[index][1]
+        return self._value
+
+    def step(self, direction: int) -> int:
+        """Move to the next slower/faster preset and stop at the endpoints."""
+
+        if direction == 0:
+            return self._value
+        if direction < 0:
+            for index in range(len(SPEED_PRESETS) - 1, -1, -1):
+                if SPEED_PRESETS[index][1] < self._value:
+                    return self.select(index)
+            return self.select(0)
+        for index in range(len(SPEED_PRESETS)):
+            if SPEED_PRESETS[index][1] > self._value:
+                return self.select(index)
+        return self.select(len(SPEED_PRESETS) - 1)
+
+    def handle_key(self, key: int) -> bool:
+        number_keys = (
+            (pygame.K_1, pygame.K_KP1),
+            (pygame.K_2, pygame.K_KP2),
+            (pygame.K_3, pygame.K_KP3),
+            (pygame.K_4, pygame.K_KP4),
+            (pygame.K_5, pygame.K_KP5),
+            (pygame.K_6, pygame.K_KP6),
+            (pygame.K_7, pygame.K_KP7),
+        )
+        for index, keys in enumerate(number_keys):
+            if key in keys:
+                self.select(index)
+                return True
+        if key in (pygame.K_LEFTBRACKET, pygame.K_MINUS):
+            self.step(-1)
+            return True
+        if key in (pygame.K_RIGHTBRACKET, pygame.K_EQUALS, pygame.K_PLUS):
+            self.step(1)
+            return True
+        if key == pygame.K_HOME:
+            self.select(0)
+            return True
+        if key == pygame.K_END:
+            self.select(len(SPEED_PRESETS) - 1)
+            return True
+        return False
+
+    def telemetry(self) -> dict[str, Any]:
+        return {
+            "decisions_per_second": self.value,
+            "speed_target_dps": self.value,
+            "speed_label": self.label,
+            "speed_preset_index": self.nearest_preset_index,
+            "speed_preset_count": len(SPEED_PRESETS),
+            "speed_preset_values": [value for _, value in SPEED_PRESETS],
+        }
+
+
+class DecisionScheduler:
+    """Convert elapsed render time into bounded fixed-rate agent decisions."""
+
+    def __init__(
+        self,
+        *,
+        max_steps_per_frame: int = 16,
+        max_elapsed_seconds: float = 0.25,
+    ):
+        if max_steps_per_frame < 1:
+            raise ValueError("max_steps_per_frame must be positive")
+        if max_elapsed_seconds <= 0:
+            raise ValueError("max_elapsed_seconds must be positive")
+        self.max_steps_per_frame = int(max_steps_per_frame)
+        self.max_elapsed_seconds = float(max_elapsed_seconds)
+        self._fractional_steps = 0.0
+
+    def reset(self) -> None:
+        self._fractional_steps = 0.0
+
+    def steps_for_frame(
+        self,
+        elapsed_seconds: float,
+        decisions_per_second: int,
+        *,
+        paused: bool = False,
+        single_step: bool = False,
+    ) -> int:
+        if paused:
+            self.reset()
+            return int(single_step)
+        elapsed = float(elapsed_seconds)
+        if not np.isfinite(elapsed) or elapsed < 0:
+            raise ValueError("elapsed_seconds must be finite and non-negative")
+        rate = max(1, int(decisions_per_second))
+        self._fractional_steps += min(elapsed, self.max_elapsed_seconds) * rate
+        whole_steps = int(self._fractional_steps)
+        self._fractional_steps -= whole_steps
+        return min(whole_steps, self.max_steps_per_frame)
 
 
 @dataclass(slots=True)
@@ -233,14 +380,21 @@ def run_visual_session(
     pygame.display.set_caption("Pacman DQN Observatory")
     clock = pygame.time.Clock()
     observatory = PacmanObservatory(initial_tab=initial_tab)
+    scheduler = DecisionScheduler()
     paused = False
     single_step = False
     running = True
-    decisions_per_second = max(1, int(speed))
+    speed_controller = SpeedController(speed)
 
     try:
         while running:
+            elapsed_seconds = clock.tick(RENDER_FPS) / 1_000.0
             for event in pygame.event.get():
+                if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                    speed_preset = observatory.speed_preset_at(event.pos)
+                    if speed_preset is not None:
+                        speed_controller.select(speed_preset)
+                        continue
                 if observatory.handle_event(event):
                     continue
                 if event.type == pygame.QUIT:
@@ -252,22 +406,28 @@ def run_visual_session(
                         paused = not paused
                     elif event.key in (pygame.K_n, pygame.K_PERIOD) and paused:
                         single_step = True
-                    elif event.key in (pygame.K_LEFTBRACKET, pygame.K_MINUS):
-                        decisions_per_second = max(1, decisions_per_second // 2)
-                    elif event.key in (pygame.K_RIGHTBRACKET, pygame.K_EQUALS, pygame.K_PLUS):
-                        decisions_per_second = min(240, decisions_per_second * 2)
+                    elif speed_controller.handle_key(event.key):
+                        pass
                     elif event.key == pygame.K_r:
                         session.reset_environment()
                     elif event.key == pygame.K_s:
                         session.save_checkpoint()
 
-            if (not paused or single_step) and running:
+            steps_this_frame = scheduler.steps_for_frame(
+                elapsed_seconds,
+                speed_controller.value,
+                paused=paused,
+                single_step=single_step,
+            )
+            for _ in range(steps_this_frame if running else 0):
                 session.step()
-                single_step = False
+            single_step = False
 
             telemetry = session.telemetry()
             telemetry["paused"] = paused
-            telemetry["decisions_per_second"] = decisions_per_second
+            telemetry["render_fps"] = clock.get_fps()
+            telemetry["render_fps_target"] = RENDER_FPS
+            telemetry.update(speed_controller.telemetry())
             observatory.render(
                 window,
                 telemetry,
@@ -275,7 +435,6 @@ def run_visual_session(
                 game_surface=session.render_game(),
             )
             pygame.display.flip()
-            clock.tick(decisions_per_second)
     finally:
         if save_on_exit and session.config.training:
             session.save_checkpoint()
