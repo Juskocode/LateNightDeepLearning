@@ -6,5 +6,6 @@ __pycache__/
 .idea/
 .vscode/
 plots/
+/models/
 snakeGameQDlearning/models/saved_models/model_v*.pth
 snakeGameQDlearning/models/saved_models/model_v*_metadata.json
