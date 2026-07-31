@@ -1,38 +1,53 @@
+"""Configuration shared by the Snake environment and learning agents."""
 
-# Game settings
+from pathlib import Path
+
 GAME_WIDTH = 640
 GAME_HEIGHT = 480
 BLOCK_SIZE = 20
-GAME_SPEED = 9999
+GAME_SPEED = 120
+PANEL_WIDTH = 400
+HEADER_HEIGHT = 76
+MARGIN = 20
+WINDOW_WIDTH = GAME_WIDTH + PANEL_WIDTH + MARGIN * 3
+WINDOW_HEIGHT = GAME_HEIGHT + HEADER_HEIGHT + MARGIN
 
-# Colors (RGB)
-WHITE = (255, 255, 255)
-RED = (200, 0, 0)
-BLUE1 = (0, 0, 255)
-BLUE2 = (0, 100, 255)
-BLUE3 = (0, 25, 75)
-BLACK = (0, 0, 0)
+WHITE = (239, 243, 255)
+RED = (239, 73, 90)
+BLUE1 = (38, 111, 214)
+BLUE2 = (70, 166, 255)
+BLUE3 = (12, 45, 92)
+BLACK = (7, 10, 22)
+PANEL_BG = (15, 20, 40)
+GRID = (20, 28, 54)
+GRID_HIGHLIGHT = (29, 42, 77)
+GREEN = (58, 207, 142)
+YELLOW = (251, 195, 64)
+MUTED = (137, 148, 180)
+PURPLE = (174, 121, 255)
+ORANGE = (255, 145, 77)
 
-# AI Training settings
 MAX_MEMORY = 100_000
 BATCH_SIZE = 1000
 LEARNING_RATE = 0.001
-GAMMA = 0.923  # Higher discount for long-term thinking
-EPSILON_DECAY = 100
-EPSILON_MIN = 10
+GAMMA = 0.923
+EPSILON_START = 1.0
+EPSILON_MIN = 0.05
+EPSILON_DECAY_GAMES = 200
+TARGET_UPDATE_FREQUENCY = 100
 
-# Model settings
 INPUT_SIZE = 11
-HIDDEN_SIZE = 512  # Increased capacity
+HIDDEN_SIZE = 512
 OUTPUT_SIZE = 3
 
-# Reward settings
 FOOD_REWARD = 10
 COLLISION_PENALTY = -10
 CLOSER_TO_FOOD_REWARD = 1
 FARTHER_FROM_FOOD_PENALTY = -1
 LOOP_PENALTY = -5
+REVISIT_PENALTY = -0.25
+WIN_REWARD = 25
 
-# File paths
-MODEL_DIR = "models/saved_models"
-FONT_PATH = "assets/arial.ttf"
+REPO_ROOT = Path(__file__).resolve().parents[3]
+MODEL_DIR = REPO_ROOT / "snakeGameQDlearning" / "models" / "saved_models"
+FONT_PATH = REPO_ROOT / "assets" / "fonts" / "arial.ttf"

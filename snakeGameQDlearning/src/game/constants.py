@@ -1,15 +1,13 @@
-from enum import Enum
 from collections import namedtuple
+from enum import Enum
 
 class Direction(Enum):
-    RIGHT = 1
-    LEFT = 2
-    UP = 3
-    DOWN = 4
+    RIGHT = (1, 0)
+    LEFT = (-1, 0)
+    UP = (0, -1)
+    DOWN = (0, 1)
 
 Point = namedtuple('Point', 'x, y')
 
 # Game mechanics
-FRAME_TIMEOUT_MULTIPLIER = 100  # Max frames = 100 * snake_length
-FOOD_REWARD = 10
-COLLISION_PENALTY = -10
+FRAME_TIMEOUT_MULTIPLIER = 100  # Starvation budget = multiplier * snake length.

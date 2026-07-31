@@ -1,31 +1,79 @@
+"""Shared Pacman constants and immutable game types."""
 
-from enum import Enum
 from collections import namedtuple
+from enum import Enum, auto
+from pathlib import Path
 
-# Game constants
-BLOCK_SIZE = 20
-PACMAN_SPEED = 10
-SPEED = 10
 
-# Colors (RGB)
-BLACK = (0, 0, 0)
-WHITE = (255, 255, 255)
-YELLOW = (255, 255, 0)
-BLUE = (0, 0, 255)
-RED = (255, 0, 0)
-
-# Direction enum
 class Direction(Enum):
-    UP = 1
-    DOWN = 2
-    LEFT = 3
-    RIGHT = 4
+    UP = (0, -1)
+    DOWN = (0, 1)
+    LEFT = (-1, 0)
+    RIGHT = (1, 0)
 
-# Point for coordinates
-Point = namedtuple('Point', 'x, y')
+    @property
+    def vector(self):
+        return self.value
 
-# Font paths
-FONT_PATH = "../../../assets/fonts/arial.ttf"
+    @property
+    def opposite(self):
+        return {
+            Direction.UP: Direction.DOWN,
+            Direction.DOWN: Direction.UP,
+            Direction.LEFT: Direction.RIGHT,
+            Direction.RIGHT: Direction.LEFT,
+        }[self]
 
-# Sprite paths
-PACMAN_SPRITE_PATH = "../../assets/sprites/Pacman.svg"
+
+class GameStatus(Enum):
+    PLAYING = auto()
+    PAUSED = auto()
+    WON = auto()
+    LOST = auto()
+
+
+class GamePhase(Enum):
+    """Short-lived round phases kept separate from pause/win/loss status."""
+
+    READY = auto()
+    ACTIVE = auto()
+    DYING = auto()
+    CLEARING = auto()
+
+
+class GhostMode(Enum):
+    SCATTER = auto()
+    CHASE = auto()
+
+
+Point = namedtuple("Point", "x y")
+
+TILE_SIZE = 24
+FPS = 60
+PLAYER_SPEED = 144.0
+GHOST_SPEED = 108.0
+FRIGHTENED_SPEED = 75.0
+EATEN_GHOST_SPEED = 192.0
+HUD_HEIGHT = 92
+STARTING_LIVES = 3
+FRIGHTENED_SECONDS = 7.0
+READY_SECONDS = 1.35
+DEATH_SECONDS = 1.25
+CLEAR_SECONDS = 1.1
+EXTRA_LIFE_SCORE = 10_000
+
+BLACK = (5, 7, 18)
+WHITE = (241, 244, 255)
+YELLOW = (255, 214, 40)
+WALL_BLUE = (42, 83, 255)
+WALL_GLOW = (21, 38, 112)
+WALL_FILL = (9, 17, 52)
+PELLET = (255, 205, 181)
+HUD_BG = (13, 17, 36)
+MUTED = (135, 145, 180)
+CYAN = (76, 224, 255)
+PINK = (255, 132, 194)
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
+FONT_PATH = REPO_ROOT / "assets" / "fonts" / "arial.ttf"
+PACMAN_SPRITE_PATH = REPO_ROOT / "assets" / "sprites" / "Pacman.svg"
