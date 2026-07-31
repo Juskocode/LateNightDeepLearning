@@ -42,11 +42,56 @@ def _run_manual(args) -> None:
     import pygame
     from pacManRf.src.game.pacmanGame import PacmanGame
 
-    game = PacmanGame(render=not (args.headless or args.screenshot))
+    game = PacmanGame(
+        render=not (args.headless or args.screenshot),
+        seed=args.seed,
+    )
     if args.screenshot:
-        game.phase = type(game.phase).ACTIVE
-        game.frightened_timer = 4.2
-        game.score = 460
+        from pacManRf.src.game.constants import Direction, GamePhase, PLAYER_SPEED
+
+        # A deterministic level-three scene exercises the same projectile,
+        # sprite, HUD, and renderer code used in live play.
+        game.level = 3
+        game.phase = GamePhase.ACTIVE
+        game.phase_timer = 0.0
+        game.frightened_timer = 0.0
+        game.score = 2_460
+        game.high_score = 2_460
+        game.animation_time = 0.37
+        game.player.reset_position((10, 3), Direction.LEFT)
+        game.ghosts[0].reset_position((5, 3), Direction.RIGHT)
+        game.ghosts[0].released = True
+        game.ghosts[2].reset_position((15, 3), Direction.LEFT)
+        game.ghosts[2].released = True
+        game.projectile_system.reset_level(initial_cooldown_seconds=0.0)
+        fireball = game.projectile_system.try_fire(
+            "BLINKY",
+            game.level,
+            (5, 3),
+            (1, 0),
+            game._projectile_cell_is_walkable,
+            next_cell=game._projectile_next_cell,
+        )
+        freeze_ball = game.projectile_system.try_fire(
+            "INKY",
+            game.level,
+            (15, 3),
+            (-1, 0),
+            game._projectile_cell_is_walkable,
+            next_cell=game._projectile_next_cell,
+        )
+        if fireball is not None:
+            fireball.cell = (7, 3)
+            fireball.tiles_travelled = 2
+            fireball.progress = 0.3
+        if freeze_ball is not None:
+            freeze_ball.cell = (13, 3)
+            freeze_ball.tiles_travelled = 2
+            freeze_ball.progress = 0.25
+        game.projectile_shots_fired = 2
+        game.player_slow.fraction = 0.15
+        game.player_slow.remaining_seconds = 2.4
+        game.player.speed = PLAYER_SPEED * game.player_speed_multiplier
         game.save_screenshot(args.screenshot)
         pygame.quit()
         return

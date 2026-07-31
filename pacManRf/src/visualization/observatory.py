@@ -362,7 +362,10 @@ class PacmanObservatory:
         y += 28
         y = self._draw_metric_cards(surface, pygame.Rect(inner.x, y, inner.width, 102), telemetry, columns=3)
         y += 9
-        q_rect = pygame.Rect(inner.x, y, inner.width, min(190, max(130, inner.bottom - y - 115)))
+        combat_rect = pygame.Rect(inner.x, y, inner.width, 74)
+        self._draw_combat_telemetry(surface, combat_rect, telemetry, compact=True)
+        y = combat_rect.bottom + 9
+        q_rect = pygame.Rect(inner.x, y, inner.width, min(176, max(118, inner.bottom - y - 108)))
         self._draw_q_bars(surface, q_rect, telemetry, compact=True)
         y = q_rect.bottom + 10
         memory_rect = pygame.Rect(inner.x, y, inner.width, max(72, inner.bottom - y))
@@ -414,7 +417,7 @@ class PacmanObservatory:
             ("PATHS", "path", "walkable", self.theme.blue),
             ("PELLETS", "pellet", "proximity", self.theme.yellow),
             ("POWER PELLETS", "power pellet", "proximity", self.theme.purple),
-            ("THREATS", "threat", "danger proximity", self.theme.red),
+            ("THREATS", "threat", "ghost + projectile proximity", self.theme.red),
             ("EDIBLE GHOSTS", "edible ghost", "target proximity", self.theme.cyan),
         )
         row_gap = 7
@@ -621,7 +624,9 @@ class PacmanObservatory:
             columns=6,
         )
 
-        chart_top = inner.y + cards_height + 14
+        combat_rect = pygame.Rect(inner.x, inner.y + cards_height + 10, inner.width, 62)
+        self._draw_combat_telemetry(surface, combat_rect, telemetry, compact=False)
+        chart_top = combat_rect.bottom + 12
         bottom_height = 108
         charts_rect = pygame.Rect(inner.x, chart_top, inner.width, max(100, inner.bottom - chart_top - bottom_height - 12))
         gap = 12
@@ -674,6 +679,97 @@ class PacmanObservatory:
         q_rect = pygame.Rect(inner.x, graph_rect.bottom + 12, inner.width, max(90, inner.bottom - graph_rect.bottom - 12))
         self._draw_network_graph(surface, graph_rect, telemetry, network, layers, weights)
         self._draw_q_bars(surface, q_rect, telemetry, compact=False)
+
+    def _draw_combat_telemetry(
+        self,
+        surface: pygame.Surface,
+        rect: pygame.Rect,
+        telemetry: Mapping[str, Any],
+        *,
+        compact: bool,
+    ) -> None:
+        pygame.draw.rect(surface, self.theme.panel_alt, rect, border_radius=9)
+        pygame.draw.rect(surface, self.theme.grid, rect, 1, border_radius=9)
+        self._text(
+            surface,
+            "COMBAT TELEMETRY",
+            (rect.x + 11, rect.y + 8),
+            self.theme.text,
+            8,
+            bold=True,
+        )
+        caption = (
+            "diagnostic · shares THREAT inputs"
+            if compact
+            else "diagnostic · projectile rays share the four THREAT inputs"
+        )
+        self._text(surface, caption, (rect.x + 119, rect.y + 8), self.theme.muted, 7)
+
+        projectile_data = _to_plain(telemetry.get("projectiles"))
+        if not isinstance(projectile_data, Mapping):
+            self._text(
+                surface,
+                "No projectile telemetry received",
+                (rect.x + 11, rect.y + 32),
+                self.theme.muted,
+                9,
+            )
+            return
+
+        weapons = _to_plain(projectile_data.get("weapons"))
+        weapons = weapons if isinstance(weapons, Mapping) else {}
+
+        def weapon_text(owner: str, label: str) -> str:
+            weapon = _to_plain(weapons.get(owner))
+            if not isinstance(weapon, Mapping):
+                return f"{label}  —"
+            unlocked = bool(weapon.get("unlocked", False))
+            early = bool(weapon.get("unlocked_early", False))
+            cooldown = _number(weapon.get("cooldown_seconds")) or 0.0
+            range_tiles = int(_number(weapon.get("range_tiles")) or 0)
+            if not unlocked:
+                status = "LOCKED"
+            elif cooldown > 0:
+                status = f"{'EARLY ' if early else ''}{cooldown:.1f}s"
+            elif early:
+                status = "EARLY READY"
+            else:
+                status = "READY"
+            return f"{label}  {status} · {range_tiles}t"
+
+        fire = weapon_text("BLINKY", "FIRE")
+        freeze = weapon_text("INKY", "FREEZE")
+        active = int(_number(projectile_data.get("active_count")) or 0)
+        shots = int(_number(projectile_data.get("shots_fired")) or 0)
+        fire_hits = int(_number(projectile_data.get("fireball_hits")) or 0)
+        freeze_hits = int(_number(projectile_data.get("freeze_ball_hits")) or 0)
+        slowed = bool(projectile_data.get("player_slowed", False))
+        slow_fraction = (_number(projectile_data.get("slow_fraction")) or 0.0) * 100
+        slow_timer = _number(projectile_data.get("slow_timer")) or 0.0
+
+        midpoint = rect.x + rect.width // 2
+        self._text(surface, fire, (rect.x + 11, rect.y + 29), self.theme.orange, 8, bold=True)
+        self._text(surface, freeze, (midpoint, rect.y + 29), self.theme.cyan, 8, bold=True)
+        if compact:
+            diagnostic = f"ACTIVE {active} · SHOTS {shots} · HITS {fire_hits}/{freeze_hits}"
+            player = f"PACMAN  -{slow_fraction:.0f}% · {slow_timer:.1f}s" if slowed else "PACMAN  NORMAL"
+            self._text(surface, diagnostic, (rect.x + 11, rect.y + 51), self.theme.muted, 7)
+            player_image = self._font(7, bold=True).render(
+                player,
+                True,
+                self.theme.cyan if slowed else self.theme.green,
+            )
+            surface.blit(player_image, (rect.right - player_image.get_width() - 11, rect.y + 51))
+        else:
+            diagnostic = f"ACTIVE {active}    TOTAL SHOTS {shots}    FIRE HITS {fire_hits}    FREEZE HITS {freeze_hits}"
+            player = f"PACMAN SLOWED {slow_fraction:.0f}% · {slow_timer:.1f}s" if slowed else "PACMAN NORMAL SPEED"
+            self._text(surface, diagnostic, (rect.x + 11, rect.y + 47), self.theme.muted, 8)
+            player_image = self._font(8, bold=True).render(
+                player,
+                True,
+                self.theme.cyan if slowed else self.theme.green,
+            )
+            surface.blit(player_image, (rect.right - player_image.get_width() - 11, rect.y + 47))
 
     def _draw_metric_cards(
         self,
