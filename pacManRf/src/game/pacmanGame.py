@@ -125,9 +125,13 @@ class PacmanGame:
         self.maze_width = self.cols * TILE_SIZE
         self.maze_height = self.rows * TILE_SIZE
         self.display_height = self.maze_height + HUD_HEIGHT
-        flags = 0 if render else pygame.HIDDEN
-        self.display = pygame.display.set_mode((self.maze_width, self.display_height), flags)
-        pygame.display.set_caption("Late Night Pacman")
+        if render:
+            self.display = pygame.display.set_mode((self.maze_width, self.display_height))
+            pygame.display.set_caption("Late Night Pacman")
+        else:
+            # A private surface keeps headless environments independent from a
+            # separate observability window created in the same process.
+            self.display = pygame.Surface((self.maze_width, self.display_height))
         self.clock = pygame.time.Clock()
         self.font = self._font(18)
         self.small_font = self._font(13)
