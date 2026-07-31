@@ -102,4 +102,3 @@ class DQNConfig:
         if "action_labels" in data:
             data["action_labels"] = tuple(data["action_labels"])
         return cls(**data)
-

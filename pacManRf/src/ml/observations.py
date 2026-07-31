@@ -234,4 +234,3 @@ class PacmanObservationEncoder:
 
 if PacmanObservationEncoder().size != DEFAULT_OBSERVATION_SIZE:
     raise RuntimeError("DEFAULT_OBSERVATION_SIZE does not match PacmanObservationEncoder")
-
