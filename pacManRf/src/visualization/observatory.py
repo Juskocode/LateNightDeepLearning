@@ -1,0 +1,1055 @@
+"""Reusable, telemetry-only Pygame UI for observing a Pacman DQN agent.
+
+The renderer deliberately owns no learning state.  Every number and every
+neural-network edge comes from the telemetry passed to :meth:`render`, making
+it safe to reuse with a live agent, a recorded run, or an empty initial state.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from enum import Enum
+import math
+from pathlib import Path
+from typing import Any, Optional
+
+import pygame
+
+from .theme import DEFAULT_THEME, Color, ObservatoryTheme
+
+
+class ObservatoryTab(str, Enum):
+    """The three top-level views exposed by the observatory."""
+
+    GAME = "GAME"
+    METRICS = "METRICS"
+    NETWORK = "NETWORK"
+
+
+@dataclass(frozen=True)
+class ObservatoryLayout:
+    """Geometry from the latest render, useful for host-side event routing."""
+
+    header: pygame.Rect
+    content: pygame.Rect
+    tabs: Mapping[ObservatoryTab, pygame.Rect]
+
+
+@dataclass(frozen=True)
+class _Layer:
+    name: str
+    size: Optional[int]
+    activations: tuple[Optional[float], ...]
+
+
+_MISSING = object()
+_FONT_PATH = Path(__file__).resolve().parents[3] / "assets" / "fonts" / "arial.ttf"
+
+
+class PacmanObservatory:
+    """Draw a tabbed DQN observability UI into any Pygame surface.
+
+    The primary API is::
+
+        ui = PacmanObservatory()
+        ui.handle_event(event)  # optional; F1/F2/F3, Tab, or tab clicks
+        ui.render(window, telemetry, history=history, game_surface=game)
+
+    ``telemetry`` is a mapping.  Common aliases are accepted for scalar
+    metrics and Q-values.  A neural-network payload can be provided under
+    ``telemetry["network"]`` with ``layers``, ``activations``, and ``weights``.
+    Weight matrices use the PyTorch convention ``[output][input]`` by default;
+    set ``weight_layout="in_out"`` when the matrices use the opposite layout.
+    Missing fields are rendered as explicit empty states, never as synthetic
+    zeroes or fabricated history.
+    """
+
+    MIN_WIDTH = 620
+    MIN_HEIGHT = 390
+    HEADER_HEIGHT = 76
+    PADDING = 16
+
+    def __init__(
+        self,
+        *,
+        initial_tab: ObservatoryTab | str = ObservatoryTab.GAME,
+        theme: ObservatoryTheme = DEFAULT_THEME,
+        font_path: str | Path | None = None,
+        chart_window: int = 120,
+        max_visible_neurons: int = 11,
+    ) -> None:
+        pygame.font.init()
+        self.theme = theme
+        self.active_tab = self._coerce_tab(initial_tab)
+        self.chart_window = max(8, int(chart_window))
+        self.max_visible_neurons = max(3, int(max_visible_neurons))
+        self.font_path = Path(font_path) if font_path is not None else _FONT_PATH
+        self._fonts: dict[tuple[int, bool], pygame.font.Font] = {}
+        self._layout: Optional[ObservatoryLayout] = None
+
+    @property
+    def layout(self) -> Optional[ObservatoryLayout]:
+        """Return geometry from the latest call to :meth:`render`."""
+
+        return self._layout
+
+    def set_tab(self, tab: ObservatoryTab | str) -> None:
+        """Select a tab by enum or case-insensitive name."""
+
+        self.active_tab = self._coerce_tab(tab)
+
+    def handle_event(self, event: pygame.event.Event) -> bool:
+        """Handle observatory navigation and report whether it was consumed."""
+
+        if event.type == pygame.KEYDOWN:
+            key_tabs = {
+                pygame.K_F1: ObservatoryTab.GAME,
+                pygame.K_F2: ObservatoryTab.METRICS,
+                pygame.K_F3: ObservatoryTab.NETWORK,
+            }
+            if event.key in key_tabs:
+                self.active_tab = key_tabs[event.key]
+                return True
+            if event.key == pygame.K_TAB:
+                tabs = tuple(ObservatoryTab)
+                self.active_tab = tabs[(tabs.index(self.active_tab) + 1) % len(tabs)]
+                return True
+        if (
+            event.type == pygame.MOUSEBUTTONDOWN
+            and getattr(event, "button", None) == 1
+            and self._layout is not None
+        ):
+            for tab, rect in self._layout.tabs.items():
+                if rect.collidepoint(event.pos):
+                    self.active_tab = tab
+                    return True
+        return False
+
+    def render(
+        self,
+        surface: pygame.Surface,
+        telemetry: Optional[Mapping[str, Any]] = None,
+        *,
+        history: Optional[Mapping[str, Sequence[Any]] | Sequence[Mapping[str, Any]]] = None,
+        game_surface: Optional[pygame.Surface] = None,
+    ) -> ObservatoryLayout:
+        """Render the selected tab and return its calculated layout.
+
+        ``history`` may be a mapping of metric names to sequences or a sequence
+        of transition/episode mappings.  When omitted, a ``history`` mapping in
+        telemetry is used if present.  ``game_surface`` is copied and scaled;
+        the caller retains ownership of it.
+        """
+
+        if not isinstance(surface, pygame.Surface):
+            raise TypeError("surface must be a pygame.Surface")
+        data: Mapping[str, Any] = telemetry if isinstance(telemetry, Mapping) else {}
+        supplied_history = history
+        if supplied_history is None:
+            embedded = data.get("history")
+            if isinstance(embedded, Mapping) or _is_record_sequence(embedded):
+                supplied_history = embedded
+
+        surface.fill(self.theme.background)
+        bounds = surface.get_rect()
+        header_height = min(self.HEADER_HEIGHT, max(58, bounds.height // 7))
+        header = pygame.Rect(0, 0, bounds.width, header_height)
+        content = pygame.Rect(
+            self.PADDING,
+            header.bottom + self.PADDING,
+            max(0, bounds.width - self.PADDING * 2),
+            max(0, bounds.height - header.bottom - self.PADDING * 2),
+        )
+        tab_rects = self._draw_header(surface, header, data)
+        self._layout = ObservatoryLayout(header, content, tab_rects)
+
+        if bounds.width < self.MIN_WIDTH or bounds.height < self.MIN_HEIGHT:
+            self._empty_state(
+                surface,
+                content,
+                "Surface too small",
+                f"Use at least {self.MIN_WIDTH} × {self.MIN_HEIGHT} pixels",
+            )
+            return self._layout
+
+        if self.active_tab is ObservatoryTab.GAME:
+            self._draw_game_tab(surface, content, data, supplied_history, game_surface)
+        elif self.active_tab is ObservatoryTab.METRICS:
+            self._draw_metrics_tab(surface, content, data, supplied_history)
+        else:
+            self._draw_network_tab(surface, content, data)
+        return self._layout
+
+    @staticmethod
+    def _coerce_tab(tab: ObservatoryTab | str) -> ObservatoryTab:
+        if isinstance(tab, ObservatoryTab):
+            return tab
+        try:
+            return ObservatoryTab(str(tab).strip().upper())
+        except ValueError as error:
+            choices = ", ".join(item.value for item in ObservatoryTab)
+            raise ValueError(f"unknown tab {tab!r}; expected one of {choices}") from error
+
+    def _font(self, size: int, *, bold: bool = False) -> pygame.font.Font:
+        key = (max(8, int(size)), bold)
+        if key not in self._fonts:
+            try:
+                font = pygame.font.Font(str(self.font_path), key[0])
+            except (FileNotFoundError, OSError, pygame.error):
+                font = pygame.font.Font(None, key[0])
+            font.set_bold(bold)
+            self._fonts[key] = font
+        return self._fonts[key]
+
+    def _draw_header(
+        self,
+        surface: pygame.Surface,
+        rect: pygame.Rect,
+        telemetry: Mapping[str, Any],
+    ) -> dict[ObservatoryTab, pygame.Rect]:
+        pygame.draw.rect(surface, self.theme.header, rect)
+        pygame.draw.line(surface, self.theme.grid, rect.bottomleft, rect.bottomright, 1)
+
+        compact = rect.width < 880
+        title = "PACMAN / DQN" if compact else "PACMAN / DQN OBSERVATORY"
+        self._text(surface, title, (self.PADDING, 13), self.theme.text, 17, bold=True)
+        algorithm = _first(telemetry, "algorithm", "agent", "mode")
+        if algorithm is not _MISSING and algorithm is not None:
+            self._text(
+                surface,
+                str(algorithm).upper().replace("_", " "),
+                (self.PADDING, 38),
+                self.theme.purple,
+                10,
+                bold=True,
+            )
+
+        tab_width = 104 if compact else 122
+        gap = 7
+        total_width = len(ObservatoryTab) * tab_width + (len(ObservatoryTab) - 1) * gap
+        start_x = max(190 if compact else 280, (rect.width - total_width) // 2)
+        if start_x + total_width > rect.right - self.PADDING:
+            start_x = rect.right - self.PADDING - total_width
+        tab_rects: dict[ObservatoryTab, pygame.Rect] = {}
+        for index, tab in enumerate(ObservatoryTab):
+            tab_rect = pygame.Rect(start_x + index * (tab_width + gap), 17, tab_width, 40)
+            selected = tab is self.active_tab
+            pygame.draw.rect(
+                surface,
+                self.theme.panel_alt if selected else self.theme.header,
+                tab_rect,
+                border_radius=9,
+            )
+            pygame.draw.rect(
+                surface,
+                self.theme.blue if selected else self.theme.grid,
+                tab_rect,
+                1 if not selected else 2,
+                border_radius=9,
+            )
+            label = self._font(11, bold=selected).render(tab.value, True, self.theme.text if selected else self.theme.muted)
+            surface.blit(label, label.get_rect(center=tab_rect.center))
+            tab_rects[tab] = tab_rect
+
+        shortcut = self._font(9).render("F1   F2   F3", True, self.theme.muted)
+        if rect.width - shortcut.get_width() - self.PADDING > start_x + total_width:
+            surface.blit(shortcut, (rect.width - shortcut.get_width() - self.PADDING, 28))
+        return tab_rects
+
+    def _draw_game_tab(
+        self,
+        surface: pygame.Surface,
+        rect: pygame.Rect,
+        telemetry: Mapping[str, Any],
+        history: Optional[Mapping[str, Sequence[Any]] | Sequence[Mapping[str, Any]]],
+        game_surface: Optional[pygame.Surface],
+    ) -> None:
+        gap = 14
+        side_width = max(330, min(430, round(rect.width * 0.38)))
+        game_rect = pygame.Rect(rect.x, rect.y, max(1, rect.width - side_width - gap), rect.height)
+        side_rect = pygame.Rect(game_rect.right + gap, rect.y, side_width, rect.height)
+        self._panel(surface, game_rect)
+        self._panel(surface, side_rect)
+
+        viewport = game_rect.inflate(-18, -18)
+        if game_surface is None:
+            self._empty_state(surface, viewport, "Game view unavailable", "Pass game_surface=... to render the live board")
+        else:
+            self._blit_contain(surface, game_surface, viewport)
+
+        inner = side_rect.inflate(-18, -18)
+        y = inner.y
+        self._section_title(surface, "LIVE DECISION", inner.x, y)
+        y += 28
+        y = self._draw_metric_cards(surface, pygame.Rect(inner.x, y, inner.width, 102), telemetry, columns=3)
+        y += 9
+        q_rect = pygame.Rect(inner.x, y, inner.width, min(190, max(130, inner.bottom - y - 115)))
+        self._draw_q_bars(surface, q_rect, telemetry, compact=True)
+        y = q_rect.bottom + 10
+        memory_rect = pygame.Rect(inner.x, y, inner.width, max(72, inner.bottom - y))
+        self._draw_memory(surface, memory_rect, telemetry, history)
+
+    def _draw_metrics_tab(
+        self,
+        surface: pygame.Surface,
+        rect: pygame.Rect,
+        telemetry: Mapping[str, Any],
+        history: Optional[Mapping[str, Sequence[Any]] | Sequence[Mapping[str, Any]]],
+    ) -> None:
+        self._panel(surface, rect)
+        inner = rect.inflate(-18, -18)
+        cards_height = 90
+        self._draw_metric_cards(
+            surface,
+            pygame.Rect(inner.x, inner.y, inner.width, cards_height),
+            telemetry,
+            columns=6,
+        )
+
+        chart_top = inner.y + cards_height + 14
+        bottom_height = 108
+        charts_rect = pygame.Rect(inner.x, chart_top, inner.width, max(100, inner.bottom - chart_top - bottom_height - 12))
+        gap = 12
+        chart_width = (charts_rect.width - gap) // 2
+        chart_height = (charts_rect.height - gap) // 2
+        chart_specs = (
+            ("REWARD", ("rewards", "reward", "episode_returns", "episode_return"), self.theme.green),
+            ("LOSS", ("losses", "loss"), self.theme.orange),
+            ("SCORE", ("scores", "score"), self.theme.blue),
+            ("EPSILON", ("epsilons", "epsilon"), self.theme.purple),
+        )
+        for index, (label, aliases, color) in enumerate(chart_specs):
+            chart = pygame.Rect(
+                charts_rect.x + (index % 2) * (chart_width + gap),
+                charts_rect.y + (index // 2) * (chart_height + gap),
+                chart_width,
+                chart_height,
+            )
+            values = _history_values(history, aliases)[-self.chart_window :]
+            self._draw_chart(surface, chart, label, values, color)
+
+        bottom = pygame.Rect(inner.x, charts_rect.bottom + 12, inner.width, max(84, inner.bottom - charts_rect.bottom - 12))
+        left = pygame.Rect(bottom.x, bottom.y, max(1, round(bottom.width * 0.58) - 6), bottom.height)
+        right = pygame.Rect(left.right + 12, bottom.y, max(1, bottom.right - left.right - 12), bottom.height)
+        self._draw_memory(surface, left, telemetry, history)
+        self._draw_replay_meter(surface, right, telemetry)
+
+    def _draw_network_tab(
+        self,
+        surface: pygame.Surface,
+        rect: pygame.Rect,
+        telemetry: Mapping[str, Any],
+    ) -> None:
+        self._panel(surface, rect)
+        inner = rect.inflate(-18, -18)
+        network = _network_payload(telemetry)
+        layers = _network_layers(network)
+        weights = _weight_matrices(network, layers)
+        if not layers:
+            self._empty_state(
+                surface,
+                inner,
+                "Network telemetry unavailable",
+                "Provide network.layers (or layer_names + activations) and network.weights",
+            )
+            return
+
+        q_height = 150 if inner.height >= 510 else 125
+        graph_rect = pygame.Rect(inner.x, inner.y, inner.width, max(180, inner.height - q_height - 12))
+        q_rect = pygame.Rect(inner.x, graph_rect.bottom + 12, inner.width, max(90, inner.bottom - graph_rect.bottom - 12))
+        self._draw_network_graph(surface, graph_rect, telemetry, network, layers, weights)
+        self._draw_q_bars(surface, q_rect, telemetry, compact=False)
+
+    def _draw_metric_cards(
+        self,
+        surface: pygame.Surface,
+        rect: pygame.Rect,
+        telemetry: Mapping[str, Any],
+        *,
+        columns: int,
+    ) -> int:
+        fields = (
+            ("SCORE", ("score",), "integer"),
+            ("EPISODE", ("episode", "episodes", "games"), "integer"),
+            ("REWARD", ("reward", "episode_reward", "episode_return"), "signed"),
+            ("LOSS", ("loss",), "decimal"),
+            ("EPSILON", ("epsilon",), "decimal"),
+            ("REPLAY", ("replay_size", "memory", "replay"), "integer"),
+        )
+        columns = max(1, min(columns, len(fields)))
+        rows = math.ceil(len(fields) / columns)
+        gap = 7
+        cell_width = max(1, (rect.width - gap * (columns - 1)) // columns)
+        cell_height = max(42, (rect.height - gap * (rows - 1)) // rows)
+        for index, (label, aliases, format_kind) in enumerate(fields):
+            column = index % columns
+            row = index // columns
+            card = pygame.Rect(
+                rect.x + column * (cell_width + gap),
+                rect.y + row * (cell_height + gap),
+                cell_width,
+                cell_height,
+            )
+            pygame.draw.rect(surface, self.theme.panel_alt, card, border_radius=8)
+            pygame.draw.rect(surface, self.theme.grid, card, 1, border_radius=8)
+            raw = _first(telemetry, *aliases)
+            value = _format_metric(raw, format_kind)
+            self._text(surface, label, (card.x + 9, card.y + 7), self.theme.muted, 9, bold=True)
+            value_color = self.theme.text
+            number = _number(raw)
+            if label == "REWARD" and number is not None:
+                value_color = self.theme.green if number > 0 else self.theme.red if number < 0 else self.theme.text
+            self._text(surface, value, (card.x + 9, card.y + 25), value_color, 14, bold=True)
+        return rect.bottom
+
+    def _draw_q_bars(
+        self,
+        surface: pygame.Surface,
+        rect: pygame.Rect,
+        telemetry: Mapping[str, Any],
+        *,
+        compact: bool,
+    ) -> None:
+        pygame.draw.rect(surface, self.theme.panel_alt, rect, border_radius=9)
+        pygame.draw.rect(surface, self.theme.grid, rect, 1, border_radius=9)
+        self._section_title(surface, "ACTION VALUES", rect.x + 11, rect.y + 9)
+        online = _numeric_vector(_first(telemetry, "online_q_values", "q_values", "online_q"))
+        target = _numeric_vector(_first(telemetry, "target_q_values", "target_q"))
+        count = max(len(online), len(target))
+        if count == 0:
+            self._empty_state(surface, rect.inflate(-16, -28), "No Q-values received", "online_q_values / target_q_values")
+            return
+        labels = _action_labels(telemetry, count)
+        chosen = _chosen_action_index(telemetry, labels)
+        finite = [abs(value) for value in (*online, *target) if value is not None and math.isfinite(value)]
+        scale = max(finite, default=0.0)
+        top = rect.y + 34
+        available = max(18, rect.bottom - top - 8)
+        row_height = max(18, min(31 if not compact else 27, available // count))
+        label_width = min(105, max(58, rect.width // 5))
+        value_width = 92 if rect.width >= 520 else 69
+        track_x = rect.x + 11 + label_width
+        track_width = max(40, rect.width - label_width - value_width - 26)
+        center_x = track_x + track_width // 2
+        for index in range(count):
+            row_y = top + index * row_height
+            if row_y + row_height > rect.bottom:
+                break
+            selected = chosen == index
+            label_color = self.theme.yellow if selected else self.theme.text
+            self._text(surface, labels[index], (rect.x + 11, row_y + 4), label_color, 10, bold=selected)
+            track = pygame.Rect(track_x, row_y + 3, track_width, max(12, row_height - 8))
+            pygame.draw.rect(surface, self.theme.grid, track, border_radius=4)
+            pygame.draw.line(surface, self.theme.muted, (center_x, track.y + 1), (center_x, track.bottom - 1), 1)
+            self._signed_bar(surface, track, online[index] if index < len(online) else None, scale, self.theme.cyan, 0)
+            self._signed_bar(surface, track, target[index] if index < len(target) else None, scale, self.theme.magenta, 1)
+            if selected:
+                pygame.draw.rect(surface, self.theme.yellow, track, 1, border_radius=4)
+            online_text = _format_number(online[index] if index < len(online) else None, signed=True)
+            target_text = _format_number(target[index] if index < len(target) else None, signed=True)
+            self._text(
+                surface,
+                f"{online_text} / {target_text}",
+                (track.right + 7, row_y + 4),
+                self.theme.muted,
+                9,
+            )
+        legend = "online cyan  /  target magenta"
+        legend_image = self._font(8).render(legend, True, self.theme.muted)
+        surface.blit(legend_image, (rect.right - legend_image.get_width() - 10, rect.y + 11))
+
+    def _signed_bar(
+        self,
+        surface: pygame.Surface,
+        track: pygame.Rect,
+        value: Optional[float],
+        scale: float,
+        color: Color,
+        lane: int,
+    ) -> None:
+        if value is None or not math.isfinite(value):
+            return
+        half = max(1, track.width // 2 - 2)
+        magnitude = 0 if scale == 0 else round(half * abs(value) / scale)
+        if value != 0 and magnitude == 0:
+            magnitude = 1
+        lane_height = max(2, (track.height - 4) // 2)
+        y = track.y + 2 + lane * lane_height
+        center = track.centerx
+        bar = pygame.Rect(center if value >= 0 else center - magnitude, y, magnitude, lane_height)
+        if bar.width:
+            pygame.draw.rect(surface, color, bar, border_radius=2)
+
+    def _draw_chart(
+        self,
+        surface: pygame.Surface,
+        rect: pygame.Rect,
+        label: str,
+        values: Sequence[Optional[float]],
+        color: Color,
+    ) -> None:
+        pygame.draw.rect(surface, self.theme.panel_alt, rect, border_radius=8)
+        pygame.draw.rect(surface, self.theme.grid, rect, 1, border_radius=8)
+        self._section_title(surface, label, rect.x + 10, rect.y + 8)
+        plot = pygame.Rect(rect.x + 42, rect.y + 30, max(20, rect.width - 52), max(20, rect.height - 43))
+        pygame.draw.line(surface, self.theme.grid, plot.bottomleft, plot.bottomright, 1)
+        pygame.draw.line(surface, self.theme.grid, plot.topleft, plot.bottomleft, 1)
+        finite = [(index, value) for index, value in enumerate(values) if value is not None and math.isfinite(value)]
+        if not finite:
+            self._text(surface, "No samples received", (plot.x + 8, plot.centery - 5), self.theme.muted, 9)
+            return
+        minimum = min(value for _, value in finite)
+        maximum = max(value for _, value in finite)
+        span = maximum - minimum
+        if span == 0:
+            padding = max(0.5, abs(maximum) * 0.08)
+            minimum -= padding
+            maximum += padding
+            span = maximum - minimum
+        if minimum < 0 < maximum:
+            zero_y = plot.bottom - round((0 - minimum) / span * plot.height)
+            pygame.draw.line(surface, self.theme.grid_bright, (plot.x, zero_y), (plot.right, zero_y), 1)
+        denominator = max(1, len(values) - 1)
+        segments: list[list[tuple[int, int]]] = []
+        segment: list[tuple[int, int]] = []
+        for index, value in enumerate(values):
+            if value is None or not math.isfinite(value):
+                if segment:
+                    segments.append(segment)
+                    segment = []
+                continue
+            x = plot.x + round(index / denominator * plot.width)
+            y = plot.bottom - round((value - minimum) / span * plot.height)
+            segment.append((x, y))
+        if segment:
+            segments.append(segment)
+        for points in segments:
+            if len(points) > 1:
+                pygame.draw.lines(surface, color, False, points, 2)
+            else:
+                pygame.draw.circle(surface, color, points[0], 2)
+        self._text(surface, _format_number(maximum), (rect.x + 7, plot.y - 2), self.theme.muted, 8)
+        self._text(surface, _format_number(minimum), (rect.x + 7, plot.bottom - 8), self.theme.muted, 8)
+        count_text = f"{len(finite)} sample{'s' if len(finite) != 1 else ''}"
+        image = self._font(8).render(count_text, True, self.theme.muted)
+        surface.blit(image, (plot.right - image.get_width(), rect.y + 9))
+
+    def _draw_memory(
+        self,
+        surface: pygame.Surface,
+        rect: pygame.Rect,
+        telemetry: Mapping[str, Any],
+        history: Optional[Mapping[str, Sequence[Any]] | Sequence[Mapping[str, Any]]],
+    ) -> None:
+        pygame.draw.rect(surface, self.theme.panel_alt, rect, border_radius=8)
+        pygame.draw.rect(surface, self.theme.grid, rect, 1, border_radius=8)
+        self._section_title(surface, "RECENT REPLAY MEMORY", rect.x + 10, rect.y + 8)
+        rewards = _memory_values(telemetry, history, ("recent_rewards", "rewards"), ("reward",))
+        actions = _memory_raw_values(telemetry, history, ("recent_actions", "actions"), ("action", "action_index"))
+        dones = _memory_raw_values(telemetry, history, ("recent_dones", "dones"), ("done", "terminal"))
+        count = max(len(rewards), len(actions), len(dones))
+        if count == 0:
+            self._text(surface, "No transitions received", (rect.x + 11, rect.y + 35), self.theme.muted, 9)
+            return
+        max_slots = max(1, min(36, (rect.width - 20) // 12))
+        start = max(0, count - max_slots)
+        visible_count = count - start
+        strip = pygame.Rect(rect.x + 10, rect.y + 33, rect.width - 20, min(32, max(19, rect.height - 48)))
+        gap = 3
+        slot_width = max(5, (strip.width - gap * (visible_count - 1)) // visible_count)
+        for visible_index, source_index in enumerate(range(start, count)):
+            reward = rewards[source_index] if source_index < len(rewards) else None
+            action = actions[source_index] if source_index < len(actions) else None
+            terminal = bool(dones[source_index]) if source_index < len(dones) and dones[source_index] is not None else False
+            color = self.theme.grid_bright
+            if reward is not None:
+                color = self.theme.green if reward > 0 else self.theme.red if reward < 0 else self.theme.blue
+            slot = pygame.Rect(strip.x + visible_index * (slot_width + gap), strip.y, slot_width, strip.height)
+            pygame.draw.rect(surface, color, slot, border_radius=3)
+            if terminal:
+                pygame.draw.rect(surface, self.theme.yellow, slot, 2, border_radius=3)
+            if action is not None and slot_width >= 12:
+                action_text = str(action)
+                if len(action_text) > 2:
+                    action_text = action_text[:2]
+                image = self._font(8, bold=True).render(action_text, True, self.theme.background)
+                surface.blit(image, image.get_rect(center=slot.center))
+        if rect.height >= 78:
+            self._text(
+                surface,
+                "green +reward   red −reward   yellow terminal border",
+                (rect.x + 10, strip.bottom + 7),
+                self.theme.muted,
+                8,
+            )
+
+    def _draw_replay_meter(
+        self,
+        surface: pygame.Surface,
+        rect: pygame.Rect,
+        telemetry: Mapping[str, Any],
+    ) -> None:
+        pygame.draw.rect(surface, self.theme.panel_alt, rect, border_radius=8)
+        pygame.draw.rect(surface, self.theme.grid, rect, 1, border_radius=8)
+        self._section_title(surface, "REPLAY CAPACITY", rect.x + 10, rect.y + 8)
+        size_raw = _first(telemetry, "replay_size", "memory", "replay")
+        capacity_raw = _first(telemetry, "replay_capacity", "memory_capacity", "capacity")
+        size = _number(size_raw)
+        capacity = _number(capacity_raw)
+        if size is None or capacity is None or capacity <= 0:
+            self._text(surface, "Size / capacity unavailable", (rect.x + 10, rect.y + 35), self.theme.muted, 9)
+            return
+        fraction = max(0.0, min(1.0, size / capacity))
+        track = pygame.Rect(rect.x + 10, rect.y + 38, rect.width - 20, 12)
+        pygame.draw.rect(surface, self.theme.grid, track, border_radius=6)
+        fill = track.copy()
+        fill.width = round(track.width * fraction)
+        if fill.width:
+            pygame.draw.rect(surface, self.theme.blue, fill, border_radius=6)
+        self._text(
+            surface,
+            f"{int(size):,} / {int(capacity):,}   {fraction:.1%}",
+            (rect.x + 10, track.bottom + 8),
+            self.theme.text,
+            10,
+            bold=True,
+        )
+
+    def _draw_network_graph(
+        self,
+        surface: pygame.Surface,
+        rect: pygame.Rect,
+        telemetry: Mapping[str, Any],
+        network: Mapping[str, Any],
+        layers: Sequence[_Layer],
+        weights: Sequence[Any],
+    ) -> None:
+        pygame.draw.rect(surface, self.theme.panel_alt, rect, border_radius=9)
+        pygame.draw.rect(surface, self.theme.grid, rect, 1, border_radius=9)
+        self._section_title(surface, "REAL NETWORK STATE", rect.x + 11, rect.y + 9)
+        self._text(
+            surface,
+            "sampled activations and actual weights",
+            (rect.x + 145, rect.y + 10),
+            self.theme.muted,
+            9,
+        )
+        graph = pygame.Rect(rect.x + 28, rect.y + 48, rect.width - 56, max(90, rect.height - 86))
+        layer_count = len(layers)
+        x_positions = [
+            graph.x + round(index * graph.width / max(1, layer_count - 1))
+            for index in range(layer_count)
+        ]
+        sampled: list[tuple[list[int], list[Optional[float]], list[tuple[int, int]]]] = []
+        node_radius = max(5, min(10, graph.height // (self.max_visible_neurons * 3)))
+        for layer, x in zip(layers, x_positions):
+            full_count = layer.size if layer.size is not None else len(layer.activations)
+            full_count = max(0, full_count)
+            indices = _sample_indices(full_count, self.max_visible_neurons)
+            values = [layer.activations[index] if index < len(layer.activations) else None for index in indices]
+            if indices:
+                step = graph.height / max(1, len(indices) - 1)
+                positions = [(x, graph.y + round(i * step)) for i in range(len(indices))]
+            else:
+                positions = []
+            sampled.append((indices, values, positions))
+
+        overlay = pygame.Surface(surface.get_size(), pygame.SRCALPHA)
+        layout = str(network.get("weight_layout", "out_in")).lower()
+        for connection_index in range(layer_count - 1):
+            matrix = weights[connection_index] if connection_index < len(weights) else None
+            src_indices, _, src_positions = sampled[connection_index]
+            dst_indices, _, dst_positions = sampled[connection_index + 1]
+            connection_values = _sampled_weights(
+                matrix,
+                src_indices,
+                dst_indices,
+                layers[connection_index].size,
+                layers[connection_index + 1].size,
+                layout,
+            )
+            finite_weights = [abs(value) for _, _, value in connection_values if math.isfinite(value)]
+            weight_scale = max(finite_weights, default=0.0)
+            src_position_by_index = dict(zip(src_indices, src_positions))
+            dst_position_by_index = dict(zip(dst_indices, dst_positions))
+            for src_index, dst_index, value in connection_values:
+                start = src_position_by_index.get(src_index)
+                end = dst_position_by_index.get(dst_index)
+                if start is None or end is None:
+                    continue
+                ratio = 0.0 if weight_scale == 0 else abs(value) / weight_scale
+                alpha = 24 + round(154 * ratio)
+                width = 1 + round(3 * ratio)
+                base = self.theme.cyan if value > 0 else self.theme.magenta if value < 0 else self.theme.muted
+                pygame.draw.line(overlay, (*base, alpha), start, end, width)
+        surface.blit(overlay, (0, 0))
+
+        labels = _action_labels(telemetry, max((layer.size or len(layer.activations) for layer in layers[-1:]), default=0))
+        chosen = _chosen_action_index(telemetry, labels)
+        for layer_index, (layer, x, sample_data) in enumerate(zip(layers, x_positions, sampled)):
+            indices, values, positions = sample_data
+            finite_activations = [abs(value) for value in values if value is not None and math.isfinite(value)]
+            activation_scale = max(finite_activations, default=0.0)
+            for node_index, activation, position in zip(indices, values, positions):
+                if activation is None or not math.isfinite(activation):
+                    pygame.draw.circle(surface, self.theme.panel, position, node_radius)
+                    pygame.draw.circle(surface, self.theme.muted, position, node_radius, 1)
+                else:
+                    ratio = 0.0 if activation_scale == 0 else min(1.0, abs(activation) / activation_scale)
+                    base = self.theme.green if activation >= 0 else self.theme.orange
+                    fill = _blend(self.theme.panel, base, 0.22 + 0.68 * ratio)
+                    pygame.draw.circle(surface, fill, position, node_radius)
+                    pygame.draw.circle(surface, base, position, node_radius, 1)
+                if layer_index == layer_count - 1 and chosen == node_index:
+                    pygame.draw.circle(surface, self.theme.yellow, position, node_radius + 3, 2)
+
+            title = layer.name
+            title_image = self._font(10, bold=True).render(title, True, self.theme.text)
+            surface.blit(title_image, (x - title_image.get_width() // 2, graph.bottom + 12))
+            size_text = "size unavailable" if layer.size is None else str(layer.size)
+            if layer.size is not None and len(indices) < layer.size:
+                size_text = f"{len(indices)} / {layer.size} shown"
+            elif values and not any(value is not None for value in values):
+                size_text = f"{size_text} · no activations"
+            size_image = self._font(8).render(size_text, True, self.theme.muted)
+            surface.blit(size_image, (x - size_image.get_width() // 2, graph.bottom + 27))
+
+        missing_weight_count = max(0, len(layers) - 1 - len(weights))
+        if missing_weight_count:
+            note = f"{missing_weight_count} weight matrix{'es' if missing_weight_count != 1 else ''} unavailable"
+            image = self._font(8).render(note, True, self.theme.muted)
+            surface.blit(image, (rect.right - image.get_width() - 11, rect.y + 11))
+
+    def _panel(self, surface: pygame.Surface, rect: pygame.Rect) -> None:
+        pygame.draw.rect(surface, self.theme.panel, rect, border_radius=11)
+        pygame.draw.rect(surface, self.theme.grid, rect, 1, border_radius=11)
+
+    def _section_title(self, surface: pygame.Surface, value: str, x: int, y: int) -> None:
+        self._text(surface, value, (x, y), self.theme.muted, 9, bold=True)
+
+    def _text(
+        self,
+        surface: pygame.Surface,
+        value: str,
+        position: tuple[int, int],
+        color: Color,
+        size: int,
+        *,
+        bold: bool = False,
+    ) -> None:
+        surface.blit(self._font(size, bold=bold).render(str(value), True, color), position)
+
+    def _empty_state(
+        self,
+        surface: pygame.Surface,
+        rect: pygame.Rect,
+        title: str,
+        detail: str,
+    ) -> None:
+        title_image = self._font(14, bold=True).render(title, True, self.theme.text)
+        detail_image = self._font(9).render(detail, True, self.theme.muted)
+        title_y = rect.centery - 15
+        surface.blit(title_image, (rect.centerx - title_image.get_width() // 2, title_y))
+        surface.blit(detail_image, (rect.centerx - detail_image.get_width() // 2, title_y + 25))
+
+    def _blit_contain(self, destination: pygame.Surface, source: pygame.Surface, rect: pygame.Rect) -> None:
+        if source.get_width() <= 0 or source.get_height() <= 0:
+            self._empty_state(destination, rect, "Game view unavailable", "The supplied surface has no drawable area")
+            return
+        scale = min(rect.width / source.get_width(), rect.height / source.get_height())
+        size = (max(1, round(source.get_width() * scale)), max(1, round(source.get_height() * scale)))
+        image = pygame.transform.smoothscale(source, size)
+        image_rect = image.get_rect(center=rect.center)
+        destination.blit(image, image_rect)
+        pygame.draw.rect(destination, self.theme.grid_bright, image_rect, 1, border_radius=4)
+
+
+def _first(mapping: Mapping[str, Any], *keys: str) -> Any:
+    for key in keys:
+        if key in mapping:
+            return mapping[key]
+    return _MISSING
+
+
+def _number(value: Any) -> Optional[float]:
+    if value is _MISSING or value is None or isinstance(value, bool):
+        return None
+    try:
+        result = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return result if math.isfinite(result) else None
+
+
+def _to_plain(value: Any) -> Any:
+    if value is _MISSING:
+        return value
+    try:
+        if hasattr(value, "detach"):
+            value = value.detach()
+        if hasattr(value, "cpu"):
+            value = value.cpu()
+        if hasattr(value, "tolist"):
+            value = value.tolist()
+    except (RuntimeError, TypeError, ValueError):
+        return value
+    return value
+
+
+def _is_sequence(value: Any) -> bool:
+    return isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray))
+
+
+def _is_record_sequence(value: Any) -> bool:
+    return _is_sequence(value) and (not value or all(isinstance(item, Mapping) for item in value))
+
+
+def _numeric_vector(value: Any) -> list[Optional[float]]:
+    value = _to_plain(value)
+    if not _is_sequence(value):
+        return []
+    return [_number(item) for item in value]
+
+
+def _format_number(value: Optional[float], *, signed: bool = False) -> str:
+    if value is None or not math.isfinite(value):
+        return "—"
+    absolute = abs(value)
+    precision = 3 if absolute < 10 else 2 if absolute < 100 else 1
+    return f"{value:+.{precision}f}" if signed else f"{value:.{precision}f}"
+
+
+def _format_metric(value: Any, kind: str) -> str:
+    number = _number(value)
+    if number is None:
+        return "—"
+    if kind == "integer":
+        return f"{int(number):,}" if number.is_integer() else f"{number:,.1f}"
+    if kind == "signed":
+        return _format_number(number, signed=True)
+    return _format_number(number)
+
+
+def _history_values(
+    history: Optional[Mapping[str, Sequence[Any]] | Sequence[Mapping[str, Any]]],
+    aliases: Sequence[str],
+) -> list[Optional[float]]:
+    if isinstance(history, Mapping):
+        raw = _first(history, *aliases)
+        return _numeric_vector(raw)
+    if _is_record_sequence(history):
+        values: list[Optional[float]] = []
+        for record in history:
+            raw = _first(record, *aliases)
+            values.append(_number(raw))
+        return values
+    return []
+
+
+def _memory_values(
+    telemetry: Mapping[str, Any],
+    history: Optional[Mapping[str, Sequence[Any]] | Sequence[Mapping[str, Any]]],
+    telemetry_aliases: Sequence[str],
+    record_aliases: Sequence[str],
+) -> list[Optional[float]]:
+    raw = _first(telemetry, *telemetry_aliases)
+    values = _numeric_vector(raw)
+    if values:
+        return values
+    return _history_values(history, record_aliases)
+
+
+def _memory_raw_values(
+    telemetry: Mapping[str, Any],
+    history: Optional[Mapping[str, Sequence[Any]] | Sequence[Mapping[str, Any]]],
+    telemetry_aliases: Sequence[str],
+    record_aliases: Sequence[str],
+) -> list[Any]:
+    raw = _to_plain(_first(telemetry, *telemetry_aliases))
+    if _is_sequence(raw):
+        return list(raw)
+    if _is_record_sequence(history):
+        return [None if (value := _first(record, *record_aliases)) is _MISSING else _to_plain(value) for record in history]
+    if isinstance(history, Mapping):
+        raw = _to_plain(_first(history, *telemetry_aliases, *record_aliases))
+        if _is_sequence(raw):
+            return list(raw)
+    return []
+
+
+def _action_labels(telemetry: Mapping[str, Any], count: int) -> list[str]:
+    raw = _to_plain(_first(telemetry, "action_labels", "actions"))
+    supplied = [str(item) for item in raw] if _is_sequence(raw) else []
+    return [supplied[index] if index < len(supplied) else f"A{index}" for index in range(count)]
+
+
+def _chosen_action_index(telemetry: Mapping[str, Any], labels: Sequence[str]) -> Optional[int]:
+    raw = _first(telemetry, "chosen_action", "action_index", "selected_action")
+    if raw is _MISSING or raw is None or isinstance(raw, bool):
+        return None
+    if isinstance(raw, str):
+        lowered = raw.casefold()
+        for index, label in enumerate(labels):
+            if label.casefold() == lowered:
+                return index
+        try:
+            raw = int(raw)
+        except ValueError:
+            return None
+    try:
+        index = int(raw)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return index if 0 <= index < len(labels) else None
+
+
+def _network_payload(telemetry: Mapping[str, Any]) -> Mapping[str, Any]:
+    nested = telemetry.get("network")
+    if isinstance(nested, Mapping):
+        return nested
+    # Supporting top-level fields keeps integration lightweight while still
+    # preserving the rule that only caller-supplied values are displayed.
+    keys = (
+        "layers", "network_layers", "layer_names", "layer_sizes",
+        "activations", "layer_activations", "weights", "network_weights",
+        "weight_layout",
+    )
+    return {key: telemetry[key] for key in keys if key in telemetry}
+
+
+def _network_layers(network: Mapping[str, Any]) -> list[_Layer]:
+    raw_layers = _to_plain(_first(network, "layers", "network_layers"))
+    raw_activations = _to_plain(_first(network, "activations", "layer_activations"))
+    names = _to_plain(network.get("layer_names"))
+    sizes = _to_plain(network.get("layer_sizes"))
+    layers: list[_Layer] = []
+
+    if _is_sequence(raw_layers):
+        for index, raw_layer in enumerate(raw_layers):
+            if isinstance(raw_layer, Mapping):
+                name = str(raw_layer.get("name", raw_layer.get("label", f"L{index}")))
+                activation_raw = _to_plain(raw_layer.get("activations", raw_layer.get("activation")))
+                activations = tuple(_numeric_vector(activation_raw))
+                size = _positive_int(raw_layer.get("size", raw_layer.get("width")))
+                if size is None and activations:
+                    size = len(activations)
+                layers.append(_Layer(name, size, activations))
+            elif isinstance(raw_layer, str):
+                activation_raw = _sequence_item(raw_activations, index)
+                activations = tuple(_numeric_vector(activation_raw))
+                size = _positive_int(_sequence_item(sizes, index))
+                if size is None and activations:
+                    size = len(activations)
+                layers.append(_Layer(raw_layer, size, activations))
+            else:
+                size = _positive_int(raw_layer)
+                if size is not None:
+                    activation_raw = _sequence_item(raw_activations, index)
+                    layers.append(_Layer(f"L{index}", size, tuple(_numeric_vector(activation_raw))))
+        if layers:
+            return layers
+
+    activation_groups: list[Any] = []
+    if isinstance(raw_activations, Mapping):
+        for index, (name, activation_raw) in enumerate(raw_activations.items()):
+            activations = tuple(_numeric_vector(activation_raw))
+            size = _positive_int(_mapping_or_sequence_item(sizes, name, index))
+            if size is None and activations:
+                size = len(activations)
+            layers.append(_Layer(str(name), size, activations))
+        return layers
+    if _is_sequence(raw_activations):
+        activation_groups = list(raw_activations)
+
+    name_list = [str(item) for item in names] if _is_sequence(names) else []
+    size_list = list(sizes) if _is_sequence(sizes) else []
+    count = max(len(name_list), len(size_list), len(activation_groups))
+    for index in range(count):
+        activations = tuple(_numeric_vector(_sequence_item(activation_groups, index)))
+        size = _positive_int(_sequence_item(size_list, index))
+        if size is None and activations:
+            size = len(activations)
+        layers.append(_Layer(name_list[index] if index < len(name_list) else f"L{index}", size, activations))
+    return layers
+
+
+def _weight_matrices(network: Mapping[str, Any], layers: Sequence[_Layer]) -> list[Any]:
+    raw = _to_plain(_first(network, "weights", "network_weights"))
+    if _is_sequence(raw):
+        return list(raw)
+    matrices: list[Any] = []
+    raw_layers = _to_plain(_first(network, "layers", "network_layers"))
+    if _is_sequence(raw_layers):
+        # A layer's weights are interpreted as the incoming matrix for that layer.
+        for layer in list(raw_layers)[1:]:
+            if isinstance(layer, Mapping) and "weights" in layer:
+                matrices.append(_to_plain(layer["weights"]))
+    return matrices[: max(0, len(layers) - 1)]
+
+
+def _sample_indices(count: int, limit: int) -> list[int]:
+    if count <= 0:
+        return []
+    if count <= limit:
+        return list(range(count))
+    sampled = [round(index * (count - 1) / (limit - 1)) for index in range(limit)]
+    return list(dict.fromkeys(sampled))
+
+
+def _sampled_weights(
+    matrix: Any,
+    source_indices: Sequence[int],
+    destination_indices: Sequence[int],
+    source_size: Optional[int],
+    destination_size: Optional[int],
+    layout: str,
+) -> list[tuple[int, int, float]]:
+    matrix = _to_plain(matrix)
+    if not _is_sequence(matrix):
+        return []
+    rows = list(matrix)
+    if not rows or not all(_is_sequence(row) for row in rows):
+        return []
+    row_count = len(rows)
+    column_count = min((len(row) for row in rows), default=0)
+    if layout not in ("out_in", "in_out"):
+        layout = "out_in"
+    if layout == "out_in" and source_size is not None and destination_size is not None:
+        if row_count < destination_size or column_count < source_size:
+            if row_count >= source_size and column_count >= destination_size:
+                layout = "in_out"
+    values: list[tuple[int, int, float]] = []
+    for source in source_indices:
+        for destination in destination_indices:
+            row, column = (destination, source) if layout == "out_in" else (source, destination)
+            if row >= row_count or column >= len(rows[row]):
+                continue
+            value = _number(rows[row][column])
+            if value is not None:
+                values.append((source, destination, value))
+    return values
+
+
+def _positive_int(value: Any) -> Optional[int]:
+    number = _number(value)
+    if number is None or number < 0 or not number.is_integer():
+        return None
+    return int(number)
+
+
+def _sequence_item(sequence: Any, index: int) -> Any:
+    if _is_sequence(sequence) and index < len(sequence):
+        return sequence[index]
+    return None
+
+
+def _mapping_or_sequence_item(container: Any, key: Any, index: int) -> Any:
+    if isinstance(container, Mapping):
+        return container.get(key)
+    return _sequence_item(container, index)
+
+
+def _blend(first: Color, second: Color, amount: float) -> Color:
+    amount = max(0.0, min(1.0, amount))
+    return tuple(round(a + (b - a) * amount) for a, b in zip(first, second))  # type: ignore[return-value]

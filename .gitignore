@@ -7,5 +7,6 @@ __pycache__/
 .vscode/
 plots/
 /models/
+pacManRf/models/checkpoints/
 snakeGameQDlearning/models/saved_models/model_v*.pth
 snakeGameQDlearning/models/saved_models/model_v*_metadata.json

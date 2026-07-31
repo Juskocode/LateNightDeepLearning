@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "late-night-deep-learning"
-version = "0.2.0"
-description = "Sprite-driven Pacman and an observable DQN/Double-DQN Snake trainer"
+version = "0.3.0"
+description = "Sprite-driven Pacman and observable DQN/Double-DQN game trainers"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -13,10 +13,12 @@ dependencies = [
     "numpy>=1.26,<3",
     "torch>=2.3,<3",
     "matplotlib>=3.8,<4",
+    "Pillow>=10,<12",
 ]
 
 [project.scripts]
 late-night-pacman = "pacManRf.main:main"
+late-night-pacman-rl = "pacManRf.main:rl_main"
 late-night-snake = "snakeGameQDlearning.main:main"
 late-night-tests = "late_night_deep_learning.test_runner:main"
 

@@ -3,3 +3,4 @@ numpy~=2.0.2
 torch~=2.7.1
 matplotlib~=3.9.4
 ipython~=8.18.1
+Pillow>=10,<12
