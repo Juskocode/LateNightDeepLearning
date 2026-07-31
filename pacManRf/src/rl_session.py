@@ -180,7 +180,8 @@ class SessionConfig:
     replay_warmup: int = 64
     target_update_interval: int = 250
     epsilon_decay_steps: int = 25_000
-    terminate_on_life_loss: bool = True
+    terminate_on_life_loss: bool = False
+    auto_advance_levels: bool = True
     max_episode_steps: int = 2_000
     save_replay: bool = False
 
@@ -194,7 +195,7 @@ class PacmanRLSession:
             seed=self.config.seed,
             render=False,
             terminate_on_life_loss=self.config.terminate_on_life_loss,
-            auto_advance_levels=False,
+            auto_advance_levels=self.config.auto_advance_levels,
             max_episode_steps=self.config.max_episode_steps,
         )
         learning_config = DQNConfig(
@@ -230,6 +231,9 @@ class PacmanRLSession:
             "scores": deque(maxlen=500),
             "epsilons": deque(maxlen=500),
             "episode_returns": deque(maxlen=500),
+            "levels": deque(maxlen=500),
+            "projectiles": deque(maxlen=500),
+            "slow_fraction": deque(maxlen=500),
         }
         self.state = self.env.observation
         self.pending_action = self._select_action(self.state)
@@ -279,6 +283,10 @@ class PacmanRLSession:
         self.history["losses"].append(float(self.agent.trainer.last_metrics.loss))
         self.history["scores"].append(float(self.env.game.score))
         self.history["epsilons"].append(float(self.agent.epsilon))
+        projectile_data = self.env.game.projectile_telemetry()
+        self.history["levels"].append(float(self.env.game.level))
+        self.history["projectiles"].append(float(projectile_data["active_count"]))
+        self.history["slow_fraction"].append(float(projectile_data["slow_fraction"]))
         self.last_info = dict(info)
         episode_finished = False
 
@@ -322,6 +330,7 @@ class PacmanRLSession:
             self.state,
             max_neurons_per_layer=max_neurons_per_layer,
         )
+        projectile_data = self.env.game.projectile_telemetry()
         data.update(
             {
                 "score": self.env.game.score,
@@ -339,6 +348,14 @@ class PacmanRLSession:
                 "lives": self.env.game.lives,
                 "level": self.env.game.level,
                 "pellets": self.env.game._count_dots(),
+                "projectiles": projectile_data,
+                "projectiles_active": projectile_data["active_count"],
+                "player_slowed": projectile_data["player_slowed"],
+                "slow_fraction": projectile_data["slow_fraction"],
+                "slow_timer": projectile_data["slow_timer"],
+                "projectile_shots_fired": projectile_data["shots_fired"],
+                "fireball_hits": projectile_data["fireball_hits"],
+                "freeze_ball_hits": projectile_data["freeze_ball_hits"],
                 "loaded_checkpoint": self.loaded_checkpoint,
                 "history": self.history_snapshot(),
             }

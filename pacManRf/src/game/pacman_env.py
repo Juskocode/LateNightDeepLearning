@@ -18,7 +18,6 @@ from typing import Sequence
 import numpy as np
 
 from .constants import (
-    FRIGHTENED_SECONDS,
     STARTING_LIVES,
     Direction,
     GamePhase,
@@ -74,9 +73,10 @@ class RewardConfig:
     blocked_action: float = -0.10
     closer_to_pellet: float = 0.05
     farther_from_pellet: float = -0.02
+    freeze_hit: float = -5.0
     life_lost: float = -25.0
     game_over: float = -25.0
-    level_cleared: float = 50.0
+    level_cleared: float = 500.0
 
 
 class PacmanEnv:
@@ -115,7 +115,11 @@ class PacmanEnv:
         self.auto_advance_levels = bool(auto_advance_levels)
         self.max_episode_steps = max_episode_steps
         self.rewards = rewards or RewardConfig()
-        self.game = PacmanGame(render=render, seed=self.seed)
+        self.game = PacmanGame(
+            render=render,
+            seed=self.seed,
+            auto_advance_on_clear=False,
+        )
         self.render_enabled = render
 
         self.episode_steps = 0
@@ -180,15 +184,20 @@ class PacmanEnv:
         pellets_before = self._count_cell(".")
         power_before = self._count_cell("o")
         eaten_before = tuple(ghost.eaten for ghost in self.game.ghosts)
+        shots_before = self.game.projectile_shots_fired
+        fireball_hits_before = self.game.fireball_hits
+        freeze_ball_hits_before = self.game.freeze_ball_hits
         nearest_pellet_before = self._nearest_distance(self._dot_cells())
         action_blocked = not self.game._can_move(start_grid, requested_direction)
 
         self.game.next_direction = requested_direction
         internal_frames = 0
         stalled = False
+        projectile_events = []
         while True:
             internal_frames += 1
             self.game._update(self.frame_dt)
+            projectile_events.extend(self.game.last_projectile_events)
 
             if self.game.lives < lives_before:
                 break
@@ -217,6 +226,9 @@ class PacmanEnv:
             int(not was_eaten and is_eaten)
             for was_eaten, is_eaten in zip(eaten_before, eaten_after_event)
         )
+        projectiles_fired = self.game.projectile_shots_fired - shots_before
+        fireball_hits = self.game.fireball_hits - fireball_hits_before
+        freeze_ball_hits = self.game.freeze_ball_hits - freeze_ball_hits_before
         life_lost = self.game.lives < lives_before
         level_cleared = (
             self.game.phase == GamePhase.CLEARING
@@ -230,6 +242,7 @@ class PacmanEnv:
             "score": score_delta * self.rewards.score_scale,
             "blocked_action": self.rewards.blocked_action if action_blocked else 0.0,
             "pellet_progress": 0.0,
+            "freeze_hit": self.rewards.freeze_hit * freeze_ball_hits,
             "life_lost": self.rewards.life_lost if life_lost else 0.0,
             "game_over": self.rewards.game_over if game_over else 0.0,
             "level_cleared": self.rewards.level_cleared if level_cleared else 0.0,
@@ -294,6 +307,25 @@ class PacmanEnv:
                 "pellets_eaten": pellets_eaten,
                 "power_pellets_eaten": power_pellets_eaten,
                 "ghosts_eaten": ghosts_eaten,
+                "projectiles_fired": projectiles_fired,
+                "projectile_shots_fired": projectiles_fired,
+                "fireball_hits": fireball_hits,
+                "freeze_ball_hits": freeze_ball_hits,
+                "projectile_events": [
+                    {
+                        "id": event.projectile_id,
+                        "owner": event.owner,
+                        "kind": event.kind.value,
+                        "reason": event.reason.value,
+                        "cell": event.cell,
+                        "position_tiles": event.position_tiles,
+                        "damage": event.damage,
+                        "slow_fraction": event.slow_fraction,
+                    }
+                    for event in projectile_events
+                ],
+                "pacman_slowed": self.game.player_slow.active,
+                "slow_remaining_seconds": self.game.player_slow.remaining_seconds,
                 "life_lost": life_lost,
                 "level_cleared": level_cleared,
                 "cleared_level": start_level if level_cleared else None,
@@ -370,11 +402,12 @@ class PacmanEnv:
         directions = self._relative_directions(self.game.player.direction)
         dots = self._dot_cells()
         power_pellets = self._cells_containing("o")
-        threats = {
+        ghost_threats = {
             ghost.grid
             for ghost in self.game.ghosts
             if ghost.released and not ghost.eaten and self.game.frightened_timer <= 0
         }
+        projectile_threats = self.game.projectile_threat_cells()
         edible_ghosts = {
             ghost.grid
             for ghost in self.game.ghosts
@@ -385,7 +418,16 @@ class PacmanEnv:
         values.extend(float(self.game._can_move(self.game.player.grid, direction)) for direction in directions)
         values.extend(self._directional_proximity(directions, dots, horizon=40))
         values.extend(self._directional_proximity(directions, power_pellets, horizon=40))
-        values.extend(self._directional_proximity(directions, threats, horizon=8))
+        ghost_proximity = self._directional_proximity(directions, ghost_threats, horizon=8)
+        projectile_proximity = self._directional_proximity(
+            directions,
+            projectile_threats,
+            horizon=15,
+        )
+        values.extend(
+            max(ghost_value, projectile_value)
+            for ghost_value, projectile_value in zip(ghost_proximity, projectile_proximity)
+        )
         values.extend(self._directional_proximity(directions, edible_ghosts, horizon=12))
         values.extend(
             float(self.game.player.direction == direction)
@@ -395,7 +437,7 @@ class PacmanEnv:
             (
                 self.game.player.grid_x / max(1, self.game.cols - 1),
                 self.game.player.grid_y / max(1, self.game.rows - 1),
-                min(1.0, self.game.frightened_timer / FRIGHTENED_SECONDS),
+                min(1.0, self.game.frightened_timer / self.game.frightened_duration),
                 self.game._count_dots() / max(1, self.game.total_dots),
                 min(1.0, self.game.lives / (STARTING_LIVES + 1)),
                 min(1.0, self.game.level / 10.0),
@@ -508,6 +550,7 @@ class PacmanEnv:
         return sum(cell == character for row in self.game.maze for cell in row)
 
     def _base_info(self) -> dict:
+        projectile_data = self.game.projectile_telemetry()
         return {
             "score": self.game.score,
             "lives": self.game.lives,
@@ -518,6 +561,13 @@ class PacmanEnv:
             "phase": self.game.phase.name,
             "ghost_mode": self.game.ghost_mode.name,
             "frightened_timer": self.game.frightened_timer,
+            "ghost_speed_multiplier": self.game.ghost_speed_multiplier,
+            "frightened_duration": self.game.frightened_duration,
+            "projectiles": projectile_data,
+            "projectiles_active": projectile_data["active_count"],
+            "player_slowed": projectile_data["player_slowed"],
+            "slow_fraction": projectile_data["slow_fraction"],
+            "slow_timer": projectile_data["slow_timer"],
             "episode_steps": self.episode_steps,
             "episode_return": self.episode_return,
         }

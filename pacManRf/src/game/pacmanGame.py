@@ -12,12 +12,23 @@ import pygame
 
 from .constants import (
     BLACK, CLEAR_SECONDS, CYAN, DEATH_SECONDS, EATEN_GHOST_SPEED,
-    EXTRA_LIFE_SCORE, FPS, FRIGHTENED_SECONDS, FRIGHTENED_SPEED, GHOST_SPEED,
-    HUD_BG, HUD_HEIGHT, MUTED, PELLET, PINK, PLAYER_SPEED, READY_SECONDS,
-    STARTING_LIVES, TILE_SIZE, WALL_BLUE, WALL_FILL, WALL_GLOW, WHITE, YELLOW,
-    Direction, FONT_PATH, GamePhase, GameStatus, GhostMode,
+    EXTRA_LIFE_SCORE, FPS, FRIGHTENED_DECREASE_PER_LEVEL, FRIGHTENED_SECONDS,
+    FRIGHTENED_SPEED, GHOST_SPEED, GHOST_SPEED_INCREASE_PER_LEVEL, HUD_BG,
+    HUD_HEIGHT, MAX_GHOST_SPEED_MULTIPLIER, MIN_FRIGHTENED_SECONDS, MUTED,
+    PELLET, PINK, PLAYER_SPEED, READY_SECONDS, STARTING_LIVES, TILE_SIZE,
+    WALL_BLUE, WALL_FILL, WALL_GLOW, WHITE, YELLOW, Direction, FONT_PATH,
+    GamePhase, GameStatus, GhostMode,
 )
 from .pacmanSprite import GhostSprite, PacmanSprite
+from .projectileSprite import ProjectileSprite
+from .projectiles import (
+    DEFAULT_PROJECTILE_SPECS,
+    GhostProjectileSystem,
+    PacmanSlowState,
+    Projectile,
+    ProjectileEvent,
+    ProjectileKind,
+)
 
 
 MAZE_TEMPLATE = (
@@ -100,6 +111,16 @@ class ScorePopup:
     age: float = 0.0
 
 
+@dataclass
+class ProjectileImpact:
+    """Short-lived visual left behind when a projectile despawns."""
+
+    kind: ProjectileKind
+    position: pygame.Vector2
+    lifetime: float = 0.34
+    age: float = 0.0
+
+
 MODE_SCHEDULE = (
     (GhostMode.SCATTER, 7.0),
     (GhostMode.CHASE, 20.0),
@@ -111,15 +132,35 @@ MODE_SCHEDULE = (
 
 RELEASE_DELAYS = (0.0, 1.4, 3.6, 5.8)
 SCATTER_TARGETS = ((19, 0), (0, 0), (19, 20), (0, 20))
+PROJECTILE_READY_DELAY = 1.0
+PLAYER_PROJECTILE_COLLISION_RADIUS_TILES = 0.30
 
 
 class PacmanGame:
     """Owns rules, state transitions, rendering, and a deterministic update loop."""
 
-    def __init__(self, render: bool = True, seed: int = 7):
+    def __init__(
+        self,
+        render: bool = True,
+        seed: int = 7,
+        *,
+        auto_advance_on_clear: bool = True,
+    ):
         pygame.init()
         self.rng = random.Random(seed)
+        self.projectile_system = GhostProjectileSystem(self.rng)
+        self.player_slow = PacmanSlowState()
+        self.projectile_sprites = {
+            spec.kind: ProjectileSprite(spec, TILE_SIZE)
+            for spec in DEFAULT_PROJECTILE_SPECS
+        }
+        self.projectile_impacts: list[ProjectileImpact] = []
+        self.last_projectile_events: tuple[ProjectileEvent, ...] = ()
+        self.projectile_shots_fired = 0
+        self.fireball_hits = 0
+        self.freeze_ball_hits = 0
         self.render_enabled = render
+        self.auto_advance_on_clear = bool(auto_advance_on_clear)
         self.cols = len(MAZE_TEMPLATE[0])
         self.rows = len(MAZE_TEMPLATE)
         self.maze_width = self.cols * TILE_SIZE
@@ -185,6 +226,26 @@ class PacmanGame:
     def direction(self):
         return self.player.direction
 
+    @property
+    def ghost_speed_multiplier(self) -> float:
+        increase = (self.level - 1) * GHOST_SPEED_INCREASE_PER_LEVEL
+        return min(MAX_GHOST_SPEED_MULTIPLIER, 1.0 + max(0.0, increase))
+
+    @property
+    def frightened_duration(self) -> float:
+        decrease = (self.level - 1) * FRIGHTENED_DECREASE_PER_LEVEL
+        return max(MIN_FRIGHTENED_SECONDS, FRIGHTENED_SECONDS - max(0.0, decrease))
+
+    @property
+    def active_projectiles(self) -> tuple[Projectile, ...]:
+        """Read-only projectile snapshot used by rendering and observability."""
+
+        return self.projectile_system.active_projectiles
+
+    @property
+    def player_speed_multiplier(self) -> float:
+        return self.player_slow.speed_multiplier
+
     def _count_dots(self) -> int:
         return sum(cell in ".o" for row in self.maze for cell in row)
 
@@ -238,6 +299,12 @@ class PacmanGame:
             popup.age += dt
             popup.position.y -= 24 * dt
         self.score_popups = [popup for popup in self.score_popups if popup.age < popup.lifetime]
+        for impact in self.projectile_impacts:
+            impact.age += dt
+        self.projectile_impacts = [
+            impact for impact in self.projectile_impacts if impact.age < impact.lifetime
+        ]
+        self.last_projectile_events = ()
 
         if self.phase == GamePhase.READY:
             self.phase_timer -= dt
@@ -254,8 +321,17 @@ class PacmanGame:
         if self.phase == GamePhase.CLEARING:
             self.phase_timer -= dt
             if self.phase_timer <= 0:
-                self.status = GameStatus.WON
-                self.high_score = max(self.high_score, self.score)
+                if self.auto_advance_on_clear:
+                    self.next_level()
+                else:
+                    self.status = GameStatus.WON
+                    self.high_score = max(self.high_score, self.score)
+            return
+
+        self.player_slow.update(dt)
+        self.last_projectile_events = self._update_projectiles(dt)
+        self.player.speed = PLAYER_SPEED * self.player_speed_multiplier
+        if self.phase != GamePhase.ACTIVE:
             return
 
         frightened_before = self.frightened_timer
@@ -280,7 +356,7 @@ class PacmanGame:
         if self.phase != GamePhase.ACTIVE:
             return
 
-        speed_scale = 1 + min(0.18, (self.level - 1) * 0.035)
+        speed_scale = self.ghost_speed_multiplier
         for index, ghost in enumerate(self.ghosts):
             if not ghost.released:
                 ghost.release_timer -= dt
@@ -308,11 +384,14 @@ class PacmanGame:
             self._check_ghost_collisions()
             if self.phase != GamePhase.ACTIVE:
                 return
+            if ghost.target is None:
+                self._try_fire_projectile(ghost)
 
         if self._count_dots() == 0:
             self.phase = GamePhase.CLEARING
             self.phase_timer = CLEAR_SECONDS
             self.high_score = max(self.high_score, self.score)
+            self._clear_combat_transients(reset_cooldowns=False)
 
     def _update_ghost_mode(self, dt: float) -> None:
         if math.isinf(self.mode_timer):
@@ -364,6 +443,184 @@ class PacmanGame:
         mover.position += delta.normalize() * step
         return False
 
+    def _projectile_next_cell(
+        self,
+        cell: tuple[int, int],
+        direction: tuple[int, int],
+    ) -> tuple[int, int]:
+        """Advance one projectile tile while preserving the maze tunnel."""
+
+        x, y = cell[0] + direction[0], cell[1] + direction[1]
+        if y == 9:
+            x %= self.cols
+        return x, y
+
+    def _projectile_cell_is_walkable(self, cell: tuple[int, int]) -> bool:
+        return self._cell(*cell) != "#"
+
+    def _projectile_hits_player(
+        self,
+        projectile: Projectile,
+        _cell: tuple[int, int],
+    ) -> bool:
+        """Use interpolated sprite positions instead of stale grid ownership."""
+
+        projectile_x, projectile_y = self._projectile_pixel_position(projectile)
+        player_x = self.player.position.x
+        if projectile.cell[1] == 9 and self.player.grid_y == 9:
+            player_x %= self.maze_width
+            horizontal = min(
+                abs(projectile_x - player_x),
+                self.maze_width - abs(projectile_x - player_x),
+            )
+        else:
+            horizontal = abs(projectile_x - player_x)
+        vertical = abs(projectile_y - self.player.position.y)
+        radius = TILE_SIZE * (
+            PLAYER_PROJECTILE_COLLISION_RADIUS_TILES + projectile.spec.radius_tiles
+        )
+        return horizontal * horizontal + vertical * vertical <= radius * radius
+
+    def _try_fire_projectile(self, ghost: Ghost) -> None:
+        suppressed = (
+            self.phase != GamePhase.ACTIVE
+            or not ghost.released
+            or ghost.eaten
+            or self.frightened_timer > 0
+        )
+        projectile = self.projectile_system.try_fire_at_target(
+            ghost.name,
+            self.level,
+            ghost.grid,
+            self.player.grid,
+            self._projectile_cell_is_walkable,
+            next_cell=self._projectile_next_cell,
+            suppressed=suppressed,
+        )
+        if projectile is not None:
+            self.projectile_shots_fired += 1
+
+    def _update_projectiles(self, dt: float) -> tuple[ProjectileEvent, ...]:
+        events = self.projectile_system.update(
+            dt,
+            None,
+            self._projectile_cell_is_walkable,
+            next_cell=self._projectile_next_cell,
+            pacman_collision_test=self._projectile_hits_player,
+        )
+        processed = []
+        for event in events:
+            self._apply_projectile_event(event)
+            processed.append(event)
+            if self.phase != GamePhase.ACTIVE:
+                break
+        return tuple(processed)
+
+    def _apply_projectile_event(self, event: ProjectileEvent) -> None:
+        x, y = event.position_tiles
+        pixel_x = (x + 0.5) * TILE_SIZE
+        if event.cell[1] == 9:
+            pixel_x %= self.maze_width
+        position = pygame.Vector2(
+            pixel_x,
+            (y + 0.5) * TILE_SIZE,
+        )
+        self.projectile_impacts.append(ProjectileImpact(event.kind, position))
+        if not event.hit_pacman:
+            return
+
+        if event.kind == ProjectileKind.FIREBALL and event.damage:
+            self.fireball_hits += 1
+            self.score_popups.append(
+                ScorePopup("FIRE HIT", position, (255, 125, 55), lifetime=0.9)
+            )
+            self._lose_life()
+        elif event.kind == ProjectileKind.FREEZE_BALL and self.player_slow.apply(event):
+            self.freeze_ball_hits += 1
+            self.player.speed = PLAYER_SPEED * self.player_speed_multiplier
+            self.flash_timer = max(self.flash_timer, 0.18)
+            self.score_popups.append(
+                ScorePopup("FROZEN -15%", position, CYAN, lifetime=1.05)
+            )
+
+    def _clear_combat_transients(
+        self,
+        *,
+        reset_cooldowns: bool,
+        clear_impacts: bool = True,
+    ) -> None:
+        if reset_cooldowns:
+            self.projectile_system.reset_level(
+                initial_cooldown_seconds=PROJECTILE_READY_DELAY,
+            )
+        else:
+            self.projectile_system.clear_projectiles()
+        self.player_slow.clear()
+        self.player.speed = PLAYER_SPEED
+        self.last_projectile_events = ()
+        if clear_impacts:
+            self.projectile_impacts.clear()
+
+    def projectile_threat_cells(self) -> set[tuple[int, int]]:
+        """Return occupied and future ray cells for checkpoint-safe vision."""
+
+        cells: set[tuple[int, int]] = set()
+        for projectile in self.active_projectiles:
+            cell = projectile.cell
+            cells.add(cell)
+            remaining = projectile.spec.range_tiles - projectile.tiles_travelled
+            for _ in range(max(0, remaining)):
+                cell = self._projectile_next_cell(cell, projectile.direction)
+                if not self._projectile_cell_is_walkable(cell):
+                    break
+                cells.add(cell)
+        return cells
+
+    def projectile_telemetry(self) -> dict[str, object]:
+        """Expose live projectile rules without leaking mutable game objects."""
+
+        cooldowns = self.projectile_system.cooldowns
+        weapons = {}
+        for roll in self.projectile_system.unlocks.rolls:
+            spec = self.projectile_system.spec_for(roll.owner)
+            weapons[roll.owner] = {
+                "kind": roll.kind.value,
+                "unlocked": self.projectile_system.is_unlocked(roll.owner, self.level),
+                "unlocked_early": roll.unlocked_early,
+                "early_unlock_chance": roll.probability,
+                "unlock_level": spec.unlock_level if spec is not None else 3,
+                "range_tiles": spec.range_tiles if spec is not None else 0,
+                "cooldown_seconds": cooldowns.get(roll.owner, 0.0),
+            }
+        active = []
+        for projectile in self.active_projectiles:
+            x, y = projectile.position_tiles
+            active.append(
+                {
+                    "id": projectile.projectile_id,
+                    "owner": projectile.owner,
+                    "kind": projectile.kind.value,
+                    "cell": projectile.cell,
+                    "direction": projectile.direction,
+                    "progress": projectile.progress,
+                    "position_tiles": (x, y),
+                    "tiles_travelled": projectile.tiles_travelled,
+                    "remaining_range_tiles": projectile.remaining_range_tiles,
+                    "range_tiles": projectile.spec.range_tiles,
+                }
+            )
+        return {
+            "weapons": weapons,
+            "active": active,
+            "active_count": len(active),
+            "player_slowed": self.player_slow.active,
+            "slow_fraction": self.player_slow.fraction,
+            "slow_timer": self.player_slow.remaining_seconds,
+            "shots_fired": self.projectile_shots_fired,
+            "fireball_hits": self.fireball_hits,
+            "freeze_ball_hits": self.freeze_ball_hits,
+        }
+
     def _eat_current_cell(self) -> None:
         x, y = self.player.grid
         if not (0 <= x < self.cols and 0 <= y < self.rows):
@@ -375,7 +632,7 @@ class PacmanGame:
         elif cell == "o":
             self.maze[y][x] = " "
             self._add_score(50, "POWER", CYAN)
-            self.frightened_timer = FRIGHTENED_SECONDS
+            self.frightened_timer = self.frightened_duration
             self.ghost_chain = 0
             self.flash_timer = 0.22
             for ghost in self.ghosts:
@@ -461,6 +718,10 @@ class PacmanGame:
         self.high_score = max(self.high_score, self.score)
         self.frightened_timer = 0.0
         self.ghost_chain = 0
+        self._clear_combat_transients(
+            reset_cooldowns=False,
+            clear_impacts=False,
+        )
         self.phase = GamePhase.DYING
         self.phase_timer = DEATH_SECONDS
         self.flash_timer = 0.28
@@ -469,6 +730,7 @@ class PacmanGame:
             return
 
     def _reset_round_positions(self) -> None:
+        self._clear_combat_transients(reset_cooldowns=True)
         self.player.reset_position((9, 15), Direction.LEFT)
         self.next_direction = Direction.LEFT
         for index, ghost in enumerate(self.ghosts):
@@ -479,6 +741,10 @@ class PacmanGame:
             ghost.reset_position(ghost.spawn, Direction.LEFT if index % 2 == 0 else Direction.RIGHT)
 
     def restart(self) -> None:
+        self.projectile_system.start_new_run()
+        self.projectile_shots_fired = 0
+        self.fireball_hits = 0
+        self.freeze_ball_hits = 0
         self.maze = [list(row) for row in MAZE_TEMPLATE]
         self.score = 0
         self.lives = STARTING_LIVES
@@ -510,6 +776,7 @@ class PacmanGame:
     def _render(self, dt: float) -> None:
         self.display.fill(BLACK)
         self._draw_maze()
+        self._draw_projectiles()
         pygame.draw.ellipse(
             self.display, (0, 0, 0, 105),
             (self.player.position.x - 10, self.player.position.y + 6, 20, 7),
@@ -521,6 +788,7 @@ class PacmanGame:
         self.player.sprite.draw(self.display, self.player.position, dt, death_progress)
         if self.phase != GamePhase.DYING:
             for ghost in self.ghosts:
+                self._draw_armed_ghost_aura(ghost)
                 pygame.draw.ellipse(
                     self.display, (0, 0, 0, 90),
                     (ghost.position.x - 10, ghost.position.y + 7, 20, 6),
@@ -542,9 +810,61 @@ class PacmanGame:
         if self.render_enabled:
             pygame.display.flip()
 
+    def _projectile_pixel_position(self, projectile: Projectile) -> tuple[float, float]:
+        x, y = projectile.position_tiles
+        pixel_x = (x + 0.5) * TILE_SIZE
+        if projectile.cell[1] == 9:
+            pixel_x %= self.maze_width
+        return pixel_x, (y + 0.5) * TILE_SIZE
+
+    def _draw_projectiles(self) -> None:
+        for projectile in self.active_projectiles:
+            sprite = self.projectile_sprites[projectile.kind]
+            sprite.draw(
+                self.display,
+                self._projectile_pixel_position(projectile),
+                self.animation_time,
+            )
+        for impact in self.projectile_impacts:
+            progress = impact.age / impact.lifetime
+            self.projectile_sprites[impact.kind].draw_impact(
+                self.display,
+                impact.position,
+                progress,
+            )
+
+    def _draw_armed_ghost_aura(self, ghost: Ghost) -> None:
+        if (
+            ghost.eaten
+            or self.frightened_timer > 0
+            or not self.projectile_system.is_unlocked(ghost.name, self.level)
+        ):
+            return
+        spec = self.projectile_system.spec_for(ghost.name)
+        if spec is None:
+            return
+        phase_offset = 0 if ghost.name == "BLINKY" else 1.7
+        pulse = (math.sin(self.animation_time * 5.5 + phase_offset) + 1) / 2
+        radius = round(TILE_SIZE * (0.54 + pulse * 0.06))
+        pygame.draw.circle(
+            self.display,
+            spec.glow_color,
+            (round(ghost.position.x), round(ghost.position.y)),
+            radius,
+            1,
+        )
+        angle = self.animation_time * (3.4 if ghost.name == "BLINKY" else -2.7)
+        particle = (
+            round(ghost.position.x + math.cos(angle) * radius),
+            round(ghost.position.y + math.sin(angle) * radius),
+        )
+        pygame.draw.circle(self.display, spec.color, particle, 2)
+
     def _build_maze_surface(self) -> pygame.Surface:
         surface = pygame.Surface((self.maze_width, self.maze_height))
         surface.fill(BLACK)
+        contour_inset = 2
+        contour_paths: list[tuple[tuple[int, int], tuple[int, int]]] = []
 
         def is_wall(x: int, y: int) -> bool:
             if not (0 <= x < self.cols and 0 <= y < self.rows):
@@ -558,15 +878,67 @@ class PacmanGame:
                 x, y = col * TILE_SIZE, row * TILE_SIZE
                 pygame.draw.rect(surface, WALL_FILL, (x, y, TILE_SIZE, TILE_SIZE))
                 edges = (
-                    (not is_wall(col, row - 1), (x, y + 2), (x + TILE_SIZE, y + 2)),
-                    (not is_wall(col, row + 1), (x, y + TILE_SIZE - 2), (x + TILE_SIZE, y + TILE_SIZE - 2)),
-                    (not is_wall(col - 1, row), (x + 2, y), (x + 2, y + TILE_SIZE)),
-                    (not is_wall(col + 1, row), (x + TILE_SIZE - 2, y), (x + TILE_SIZE - 2, y + TILE_SIZE)),
+                    (
+                        not is_wall(col, row - 1),
+                        (x, y + contour_inset),
+                        (x + TILE_SIZE, y + contour_inset),
+                    ),
+                    (
+                        not is_wall(col, row + 1),
+                        (x, y + TILE_SIZE - contour_inset),
+                        (x + TILE_SIZE, y + TILE_SIZE - contour_inset),
+                    ),
+                    (
+                        not is_wall(col - 1, row),
+                        (x + contour_inset, y),
+                        (x + contour_inset, y + TILE_SIZE),
+                    ),
+                    (
+                        not is_wall(col + 1, row),
+                        (x + TILE_SIZE - contour_inset, y),
+                        (x + TILE_SIZE - contour_inset, y + TILE_SIZE),
+                    ),
                 )
                 for visible, start, end in edges:
                     if visible:
-                        pygame.draw.line(surface, WALL_GLOW, start, end, 6)
-                        pygame.draw.line(surface, WALL_BLUE, start, end, 2)
+                        contour_paths.append((start, end))
+
+        # A three-wall vertex has one open quadrant. Its two exposed edges stop
+        # short of one another because both are inset, so route an L-shaped
+        # join through the opposite (wall) quadrant. Vertices with two diagonal
+        # walls are intentionally left alone: joining those would visually seal
+        # two corridors that only meet at a point.
+        for vertex_y in range(1, self.rows):
+            for vertex_x in range(1, self.cols):
+                x, y = vertex_x * TILE_SIZE, vertex_y * TILE_SIZE
+                quadrants = (
+                    (is_wall(vertex_x - 1, vertex_y - 1), -1, -1),
+                    (is_wall(vertex_x, vertex_y - 1), 1, -1),
+                    (is_wall(vertex_x - 1, vertex_y), -1, 1),
+                    (is_wall(vertex_x, vertex_y), 1, 1),
+                )
+                if sum(wall for wall, _, _ in quadrants) != 3:
+                    continue
+                _, floor_dx, floor_dy = next(
+                    quadrant for quadrant in quadrants if not quadrant[0]
+                )
+                join = (
+                    x - floor_dx * contour_inset,
+                    y - floor_dy * contour_inset,
+                )
+                contour_paths.extend(
+                    (
+                        ((join[0], y), join),
+                        (join, (x, join[1])),
+                    )
+                )
+
+        # Paint in layers so a later glow never washes over an already crisp
+        # blue contour at intersections and tightly packed corners.
+        for start, end in contour_paths:
+            pygame.draw.line(surface, WALL_GLOW, start, end, 6)
+        for start, end in contour_paths:
+            pygame.draw.line(surface, WALL_BLUE, start, end, 2)
 
         # The ghost-house gate is visual only; the movement graph deliberately
         # lets returning eyes pass through it.
@@ -614,6 +986,13 @@ class PacmanGame:
         self.display.blit(high, (174, y + 12))
         self.display.blit(dots, (14, y + 43))
         self.display.blit(level, (174, y + 43))
+        if self.player_slow.active:
+            slowed = self.tiny_font.render(
+                f"FROZEN -15%  {self.player_slow.remaining_seconds:0.1f}s",
+                True,
+                CYAN,
+            )
+            self.display.blit(slowed, (258, y + 44))
         for life in range(self.lives):
             pygame.draw.circle(self.display, YELLOW, (self.maze_width - 20 - life * 25, y + 24), 8)
             pygame.draw.polygon(self.display, HUD_BG, [(self.maze_width - 20 - life * 25, y + 24),
@@ -625,11 +1004,25 @@ class PacmanGame:
             bar = pygame.Rect(self.maze_width - 122, y + 68, 108, 5)
             pygame.draw.rect(self.display, (29, 40, 68), bar, border_radius=2)
             fill = bar.copy()
-            fill.width = round(bar.width * self.frightened_timer / FRIGHTENED_SECONDS)
+            fill.width = round(bar.width * self.frightened_timer / self.frightened_duration)
             pygame.draw.rect(self.display, CYAN, fill, border_radius=2)
         else:
             mode = self.tiny_font.render(self.ghost_mode.name, True, MUTED)
             self.display.blit(mode, (self.maze_width - 75, y + 51))
+
+        for x, owner, label in ((14, "BLINKY", "FIRE"), (174, "INKY", "FREEZE")):
+            spec = self.projectile_system.spec_for(owner)
+            unlocked = self.projectile_system.is_unlocked(owner, self.level)
+            cooldown = self.projectile_system.seconds_until_ready(owner)
+            if unlocked and cooldown <= 0:
+                suffix = "READY"
+            elif unlocked:
+                suffix = f"{cooldown:0.1f}s"
+            else:
+                suffix = "LOCKED"
+            color = spec.color if spec is not None and unlocked else MUTED
+            weapon = self.tiny_font.render(f"{label}  {suffix}", True, color)
+            self.display.blit(weapon, (x, y + 69))
 
     def _draw_overlay(self) -> None:
         overlay = pygame.Surface((self.maze_width, 92), pygame.SRCALPHA)

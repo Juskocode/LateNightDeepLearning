@@ -10,6 +10,7 @@ from PIL import Image
 import pygame
 import torch
 
+from pacManRf.src.game.constants import Direction
 from pacManRf.src.game.pacman_env import ACTION_LABELS, OBSERVATION_LABELS, PacmanEnv
 from pacManRf.src.ml import DQNConfig, PacmanDQNAgent, PacmanQNetwork
 from pacManRf.src.ml.trainer import DQNTrainer
@@ -41,6 +42,29 @@ def small_session(seed=9):
 
 
 class PacmanEnvironmentTests(unittest.TestCase):
+    @staticmethod
+    def _suppress_ghosts(env):
+        for ghost in env.game.ghosts:
+            ghost.released = False
+            ghost.release_timer = 999.0
+
+    @staticmethod
+    def _spawn_imminent_projectile(env, owner):
+        env.game.level = 3
+        env.game.projectile_system.reset_level(initial_cooldown_seconds=0.0)
+        shot = env.game.projectile_system.try_fire(
+            owner,
+            env.game.level,
+            (8, 15),
+            (1, 0),
+            env.game._projectile_cell_is_walkable,
+            next_cell=env.game._projectile_next_cell,
+        )
+        if shot is None:
+            raise AssertionError("test projectile did not spawn")
+        shot.progress = 0.99
+        return shot
+
     def test_observation_contract_is_named_normalized_and_finite(self):
         env = PacmanEnv(seed=2)
         state = env.reset(seed=2)
@@ -74,6 +98,90 @@ class PacmanEnvironmentTests(unittest.TestCase):
             env.step([1, 1, 0, 0])
         with self.assertRaises(ValueError):
             env.step(4)
+
+    def test_level_clear_gives_huge_reward_and_preserves_run(self):
+        env = PacmanEnv(seed=29, auto_advance_levels=True)
+        env.game.maze = [
+            [" " if cell in ".o" else cell for cell in row]
+            for row in env.game.maze
+        ]
+        env.game.maze[15][8] = "."
+        env.game.score = 1_234
+        env.game.lives = 2
+
+        _, reward, done, info = env.step(0)
+
+        self.assertFalse(done)
+        self.assertEqual(env.game.level, 2)
+        self.assertEqual(env.game.score, 1_244)
+        self.assertEqual(env.game.lives, 2)
+        self.assertEqual(info["cleared_level"], 1)
+        self.assertEqual(info["reward_components"]["level_cleared"], 500.0)
+        self.assertGreater(reward, 500.0)
+        self.assertEqual(env.episode_steps, 1)
+        self.assertEqual(env.game._count_dots(), env.game.total_dots)
+
+    def test_freeze_event_survives_multi_frame_step_and_penalizes_agent(self):
+        env = PacmanEnv(seed=37)
+        self._suppress_ghosts(env)
+        self._spawn_imminent_projectile(env, "INKY")
+
+        state, reward, done, info = env.step(0)
+
+        self.assertEqual(state.shape, (32,))
+        self.assertFalse(done)
+        self.assertEqual(env.game.lives, 3)
+        self.assertTrue(env.game.player_slow.active)
+        self.assertAlmostEqual(env.game.player_speed_multiplier, 0.85)
+        self.assertEqual(info["freeze_ball_hits"], 1)
+        self.assertEqual(info["fireball_hits"], 0)
+        self.assertEqual(info["reward_components"]["freeze_hit"], -5.0)
+        self.assertLess(reward, 0.0)
+        self.assertEqual(info["projectile_events"][0]["kind"], "freeze_ball")
+        self.assertEqual(info["projectile_events"][0]["reason"], "hit_pacman")
+
+    def test_fireball_uses_life_loss_penalty_without_double_penalty(self):
+        env = PacmanEnv(seed=41)
+        self._suppress_ghosts(env)
+        env.game.score = 123
+        self._spawn_imminent_projectile(env, "BLINKY")
+
+        _, _, done, info = env.step(0)
+
+        self.assertFalse(done)
+        self.assertEqual(env.game.lives, 2)
+        self.assertEqual(env.game.score, 123)
+        self.assertTrue(info["life_lost"])
+        self.assertEqual(info["fireball_hits"], 1)
+        self.assertEqual(info["freeze_ball_hits"], 0)
+        self.assertEqual(info["reward_components"]["life_lost"], -25.0)
+        self.assertEqual(info["reward_components"]["freeze_hit"], 0.0)
+
+    def test_projectile_rays_reuse_threat_features_without_resizing_state(self):
+        env = PacmanEnv(seed=43)
+        self._suppress_ghosts(env)
+        env.game.level = 3
+        env.game.player.reset_position((10, 3), Direction.RIGHT)
+        baseline = env.game.projectile_system.active_projectiles
+        self.assertFalse(baseline)
+        before = env._get_observation()
+
+        env.game.projectile_system.reset_level(initial_cooldown_seconds=0.0)
+        shot = env.game.projectile_system.try_fire(
+            "INKY",
+            3,
+            (4, 3),
+            (1, 0),
+            env.game._projectile_cell_is_walkable,
+            next_cell=env.game._projectile_next_cell,
+        )
+        self.assertIsNotNone(shot)
+        after = env._get_observation()
+
+        self.assertEqual(after.shape, (32,))
+        self.assertTrue(np.any(after[12:16] > before[12:16]))
+        np.testing.assert_array_equal(after[:12], before[:12])
+        np.testing.assert_array_equal(after[16:], before[16:])
 
 
 class PacmanLearningTests(unittest.TestCase):
@@ -151,6 +259,32 @@ class PacmanLearningTests(unittest.TestCase):
         self.assertEqual(len(telemetry["network"]["weights"]), 3)
         self.assertEqual(telemetry["action_labels"], list(ACTION_LABELS))
         self.assertEqual(len(telemetry["observation"]), 32)
+        self.assertIn("projectiles", telemetry)
+        self.assertIn("BLINKY", telemetry["projectiles"]["weapons"])
+        self.assertIn("INKY", telemetry["projectiles"]["weapons"])
+        self.assertEqual(telemetry["projectiles_active"], len(session.env.game.active_projectiles))
+        session.close()
+
+    def test_session_continues_across_level_clear_without_reset(self):
+        session = small_session(seed=31)
+        session.env.game.maze = [
+            [" " if cell in ".o" else cell for cell in row]
+            for row in session.env.game.maze
+        ]
+        session.env.game.maze[15][8] = "."
+        session.env.game.score = 700
+        session.env.game.lives = 2
+        session.state = session.env._get_observation()
+        session.pending_action = 0
+
+        result = session.step()
+
+        self.assertFalse(result["episode_finished"])
+        self.assertEqual(session.env.game.level, 2)
+        self.assertEqual(session.env.game.score, 710)
+        self.assertEqual(session.env.game.lives, 2)
+        self.assertEqual(session.agent.episodes, 0)
+        self.assertFalse(session.agent.memory.tail(1)[0].done)
         session.close()
 
     def test_checkpoint_round_trip_preserves_predictions_and_replay(self):
