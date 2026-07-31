@@ -41,6 +41,7 @@ class _Layer:
     name: str
     size: Optional[int]
     activations: tuple[Optional[float], ...]
+    full_size: Optional[int] = None
 
 
 _MISSING = object()
@@ -628,9 +629,17 @@ class PacmanObservatory:
         pygame.draw.rect(surface, self.theme.panel_alt, rect, border_radius=9)
         pygame.draw.rect(surface, self.theme.grid, rect, 1, border_radius=9)
         self._section_title(surface, "REAL NETWORK STATE", rect.x + 11, rect.y + 9)
+        architecture = _numeric_vector(network.get("architecture"))
+        architecture_text = " → ".join(str(int(value)) for value in architecture if value is not None)
+        parameter_count = _number(network.get("parameter_count"))
+        detail_parts = ["actual forward pass"]
+        if architecture_text:
+            detail_parts.append(architecture_text)
+        if parameter_count is not None:
+            detail_parts.append(f"{int(parameter_count):,} parameters")
         self._text(
             surface,
-            "sampled activations and actual weights",
+            "  ·  ".join(detail_parts),
             (rect.x + 145, rect.y + 10),
             self.theme.muted,
             9,
@@ -707,9 +716,10 @@ class PacmanObservatory:
             title = layer.name
             title_image = self._font(10, bold=True).render(title, True, self.theme.text)
             surface.blit(title_image, (x - title_image.get_width() // 2, graph.bottom + 12))
-            size_text = "size unavailable" if layer.size is None else str(layer.size)
-            if layer.size is not None and len(indices) < layer.size:
-                size_text = f"{len(indices)} / {layer.size} shown"
+            display_size = layer.full_size if layer.full_size is not None else layer.size
+            size_text = "size unavailable" if display_size is None else str(display_size)
+            if display_size is not None and len(indices) < display_size:
+                size_text = f"{len(indices)} / {display_size} shown"
             elif values and not any(value is not None for value in values):
                 size_text = f"{size_text} · no activations"
             size_image = self._font(8).render(size_text, True, self.theme.muted)
@@ -934,7 +944,8 @@ def _network_layers(network: Mapping[str, Any]) -> list[_Layer]:
                 size = _positive_int(raw_layer.get("size", raw_layer.get("width")))
                 if size is None and activations:
                     size = len(activations)
-                layers.append(_Layer(name, size, activations))
+                full_size = _positive_int(raw_layer.get("full_size", raw_layer.get("original_size")))
+                layers.append(_Layer(name, size, activations, full_size or size))
             elif isinstance(raw_layer, str):
                 activation_raw = _sequence_item(raw_activations, index)
                 activations = tuple(_numeric_vector(activation_raw))

@@ -157,7 +157,7 @@ class PacmanRLSession:
         self.last_info = dict(self.env.last_info)
         self.pending_action = self._select_action(self.state)
 
-    def telemetry(self, *, max_neurons_per_layer: int = 14) -> dict[str, Any]:
+    def telemetry(self, *, max_neurons_per_layer: int = 11) -> dict[str, Any]:
         data = self.agent.telemetry(
             self.state,
             max_neurons_per_layer=max_neurons_per_layer,

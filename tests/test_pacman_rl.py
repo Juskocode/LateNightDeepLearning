@@ -107,6 +107,10 @@ class PacmanLearningTests(unittest.TestCase):
         self.assertEqual(len(session.agent.memory), 8)
         self.assertGreater(telemetry["loss"], 0.0)
         self.assertEqual(telemetry["network"]["architecture"], [32, 32, 16, 4])
+        self.assertEqual(
+            [layer["full_size"] for layer in telemetry["network"]["layers"]],
+            telemetry["network"]["architecture"],
+        )
         self.assertEqual(len(telemetry["network"]["weights"]), 3)
         self.assertEqual(telemetry["action_labels"], list(ACTION_LABELS))
         self.assertEqual(len(telemetry["observation"]), 32)
