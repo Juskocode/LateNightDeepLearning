@@ -16,7 +16,11 @@ def parse_args():
     parser.add_argument("--games", type=int, default=0, help="Headless episodes; 0 runs continuously")
     parser.add_argument("--steps", type=int, help="Optional maximum headless decisions")
     parser.add_argument("--speed", type=int, default=30, help="Visual decisions per second")
-    parser.add_argument("--tab", choices=("game", "metrics", "network"), default="game")
+    parser.add_argument(
+        "--tab",
+        choices=("game", "vision", "metrics", "network"),
+        default="game",
+    )
     parser.add_argument("--fresh", action="store_true", help="Ignore an existing Pacman checkpoint")
     parser.add_argument("--checkpoint", type=Path, help="Custom Pacman RL checkpoint")
     parser.add_argument("--eval", action="store_true", help="Disable exploration and learning")
@@ -24,7 +28,7 @@ def parse_args():
     parser.add_argument("--no-save", action="store_true", help="Do not save the RL checkpoint on exit")
     parser.add_argument("--screenshot", type=Path, help="Save the current game/observatory PNG and exit")
     parser.add_argument("--gif", type=Path, help="Capture a live RL observatory GIF and exit")
-    parser.add_argument("--gif-frames", type=int, default=60)
+    parser.add_argument("--gif-frames", type=int, default=48)
     parser.add_argument("--seed", type=int, default=7)
     return parser.parse_args()
 

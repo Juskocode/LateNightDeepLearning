@@ -173,16 +173,40 @@ class PacmanDQNAgent:
             raise ValueError("Direction conversion requires the four-action Pacman space")
         return (Direction.UP, Direction.DOWN, Direction.LEFT, Direction.RIGHT)[self._action_index(action)]
 
-    def remember(self, state: Any, action: int | Sequence[int], reward: float, next_state: Any, done: bool) -> None:
+    def remember(
+        self,
+        state: Any,
+        action: int | Sequence[int],
+        reward: float,
+        next_state: Any,
+        done: bool,
+        next_legal_action_mask: Sequence[bool] | None = None,
+    ) -> None:
         state_values = self._state(state)
         next_values = self._state(next_state)
         action_index = self._action_index(action)
-        self.memory.append(Experience(state_values, action_index, float(reward), next_values, bool(done)))
+        mask = self._legal_mask(next_legal_action_mask)
+        self.memory.append(
+            Experience(state_values, action_index, float(reward), next_values, bool(done), mask)
+        )
         self.last_reward = float(reward)
 
-    def train_short_memory(self, state: Any, action: Any, reward: float, next_state: Any, done: bool) -> float:
+    def train_short_memory(
+        self,
+        state: Any,
+        action: Any,
+        reward: float,
+        next_state: Any,
+        done: bool,
+        next_legal_action_mask: Sequence[bool] | None = None,
+    ) -> float:
         return self.trainer.train_step(
-            self._state(state), self._action_index(action), reward, self._state(next_state), done
+            self._state(state),
+            self._action_index(action),
+            reward,
+            self._state(next_state),
+            done,
+            self._legal_mask(next_legal_action_mask),
         )
 
     def train_long_memory(self) -> float:
@@ -208,8 +232,16 @@ class PacmanDQNAgent:
         reward: float,
         next_state: Any,
         done: bool,
+        next_legal_action_mask: Sequence[bool] | None = None,
     ) -> TrainingMetrics | None:
-        self.remember(state, action, reward, next_state, done)
+        self.remember(
+            state,
+            action,
+            reward,
+            next_state,
+            done,
+            next_legal_action_mask,
+        )
         self.episode_return += float(reward)
         metrics = self.learn_if_ready()
         if done:
@@ -385,4 +417,3 @@ class PacmanDQNAgent:
 
 
 Agent = PacmanDQNAgent
-

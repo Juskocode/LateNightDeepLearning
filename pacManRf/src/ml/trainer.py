@@ -87,18 +87,46 @@ class DQNTrainer:
             raise ValueError("action index is outside the configured action space")
         return tensor
 
-    def _bootstrap_values(self, next_states: torch.Tensor) -> torch.Tensor:
+    def _next_action_masks(self, values: Any, batch_size: int) -> torch.Tensor:
+        if values is None:
+            return torch.ones(
+                (batch_size, self.config.action_size),
+                dtype=torch.bool,
+                device=self.device,
+            )
+        if isinstance(values, torch.Tensor):
+            masks = values.to(device=self.device, dtype=torch.bool)
+        else:
+            masks = torch.as_tensor(np.asarray(values), dtype=torch.bool, device=self.device)
+        if masks.ndim == 1:
+            masks = masks.unsqueeze(0)
+        if masks.shape != (batch_size, self.config.action_size):
+            raise ValueError(
+                "next_legal_action_masks must have shape "
+                f"(batch, {self.config.action_size})"
+            )
+        if not torch.all(masks.any(dim=1)):
+            raise ValueError("every next state must allow at least one action")
+        return masks
+
+    def _bootstrap_values(
+        self,
+        next_states: torch.Tensor,
+        next_legal_action_masks: Any = None,
+    ) -> torch.Tensor:
         """Compute the algorithm-specific bootstrap estimate.
 
         DQN selects and evaluates with the target network. Double-DQN selects
         with the online network and independently evaluates with the target.
         """
 
+        masks = self._next_action_masks(next_legal_action_masks, next_states.shape[0])
         with torch.no_grad():
             target_values = self.target_model(next_states)
             if self.algorithm == "dqn":
-                return target_values.max(dim=1).values
-            selected = self.model(next_states).argmax(dim=1, keepdim=True)
+                return target_values.masked_fill(~masks, -torch.inf).max(dim=1).values
+            online_values = self.model(next_states).masked_fill(~masks, -torch.inf)
+            selected = online_values.argmax(dim=1, keepdim=True)
             return target_values.gather(1, selected).squeeze(1)
 
     def compute_targets(
@@ -106,8 +134,9 @@ class DQNTrainer:
         next_states: torch.Tensor,
         rewards: torch.Tensor,
         dones: torch.Tensor,
+        next_legal_action_masks: Any = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        bootstrap = self._bootstrap_values(next_states)
+        bootstrap = self._bootstrap_values(next_states, next_legal_action_masks)
         targets = rewards + (~dones).float() * self.config.gamma * bootstrap
         return targets, bootstrap
 
@@ -118,6 +147,7 @@ class DQNTrainer:
         rewards: Any,
         next_states: Any,
         dones: Any,
+        next_legal_action_masks: Any = None,
     ) -> TrainingMetrics:
         state_tensor = self._states_tensor(states, "states")
         next_state_tensor = self._states_tensor(next_states, "next_states")
@@ -131,10 +161,14 @@ class DQNTrainer:
             raise ValueError("reward and done batch sizes must match states")
         if not torch.isfinite(reward_tensor).all():
             raise ValueError("rewards must contain finite values")
-
         self.model.train()
         predicted = self.model(state_tensor).gather(1, action_tensor.unsqueeze(1)).squeeze(1)
-        targets, bootstrap = self.compute_targets(next_state_tensor, reward_tensor, done_tensor)
+        targets, bootstrap = self.compute_targets(
+            next_state_tensor,
+            reward_tensor,
+            done_tensor,
+            next_legal_action_masks,
+        )
         per_sample_loss = self.criterion(predicted, targets)
         loss = per_sample_loss.mean()
 
@@ -165,8 +199,23 @@ class DQNTrainer:
         )
         return self.last_metrics
 
-    def train_step(self, state: Any, action: Any, reward: Any, next_state: Any, done: Any) -> float:
-        return self.update(state, action, reward, next_state, done).loss
+    def train_step(
+        self,
+        state: Any,
+        action: Any,
+        reward: Any,
+        next_state: Any,
+        done: Any,
+        next_legal_action_masks: Any = None,
+    ) -> float:
+        return self.update(
+            state,
+            action,
+            reward,
+            next_state,
+            done,
+            next_legal_action_masks,
+        ).loss
 
     def predict(self, states: Any, *, target: bool = False) -> np.ndarray:
         tensor = self._states_tensor(states, "states")
@@ -236,4 +285,3 @@ class QTrainer(DQNTrainer):
             gradient_clip=gradient_clip,
         )
         super().__init__(model, config)
-

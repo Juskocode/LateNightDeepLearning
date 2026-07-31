@@ -20,9 +20,10 @@ from .theme import DEFAULT_THEME, Color, ObservatoryTheme
 
 
 class ObservatoryTab(str, Enum):
-    """The three top-level views exposed by the observatory."""
+    """The four top-level views exposed by the observatory."""
 
     GAME = "GAME"
+    VISION = "VISION"
     METRICS = "METRICS"
     NETWORK = "NETWORK"
 
@@ -54,7 +55,7 @@ class PacmanObservatory:
     The primary API is::
 
         ui = PacmanObservatory()
-        ui.handle_event(event)  # optional; F1/F2/F3, Tab, or tab clicks
+        ui.handle_event(event)  # optional; F1-F4, Tab, or tab clicks
         ui.render(window, telemetry, history=history, game_surface=game)
 
     ``telemetry`` is a mapping.  Common aliases are accepted for scalar
@@ -106,8 +107,9 @@ class PacmanObservatory:
         if event.type == pygame.KEYDOWN:
             key_tabs = {
                 pygame.K_F1: ObservatoryTab.GAME,
-                pygame.K_F2: ObservatoryTab.METRICS,
-                pygame.K_F3: ObservatoryTab.NETWORK,
+                pygame.K_F2: ObservatoryTab.VISION,
+                pygame.K_F3: ObservatoryTab.METRICS,
+                pygame.K_F4: ObservatoryTab.NETWORK,
             }
             if event.key in key_tabs:
                 self.active_tab = key_tabs[event.key]
@@ -176,6 +178,8 @@ class PacmanObservatory:
 
         if self.active_tab is ObservatoryTab.GAME:
             self._draw_game_tab(surface, content, data, supplied_history, game_surface)
+        elif self.active_tab is ObservatoryTab.VISION:
+            self._draw_vision_tab(surface, content, data)
         elif self.active_tab is ObservatoryTab.METRICS:
             self._draw_metrics_tab(surface, content, data, supplied_history)
         else:
@@ -253,7 +257,7 @@ class PacmanObservatory:
             surface.blit(label, label.get_rect(center=tab_rect.center))
             tab_rects[tab] = tab_rect
 
-        shortcut = self._font(9).render("F1   F2   F3", True, self.theme.muted)
+        shortcut = self._font(9).render("F1   F2   F3   F4", True, self.theme.muted)
         if rect.width - shortcut.get_width() - self.PADDING > start_x + total_width:
             surface.blit(shortcut, (rect.width - shortcut.get_width() - self.PADDING, 28))
         return tab_rects
@@ -290,6 +294,242 @@ class PacmanObservatory:
         y = q_rect.bottom + 10
         memory_rect = pygame.Rect(inner.x, y, inner.width, max(72, inner.bottom - y))
         self._draw_memory(surface, memory_rect, telemetry, history)
+
+    def _draw_vision_tab(
+        self,
+        surface: pygame.Surface,
+        rect: pygame.Rect,
+        telemetry: Mapping[str, Any],
+    ) -> None:
+        """Render every value in the live 32-feature observation contract."""
+
+        self._panel(surface, rect)
+        inner = rect.inflate(-18, -18)
+        observation = _observation_values(telemetry)
+        if not observation:
+            self._empty_state(
+                surface,
+                inner,
+                "Vision telemetry unavailable",
+                "Provide observation as a named mapping or a vector with observation_labels",
+            )
+            return
+
+        received = sum(value is not None for value in observation.values())
+        self._text(surface, "AGENT VISION", (inner.x, inner.y), self.theme.text, 16, bold=True)
+        self._text(
+            surface,
+            f"{received} / 32 live inputs received  ·  normalized agent state",
+            (inner.x + 132, inner.y + 4),
+            self.theme.muted,
+            9,
+        )
+        chosen = _chosen_action_index(telemetry, _action_labels(telemetry, 4))
+        action_labels = _action_labels(telemetry, 4)
+        if chosen is not None:
+            action_text = f"NEXT  {action_labels[chosen]}"
+            image = self._font(10, bold=True).render(action_text, True, self.theme.yellow)
+            surface.blit(image, (inner.right - image.get_width(), inner.y + 2))
+
+        body = pygame.Rect(inner.x, inner.y + 36, inner.width, inner.height - 36)
+        gap = 12
+        left_width = max(330, round(body.width * 0.66))
+        left = pygame.Rect(body.x, body.y, left_width, body.height)
+        right = pygame.Rect(left.right + gap, body.y, max(1, body.right - left.right - gap), body.height)
+
+        direction_groups = (
+            ("PATHS", "path", "walkable", self.theme.blue),
+            ("PELLETS", "pellet", "proximity", self.theme.yellow),
+            ("POWER PELLETS", "power pellet", "proximity", self.theme.purple),
+            ("THREATS", "threat", "danger proximity", self.theme.red),
+            ("EDIBLE GHOSTS", "edible ghost", "target proximity", self.theme.cyan),
+        )
+        row_gap = 7
+        row_height = max(68, (left.height - row_gap * (len(direction_groups) - 1)) // len(direction_groups))
+        for index, (title, prefix, detail, color) in enumerate(direction_groups):
+            group_rect = pygame.Rect(
+                left.x,
+                left.y + index * (row_height + row_gap),
+                left.width,
+                row_height,
+            )
+            self._draw_directional_observation_group(
+                surface,
+                group_rect,
+                observation,
+                title=title,
+                prefix=prefix,
+                detail=detail,
+                color=color,
+                chosen_action=chosen,
+            )
+
+        heading_height = min(190, max(150, round(right.height * 0.35)))
+        heading = pygame.Rect(right.x, right.y, right.width, heading_height)
+        context = pygame.Rect(
+            right.x,
+            heading.bottom + gap,
+            right.width,
+            max(1, right.bottom - heading.bottom - gap),
+        )
+        self._draw_heading_observations(surface, heading, observation)
+        self._draw_context_observations(surface, context, observation)
+
+    def _draw_directional_observation_group(
+        self,
+        surface: pygame.Surface,
+        rect: pygame.Rect,
+        observation: Mapping[str, Optional[float]],
+        *,
+        title: str,
+        prefix: str,
+        detail: str,
+        color: Color,
+        chosen_action: Optional[int],
+    ) -> None:
+        pygame.draw.rect(surface, self.theme.panel_alt, rect, border_radius=9)
+        pygame.draw.rect(surface, self.theme.grid, rect, 1, border_radius=9)
+        pygame.draw.rect(surface, color, pygame.Rect(rect.x, rect.y, 4, rect.height), border_radius=3)
+
+        label_width = min(124, max(82, rect.width // 5))
+        self._text(surface, title, (rect.x + 13, rect.y + 11), self.theme.text, 9, bold=True)
+        self._text(surface, detail, (rect.x + 13, rect.y + 31), self.theme.muted, 8)
+
+        directions = ("ahead", "right", "left", "reverse")
+        gap = 6
+        cells_x = rect.x + label_width
+        cell_width = max(1, (rect.right - cells_x - 9 - gap * 3) // 4)
+        for index, direction in enumerate(directions):
+            cell = pygame.Rect(
+                cells_x + index * (cell_width + gap),
+                rect.y + 7,
+                cell_width,
+                rect.height - 14,
+            )
+            selected = index == chosen_action
+            pygame.draw.rect(surface, self.theme.panel, cell, border_radius=7)
+            pygame.draw.rect(
+                surface,
+                self.theme.yellow if selected else self.theme.grid_bright,
+                cell,
+                2 if selected else 1,
+                border_radius=7,
+            )
+            value = observation.get(f"{prefix} {direction}")
+            label_color = self.theme.yellow if selected else self.theme.muted
+            self._text(surface, direction.upper(), (cell.x + 7, cell.y + 6), label_color, 7, bold=selected)
+            value_text = _format_observation(value)
+            self._text(surface, value_text, (cell.x + 7, cell.y + 20), self.theme.text, 11, bold=True)
+            track = pygame.Rect(cell.x + 7, cell.bottom - 11, max(1, cell.width - 14), 5)
+            pygame.draw.rect(surface, self.theme.grid, track, border_radius=3)
+            if value is not None:
+                fill = track.copy()
+                fill.width = round(track.width * max(0.0, min(1.0, value)))
+                if fill.width:
+                    pygame.draw.rect(surface, color, fill, border_radius=3)
+
+    def _draw_heading_observations(
+        self,
+        surface: pygame.Surface,
+        rect: pygame.Rect,
+        observation: Mapping[str, Optional[float]],
+    ) -> None:
+        pygame.draw.rect(surface, self.theme.panel_alt, rect, border_radius=9)
+        pygame.draw.rect(surface, self.theme.grid, rect, 1, border_radius=9)
+        self._section_title(surface, "HEADING · WORLD AXIS", rect.x + 11, rect.y + 9)
+
+        center = (rect.centerx, rect.centery + 10)
+        reach_x = min(70, max(42, rect.width // 5))
+        reach_y = min(47, max(35, rect.height // 4))
+        positions = {
+            "up": (center[0], center[1] - reach_y),
+            "right": (center[0] + reach_x, center[1]),
+            "down": (center[0], center[1] + reach_y),
+            "left": (center[0] - reach_x, center[1]),
+        }
+        pygame.draw.line(surface, self.theme.grid_bright, positions["up"], positions["down"], 2)
+        pygame.draw.line(surface, self.theme.grid_bright, positions["left"], positions["right"], 2)
+        pygame.draw.circle(surface, self.theme.panel, center, 8)
+        pygame.draw.circle(surface, self.theme.grid_bright, center, 8, 1)
+
+        for direction, position in positions.items():
+            value = observation.get(f"heading {direction}")
+            active = value is not None and value >= 0.5
+            fill = self.theme.green if active else self.theme.panel
+            border = self.theme.green if active else self.theme.grid_bright
+            pygame.draw.circle(surface, fill, position, 21)
+            pygame.draw.circle(surface, border, position, 21, 2 if active else 1)
+            foreground = self.theme.background if active else self.theme.text
+            label = self._font(8, bold=True).render(
+                direction[:1].upper(),
+                True,
+                foreground,
+            )
+            surface.blit(label, label.get_rect(center=(position[0], position[1] - 4)))
+            value_color = self.theme.background if active else self.theme.muted
+            value_image = self._font(7, bold=True).render(
+                _format_observation(value),
+                True,
+                value_color,
+            )
+            surface.blit(value_image, value_image.get_rect(center=(position[0], position[1] + 7)))
+
+    def _draw_context_observations(
+        self,
+        surface: pygame.Surface,
+        rect: pygame.Rect,
+        observation: Mapping[str, Optional[float]],
+    ) -> None:
+        pygame.draw.rect(surface, self.theme.panel_alt, rect, border_radius=9)
+        pygame.draw.rect(surface, self.theme.grid, rect, 1, border_radius=9)
+        self._section_title(surface, "CONTEXT · NORMALIZED", rect.x + 11, rect.y + 9)
+
+        labels = (
+            "position x",
+            "position y",
+            "frightened time",
+            "pellets remaining",
+            "lives",
+            "level",
+            "chase mode",
+            "ghosts released",
+        )
+        gap = 6
+        top = rect.y + 31
+        cell_width = max(1, (rect.width - 22 - gap) // 2)
+        cell_height = max(36, (rect.bottom - top - 9 - gap * 3) // 4)
+        colors = (
+            self.theme.blue,
+            self.theme.blue,
+            self.theme.purple,
+            self.theme.yellow,
+            self.theme.green,
+            self.theme.cyan,
+            self.theme.red,
+            self.theme.orange,
+        )
+        for index, (label, color) in enumerate(zip(labels, colors)):
+            column = index % 2
+            row = index // 2
+            cell = pygame.Rect(
+                rect.x + 11 + column * (cell_width + gap),
+                top + row * (cell_height + gap),
+                cell_width,
+                cell_height,
+            )
+            pygame.draw.rect(surface, self.theme.panel, cell, border_radius=6)
+            value = observation.get(label)
+            self._text(surface, label.upper(), (cell.x + 7, cell.y + 5), self.theme.muted, 7, bold=True)
+            value_text = _format_observation(value)
+            image = self._font(9, bold=True).render(value_text, True, self.theme.text)
+            surface.blit(image, (cell.right - image.get_width() - 7, cell.y + 4))
+            track = pygame.Rect(cell.x + 7, cell.bottom - 9, max(1, cell.width - 14), 4)
+            pygame.draw.rect(surface, self.theme.grid, track, border_radius=2)
+            if value is not None:
+                fill = track.copy()
+                fill.width = round(track.width * max(0.0, min(1.0, value)))
+                if fill.width:
+                    pygame.draw.rect(surface, color, fill, border_radius=2)
 
     def _draw_metrics_tab(
         self,
@@ -820,6 +1060,34 @@ def _numeric_vector(value: Any) -> list[Optional[float]]:
     if not _is_sequence(value):
         return []
     return [_number(item) for item in value]
+
+
+def _observation_values(telemetry: Mapping[str, Any]) -> dict[str, Optional[float]]:
+    """Return only caller-supplied, named observation values.
+
+    The live session supplies a mapping.  Recorded integrations may instead
+    provide a vector and the matching ``observation_labels``; both forms keep
+    every displayed value traceable to the telemetry payload.
+    """
+
+    raw = _to_plain(_first(telemetry, "observation", "observations", "state"))
+    if isinstance(raw, Mapping):
+        return {str(label): _number(value) for label, value in raw.items()}
+    values = _numeric_vector(raw)
+    labels = _to_plain(_first(telemetry, "observation_labels", "state_labels"))
+    if not values or not _is_sequence(labels):
+        return {}
+    return {
+        str(label): values[index]
+        for index, label in enumerate(labels)
+        if index < len(values)
+    }
+
+
+def _format_observation(value: Optional[float]) -> str:
+    if value is None or not math.isfinite(value):
+        return "—"
+    return f"{value:.2f}"
 
 
 def _format_number(value: Optional[float], *, signed: bool = False) -> str:

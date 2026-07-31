@@ -101,6 +101,7 @@ class PacmanRLSession:
             state,
             explore=self.config.training,
             legal_action_mask=mask,
+            advance_schedule=self.config.training,
         )
 
     def step(self) -> dict[str, Any]:
@@ -108,11 +109,23 @@ class PacmanRLSession:
         state = self.state
         action = self.pending_action
         next_state, reward, done, info = self.env.step(action)
+        next_legal_action_mask = np.asarray(next_state[:4] > 0.5, dtype=np.bool_)
+        if not next_legal_action_mask.any():
+            next_legal_action_mask[:] = True
         if self.config.training:
-            metrics = self.agent.observe(state, action, reward, next_state, done)
+            metrics = self.agent.observe(
+                state,
+                action,
+                reward,
+                next_state,
+                done,
+                next_legal_action_mask,
+            )
         else:
             self.agent.last_reward = float(reward)
             self.agent.episode_return += float(reward)
+            if done:
+                self.agent.episodes += 1
             metrics = None
 
         self.history["rewards"].append(float(reward))

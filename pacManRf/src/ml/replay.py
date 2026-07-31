@@ -17,6 +17,7 @@ class Experience(NamedTuple):
     reward: float
     next_state: np.ndarray
     done: bool
+    next_legal_action_mask: np.ndarray | None = None
 
 
 class ReplayBatch(NamedTuple):
@@ -25,6 +26,7 @@ class ReplayBatch(NamedTuple):
     rewards: np.ndarray
     next_states: np.ndarray
     dones: np.ndarray
+    next_legal_action_masks: np.ndarray
 
 
 class ReplayBuffer:
@@ -66,7 +68,25 @@ class ReplayBuffer:
         reward = float(experience.reward)
         if not np.isfinite(reward):
             raise ValueError("reward must be finite")
-        return Experience(state, action, reward, next_state, bool(experience.done))
+        raw_mask = experience.next_legal_action_mask
+        if raw_mask is None:
+            if self.action_size is None:
+                raise ValueError("action_size is required when no next-action mask is supplied")
+            next_legal_action_mask = np.ones(self.action_size, dtype=np.bool_)
+        else:
+            next_legal_action_mask = np.asarray(raw_mask, dtype=np.bool_).reshape(-1).copy()
+            if self.action_size is not None and next_legal_action_mask.shape != (self.action_size,):
+                raise ValueError(f"next_legal_action_mask must have shape ({self.action_size},)")
+            if not next_legal_action_mask.any():
+                raise ValueError("next_legal_action_mask must allow at least one action")
+        return Experience(
+            state,
+            action,
+            reward,
+            next_state,
+            bool(experience.done),
+            next_legal_action_mask,
+        )
 
     def append(self, experience: Experience) -> None:
         validated = self._validated(experience)
@@ -80,8 +100,18 @@ class ReplayBuffer:
         reward: float,
         next_state: np.ndarray | Sequence[float],
         done: bool,
+        next_legal_action_mask: np.ndarray | Sequence[bool] | None = None,
     ) -> None:
-        self.append(Experience(np.asarray(state), int(action), float(reward), np.asarray(next_state), bool(done)))
+        self.append(
+            Experience(
+                np.asarray(state),
+                int(action),
+                float(reward),
+                np.asarray(next_state),
+                bool(done),
+                None if next_legal_action_mask is None else np.asarray(next_legal_action_mask),
+            )
+        )
 
     def sample(self, size: int) -> list[Experience]:
         if size <= 0:
@@ -94,13 +124,14 @@ class ReplayBuffer:
         experiences = self.sample(size)
         if not experiences:
             return None
-        states, actions, rewards, next_states, dones = zip(*experiences)
+        states, actions, rewards, next_states, dones, next_legal_action_masks = zip(*experiences)
         return ReplayBatch(
             np.stack(states).astype(np.float32, copy=False),
             np.asarray(actions, dtype=np.int64),
             np.asarray(rewards, dtype=np.float32),
             np.stack(next_states).astype(np.float32, copy=False),
             np.asarray(dones, dtype=np.bool_),
+            np.stack(next_legal_action_masks).astype(np.bool_, copy=False),
         )
 
     def tail(self, size: int) -> list[Experience]:
@@ -141,6 +172,7 @@ class ReplayBuffer:
                     "reward": item.reward,
                     "next_state": torch.from_numpy(item.next_state.copy()),
                     "done": item.done,
+                    "next_legal_action_mask": torch.from_numpy(item.next_legal_action_mask.copy()),
                 }
                 for item in self._items
             ]
@@ -169,6 +201,9 @@ class ReplayBuffer:
                 state_value = state_value.detach().cpu().numpy()
             if isinstance(next_state_value, torch.Tensor):
                 next_state_value = next_state_value.detach().cpu().numpy()
+            next_legal_action_mask = item.get("next_legal_action_mask")
+            if isinstance(next_legal_action_mask, torch.Tensor):
+                next_legal_action_mask = next_legal_action_mask.detach().cpu().numpy()
             restored.append(
                 self._validated(
                     Experience(
@@ -177,6 +212,7 @@ class ReplayBuffer:
                         float(item["reward"]),
                         np.asarray(next_state_value),
                         bool(item["done"]),
+                        None if next_legal_action_mask is None else np.asarray(next_legal_action_mask),
                     )
                 )
             )

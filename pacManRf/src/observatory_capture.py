@@ -51,12 +51,12 @@ def capture_observatory_gif(
     session: PacmanRLSession,
     path: str | Path,
     *,
-    frames: int = 60,
+    frames: int = 48,
     prime_steps: int = 80,
     duration_ms: int = 140,
-    output_width: int = 880,
+    output_width: int = 800,
 ) -> Path:
-    """Capture GAME → METRICS → NETWORK using live training values."""
+    """Capture GAME → VISION → METRICS → NETWORK with live values."""
     pygame.init()
     frame_count = max(12, int(frames))
     output = Path(path)
@@ -68,15 +68,21 @@ def capture_observatory_gif(
 
     for index in range(frame_count):
         session.step()
-        section = min(2, index * 3 // frame_count)
-        ui.set_tab(("GAME", "METRICS", "NETWORK")[section])
+        section = min(3, index * 4 // frame_count)
+        ui.set_tab(("GAME", "VISION", "METRICS", "NETWORK")[section])
         ui.render(
             canvas,
             session.telemetry(),
             history=session.history_snapshot(),
             game_surface=session.render_game(),
         )
-        images.append(_pil_frame(canvas, output_width=output_width))
+        images.append(
+            _pil_frame(canvas, output_width=output_width).quantize(
+                colors=96,
+                method=Image.Quantize.MEDIANCUT,
+                dither=Image.Dither.NONE,
+            )
+        )
 
     images[0].save(
         output,
@@ -85,6 +91,6 @@ def capture_observatory_gif(
         duration=max(40, int(duration_ms)),
         loop=0,
         optimize=True,
-        disposal=2,
+        disposal=1,
     )
     return output

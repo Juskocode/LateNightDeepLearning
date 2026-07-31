@@ -98,6 +98,36 @@ class PacmanLearningTests(unittest.TestCase):
         self.assertEqual(values["dqn"], 5.0)
         self.assertEqual(values["double_dqn"], 1.0)
 
+    def test_bootstrap_excludes_illegal_next_actions(self):
+        for algorithm in ("dqn", "double_dqn"):
+            with self.subTest(algorithm=algorithm):
+                config = DQNConfig(
+                    observation_size=32,
+                    action_size=4,
+                    hidden_sizes=(8,),
+                    action_labels=ACTION_LABELS,
+                    algorithm=algorithm,
+                    batch_size=1,
+                    replay_capacity=8,
+                    replay_warmup=0,
+                )
+                model = PacmanQNetwork(32, 4, (8,))
+                trainer = DQNTrainer(model, config)
+                with torch.no_grad():
+                    for parameter in trainer.model.parameters():
+                        parameter.zero_()
+                    for parameter in trainer.target_model.parameters():
+                        parameter.zero_()
+                    trainer.model.layers[-1].bias.copy_(torch.tensor([100.0, 4.0, 3.0, 2.0]))
+                    trainer.target_model.layers[-1].bias.copy_(torch.tensor([50.0, 7.0, 6.0, 5.0]))
+
+                bootstrap = trainer._bootstrap_values(
+                    torch.zeros((1, 32)),
+                    np.asarray([[False, True, True, True]]),
+                )
+
+                self.assertEqual(float(bootstrap[0]), 7.0)
+
     def test_session_exposes_real_network_and_learning_metrics(self):
         session = small_session()
         for _ in range(8):
@@ -130,6 +160,30 @@ class PacmanLearningTests(unittest.TestCase):
 
         np.testing.assert_allclose(actual, expected)
         self.assertEqual(len(restored.memory), len(session.agent.memory))
+        np.testing.assert_array_equal(
+            restored.memory.tail(1)[0].next_legal_action_mask,
+            session.agent.memory.tail(1)[0].next_legal_action_mask,
+        )
+        session.close()
+
+    def test_evaluation_counts_episodes_without_advancing_exploration(self):
+        session = PacmanRLSession(
+            SessionConfig(
+                seed=23,
+                training=False,
+                fresh=True,
+                hidden_sizes=(16, 8),
+                max_episode_steps=1,
+            )
+        )
+        epsilon = session.agent.epsilon
+
+        result = session.step()
+
+        self.assertTrue(result["episode_finished"])
+        self.assertEqual(session.agent.episodes, 1)
+        self.assertEqual(session.agent.env_steps, 0)
+        self.assertEqual(session.agent.epsilon, epsilon)
         session.close()
 
 
@@ -141,7 +195,7 @@ class PacmanObservatoryTests(unittest.TestCase):
         surface = pygame.Surface(WINDOW_SIZE)
         ui = PacmanObservatory()
 
-        for tab in ("GAME", "METRICS", "NETWORK"):
+        for tab in ("GAME", "VISION", "METRICS", "NETWORK"):
             surface.fill((0, 0, 0))
             ui.set_tab(tab)
             ui.render(
@@ -152,6 +206,26 @@ class PacmanObservatoryTests(unittest.TestCase):
             )
             self.assertNotEqual(surface.get_at((20, 20))[:3], (0, 0, 0))
         session.close()
+
+    def test_function_keys_and_tab_cycle_cover_all_four_views(self):
+        ui = PacmanObservatory()
+        expected = (
+            (pygame.K_F1, "GAME"),
+            (pygame.K_F2, "VISION"),
+            (pygame.K_F3, "METRICS"),
+            (pygame.K_F4, "NETWORK"),
+        )
+        for key, tab in expected:
+            consumed = ui.handle_event(pygame.event.Event(pygame.KEYDOWN, key=key))
+            self.assertTrue(consumed)
+            self.assertEqual(ui.active_tab.value, tab)
+
+        ui.set_tab("GAME")
+        cycled = []
+        for _ in range(4):
+            ui.handle_event(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_TAB))
+            cycled.append(ui.active_tab.value)
+        self.assertEqual(cycled, ["VISION", "METRICS", "NETWORK", "GAME"])
 
     def test_gif_capture_is_animated(self):
         session = small_session(seed=19)

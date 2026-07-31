@@ -12,6 +12,8 @@ import tempfile
 
 import pygame
 
+from pacManRf.src.game.pacman_env import OBSERVATION_LABELS
+
 from .observatory import ObservatoryTab, PacmanObservatory
 
 
@@ -41,6 +43,22 @@ def verify_surfaces(output_directory: str | Path | None = None) -> dict[str, tup
         "recent_rewards": [0.0, 0.0, 10.0, -1.0, 0.0, 10.0],
         "recent_actions": [2, 2, 1, 0, 3, 1],
         "recent_dones": [False, False, False, True, False, False],
+        "observation_labels": list(OBSERVATION_LABELS),
+        "observation": dict(
+            zip(
+                OBSERVATION_LABELS,
+                (
+                    1.0, 1.0, 0.0, 1.0,
+                    0.92, 0.48, 0.25, 0.71,
+                    0.0, 0.32, 0.0, 0.12,
+                    0.0, 0.76, 0.18, 0.0,
+                    0.0, 0.0, 0.58, 0.0,
+                    0.0, 1.0, 0.0, 0.0,
+                    0.46, 0.72, 0.35, 0.61,
+                    0.75, 0.2, 1.0, 0.5,
+                ),
+            )
+        ),
         "network": {
             "weight_layout": "out_in",
             "layers": [
