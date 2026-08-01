@@ -9,7 +9,7 @@ import random
 import pygame
 
 from .math2d import Vec2
-from .terrain import Terrain, TerrainKind
+from .terrain import ParticleMode, Terrain
 from .vehicle import CarBuild, DriverControls, Vehicle
 
 
@@ -203,9 +203,9 @@ class ParticleSystem:
         telemetry = vehicle.last_telemetry
         speed = telemetry.speed
         slip = abs(telemetry.slip_angle)
-        dusty = surface.kind not in (TerrainKind.ASPHALT, TerrainKind.WET_ASPHALT)
+        emits_material = surface.particle_mode is not ParticleMode.NONE
         skidding = slip > math.radians(5.0) or controls.brake > 0.55
-        if speed < 12.0 or not (dusty or skidding):
+        if speed < 12.0 or not (emits_material or skidding):
             return
 
         rate = min(44.0, 6.0 + speed * 0.08 + math.degrees(slip) * 0.8)
@@ -222,7 +222,7 @@ class ParticleSystem:
             )
             jitter = Vec2(self.random.uniform(-9, 9), self.random.uniform(-9, 9))
             velocity = vehicle.state.velocity * -0.08 + jitter
-            color = surface.particle_color if dusty else (164, 173, 182)
+            color = surface.particle_color if emits_material else (164, 173, 182)
             self._add(
                 ParticleSprite(
                     position,

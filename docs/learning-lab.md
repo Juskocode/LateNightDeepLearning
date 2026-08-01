@@ -424,25 +424,58 @@ algorithm change and a build change in one comparison row.
 
 Terrain affects grip, rolling resistance, and engine efficiency:
 
-| Surface | Grip | Rolling resistance | Engine efficiency |
-|---|---:|---:|---:|
-| Asphalt | 1.00 | 0.012 | 1.00 |
-| Wet asphalt | 0.88 | 0.010 | 0.98 |
-| Gravel | 0.76 | 0.035 | 0.91 |
-| Grass | 0.62 | 0.052 | 0.82 |
-| Mud | 0.48 | 0.080 | 0.70 |
+| Surface | Grip | Rolling resistance | Engine efficiency | Tire particles |
+|---|---:|---:|---:|---|
+| Asphalt | 1.00 | 0.012 | 1.00 | Skids only |
+| Wet asphalt | 0.88 | 0.010 | 0.98 | Spray |
+| Gravel | 0.76 | 0.035 | 0.91 | Dust |
+| Grass | 0.62 | 0.052 | 0.82 | Debris |
+| Mud | 0.48 | 0.080 | 0.70 | Mud |
+| Sand | 0.54 | 0.095 | 0.66 | Dust |
+| Snow | 0.40 | 0.064 | 0.72 | Snow |
+| Ice | 0.22 | 0.004 | 0.93 | Skids only |
 
-The three built-in closed circuits exercise different combinations:
+The five built-in closed circuits exercise different combinations:
 
 | Circuit slug | Character | Surface variation |
 |---|---|---|
 | `harbor_loop` | Wide, flowing corners | Wet dockside road sector; grass runoff |
 | `pine_sprint` | Technical forest layout | Gravel road sector; mud runoff |
 | `desert_switchback` | Long straights and tight switchbacks | Gravel and wet road sectors; gravel runoff |
+| `alpine_gauntlet` | Fast, narrow sixteen-point mountain loop | Ice, wet, and snow road sectors; snow runoff |
+| `canyon_maze` | Eighteen-corner precision course with opposing hairpins | Gravel, sand, and wet road sectors; sand runoff |
 
 Circuit projection is shared by physics, progress, terrain lookup, collision, and
 sensors. That prevents the renderer and environment from disagreeing about where
 the road is.
+
+### Lap timing and the best-lap ghost
+
+Lap time is deterministic simulation time. Every environment step adds
+`fixed_dt`—`1/60` second by default—to the current timer, independent of the
+wall clock. Given the same initial state and action sequence, changing the
+display frame limit therefore does not change the resulting current, last, or
+best time. A valid completion requires the ordered 25%, 50%, and 75% gates plus
+a forward start-line crossing; reverse crossings, start-line oscillation, and
+implausible projection jumps cannot create a lap. Completing that circuit
+increments the completed-lap counter, moves the current time into the last-lap
+field, and starts the next timer at zero. The first completed lap establishes
+the circuit best; only a strictly faster later lap replaces it.
+
+Each circuit keeps its own best record for the lifetime of one environment. A
+record includes the time and sampled car trajectory. `R` resets the car, current
+and last timers, completed-lap count, collisions, and current trajectory, but it
+retains every circuit's best record. `C` switches circuits and performs the same
+run reset; switching back restores that circuit's retained best. Records are
+in-memory only, so constructing a new environment or starting a new process
+begins without a best lap.
+
+After a record exists, the renderer interpolates its trajectory at the current
+lap time and draws a translucent car plus its racing line. This ghost is
+presentation-only: it has no collision body and changes neither vehicle physics,
+observations, rewards, progress, nor particles. `G` toggles both the ghost and
+racing line without disabling trajectory recording. The `--no-ghost` CLI option
+starts with this overlay hidden.
 
 ### Observation: 12 normalized values
 
@@ -485,14 +518,15 @@ road      = +0.025 on road, otherwise -0.08
 speed     = 0.018 * max(0, longitudinal_speed) / max_speed
 reverse   = -0.05 when longitudinal_speed < -2
 collision = -min(5, 0.06 * impact_speed) on contact start; otherwise 0
-lap       = +20 after one accumulated net-forward circuit; otherwise 0
+lap       = +20 after one valid gated forward circuit; otherwise 0
 ```
 
-The `info` dictionary exposes the active terrain, on-road flag, progress, laps,
-`lap_completed`, persistent-contact `collided`, one-shot `collision_started`,
-impact speed, every reward term, and vehicle telemetry. Episodes do not currently
-terminate from damage or collision. They truncate at the configured step limit,
-which defaults to 10,800 steps (three minutes at 60 Hz).
+The `info` dictionary exposes the active terrain, on-road flag, progress,
+completed laps, `lap_completed`, current/last/best lap time, persistent-contact
+`collided`, one-shot `collision_started`, impact speed, every reward term, and
+vehicle telemetry. Episodes do not currently terminate from damage or collision.
+They truncate at the configured step limit, which defaults to 10,800 steps
+(three minutes at 60 Hz).
 
 ### Driving commands and controls
 
@@ -523,7 +557,8 @@ Headless mode and any `--screenshot` request enter deterministic autopilot captu
 mode, which defaults to 240 steps when `--steps` is omitted. `--motor`, `--wheels`,
 `--suspension`, and `--grip` each accept levels 0 through 5. `--car-sprite` selects
 another transparent top-down image, while `--no-sensors` hides only the rendered
-rays—not the observation values.
+rays—not the observation values. `--no-ghost` starts with the best-lap replay and
+racing line hidden; recording still runs, and `G` can reveal the overlay later.
 
 | Input | Manual action |
 |---|---|
@@ -531,8 +566,9 @@ rays—not the observation values.
 | `S` / Down | Reverse throttle |
 | `A` / `D` or Left / Right | Steer |
 | `Space` | Brake |
-| `R` | Reset the current circuit |
+| `R` | Reset the current run while retaining per-circuit best records |
 | `C` | Cycle circuit |
+| `G` | Toggle the best-lap ghost and racing line |
 | `V` | Toggle sensor rays |
 | `1` / `2` / `3` / `4` | Cycle motor / wheels / suspension / grip |
 | `F12` | Save `driving-screenshot.png` |

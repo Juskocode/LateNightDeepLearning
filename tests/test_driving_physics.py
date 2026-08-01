@@ -1,22 +1,79 @@
 import math
 import unittest
 
-from drivingGameRL.src.circuits import Circuit, all_circuits, circuit_names, get_circuit
+from drivingGameRL.src.circuits import (
+    Circuit,
+    SurfaceSector,
+    all_circuits,
+    circuit_names,
+    get_circuit,
+)
 from drivingGameRL.src.environment import DrivingAction, DrivingEnv
 from drivingGameRL.src.math2d import Vec2
-from drivingGameRL.src.terrain import TerrainKind, terrain
+from drivingGameRL.src.terrain import (
+    TERRAINS,
+    ParticleMode,
+    Terrain,
+    TerrainKind,
+    terrain,
+)
 from drivingGameRL.src.vehicle import CarBuild, DriverControls, Vehicle
 
 
 class DrivingPhysicsTests(unittest.TestCase):
-    def test_circuit_registry_is_deterministic_and_contains_three_tracks(self):
+    def test_circuit_registry_is_deterministic_and_contains_complex_tracks(self):
         self.assertEqual(circuit_names(), circuit_names())
-        self.assertGreaterEqual(len(all_circuits()), 3)
+        self.assertGreaterEqual(len(all_circuits()), 5)
         self.assertEqual(len(circuit_names()), len(set(circuit_names())))
         for name in circuit_names():
             circuit = get_circuit(name)
             self.assertGreater(circuit.length, 1_000)
             self.assertEqual(circuit.slug, name)
+
+        for name, minimum_points in (("alpine_gauntlet", 16), ("canyon_maze", 18)):
+            circuit = get_circuit(name)
+            self.assertGreaterEqual(len(circuit.points), minimum_points)
+            self.assertGreater(len(circuit.sectors), 1)
+
+    def test_complex_circuits_fit_inside_the_track_viewport(self):
+        for name in ("alpine_gauntlet", "canyon_maze"):
+            circuit = get_circuit(name)
+            # Rendering adds four pixels outside the analytic collision radius.
+            margin = circuit.collision_radius + 4.0
+            for point in circuit.points:
+                self.assertGreaterEqual(point.x, margin, name)
+                self.assertLessEqual(point.x, 800.0 - margin, name)
+                self.assertGreaterEqual(point.y, margin, name)
+                self.assertLessEqual(point.y, 700.0 - margin, name)
+
+    def test_complex_circuit_start_lines_are_centered_on_long_straights(self):
+        for name in ("alpine_gauntlet", "canyon_maze"):
+            circuit = get_circuit(name)
+            incoming = circuit.points[0] - circuit.points[-1]
+            outgoing = circuit.points[1] - circuit.points[0]
+            self.assertGreater(incoming.length(), 70.0, name)
+            self.assertGreater(outgoing.length(), 70.0, name)
+            self.assertAlmostEqual(
+                incoming.normalized().dot(outgoing.normalized()),
+                1.0,
+                places=12,
+                msg=name,
+            )
+
+    def test_new_circuits_expose_distinct_surface_challenges(self):
+        alpine = get_circuit("alpine_gauntlet")
+        canyon = get_circuit("canyon_maze")
+        self.assertEqual(alpine.runoff, TerrainKind.SNOW)
+        self.assertEqual(canyon.runoff, TerrainKind.SAND)
+        self.assertEqual(alpine.road_kind_at_progress(0.17), TerrainKind.ICE)
+        self.assertEqual(alpine.road_kind_at_progress(0.60), TerrainKind.WET_ASPHALT)
+        self.assertEqual(canyon.road_kind_at_progress(0.21), TerrainKind.GRAVEL)
+        self.assertEqual(canyon.road_kind_at_progress(0.48), TerrainKind.SAND)
+
+        for circuit in (alpine, canyon):
+            for sector in circuit.sectors:
+                point, _ = circuit.point_tangent_at((sector.start + sector.end) * 0.5)
+                self.assertEqual(circuit.terrain_at(point).kind, sector.kind)
 
     def test_builtin_centerlines_do_not_self_intersect(self):
         def orientation(first, second, third):
@@ -74,7 +131,11 @@ class DrivingPhysicsTests(unittest.TestCase):
                             circuit.points[second_index],
                             circuit.points[(second_index + 1) % count],
                         ),
-                        circuit.track_width,
+                        (
+                            circuit.collision_radius * 2.0
+                            if circuit.slug in {"alpine_gauntlet", "canyon_maze"}
+                            else circuit.track_width
+                        ),
                         f"{circuit.slug} has overlapping non-adjacent road segments",
                     )
 
@@ -105,6 +166,60 @@ class DrivingPhysicsTests(unittest.TestCase):
                 20,
                 10,
                 TerrainKind.GRASS,
+            )
+
+    def test_surface_sectors_validate_normalized_values_and_kind(self):
+        invalid_endpoints = (-0.01, 1.0, math.inf, math.nan, True, "0.4")
+        for endpoint in invalid_endpoints:
+            with self.subTest(endpoint=endpoint):
+                with self.assertRaises(ValueError):
+                    SurfaceSector(endpoint, 0.5, TerrainKind.GRAVEL)
+                with self.assertRaises(ValueError):
+                    SurfaceSector(0.1, endpoint, TerrainKind.GRAVEL)
+        with self.assertRaises(ValueError):
+            SurfaceSector(0.2, 0.2, TerrainKind.GRAVEL)
+        with self.assertRaises(ValueError):
+            SurfaceSector(0.2, 0.4, "gravel")
+
+    def test_circuit_rejects_overlapping_surface_sectors(self):
+        points = (Vec2(0, 0), Vec2(100, 0), Vec2(100, 100), Vec2(0, 100))
+
+        def make_circuit(*sectors):
+            return Circuit(
+                "sector-test",
+                "Sector test",
+                points,
+                20,
+                10,
+                TerrainKind.GRASS,
+                sectors,
+            )
+
+        with self.assertRaises(ValueError):
+            make_circuit(
+                SurfaceSector(0.10, 0.30, TerrainKind.GRAVEL),
+                SurfaceSector(0.20, 0.40, TerrainKind.MUD),
+            )
+        with self.assertRaises(ValueError):
+            make_circuit(
+                SurfaceSector(0.82, 0.14, TerrainKind.GRAVEL),
+                SurfaceSector(0.08, 0.22, TerrainKind.MUD),
+            )
+
+        adjacent = make_circuit(
+            SurfaceSector(0.10, 0.20, TerrainKind.GRAVEL),
+            SurfaceSector(0.20, 0.30, TerrainKind.MUD),
+        )
+        self.assertEqual(adjacent.road_kind_at_progress(0.20), TerrainKind.MUD)
+        with self.assertRaises(ValueError):
+            Circuit(
+                "bad-sector",
+                "Bad sector",
+                points,
+                20,
+                10,
+                TerrainKind.GRASS,
+                ("not-a-sector",),
             )
 
     def test_surface_sectors_and_runoff_have_different_grip(self):
@@ -357,6 +472,73 @@ class DrivingPhysicsTests(unittest.TestCase):
             grips.append(vehicle.last_telemetry.effective_grip)
         self.assertEqual(speeds, sorted(speeds, reverse=True))
         self.assertEqual(grips, sorted(grips, reverse=True))
+
+    def test_sand_snow_and_ice_have_distinct_physics_and_visuals(self):
+        sand = terrain(TerrainKind.SAND)
+        snow = terrain(TerrainKind.SNOW)
+        ice = terrain(TerrainKind.ICE)
+        self.assertGreater(sand.grip, snow.grip)
+        self.assertGreater(snow.grip, ice.grip)
+        self.assertGreater(sand.rolling_resistance, snow.rolling_resistance)
+        self.assertGreater(snow.rolling_resistance, ice.rolling_resistance)
+        self.assertLess(sand.engine_efficiency, snow.engine_efficiency)
+        self.assertLess(snow.engine_efficiency, ice.engine_efficiency)
+        self.assertEqual(
+            len({surface.color for surface in (sand, snow, ice)}),
+            3,
+        )
+        self.assertEqual(
+            len({surface.particle_color for surface in (sand, snow, ice)}),
+            3,
+        )
+
+        lateral_speeds = []
+        for surface in (sand, snow, ice):
+            vehicle = Vehicle()
+            vehicle.reset(Vec2(), 0.0)
+            vehicle.state.velocity = Vec2(80.0, 35.0)
+            for _ in range(60):
+                vehicle.step(DriverControls(throttle=0.5), surface, 1.0 / 60.0)
+            lateral_speeds.append(abs(vehicle.last_telemetry.lateral_speed))
+        self.assertEqual(lateral_speeds, sorted(lateral_speeds))
+
+    def test_terrain_registry_is_complete_finite_and_classifies_particles(self):
+        self.assertEqual(set(TERRAINS), set(TerrainKind))
+        for kind, surface in TERRAINS.items():
+            self.assertIs(surface.kind, kind)
+            self.assertTrue(
+                all(
+                    math.isfinite(value)
+                    for value in (
+                        surface.grip,
+                        surface.rolling_resistance,
+                        surface.engine_efficiency,
+                    )
+                )
+            )
+            self.assertIsInstance(surface.particle_mode, ParticleMode)
+        self.assertIs(terrain(TerrainKind.ICE).particle_mode, ParticleMode.NONE)
+        self.assertIs(terrain(TerrainKind.SNOW).particle_mode, ParticleMode.SNOW)
+        self.assertIs(terrain(TerrainKind.SAND).particle_mode, ParticleMode.DUST)
+
+        legacy_shape = Terrain(
+            TerrainKind.ASPHALT,
+            1.0,
+            0.01,
+            1.0,
+            (10, 20, 30),
+            (40, 50, 60),
+        )
+        self.assertIs(legacy_shape.particle_mode, ParticleMode.NONE)
+        with self.assertRaises(ValueError):
+            Terrain(
+                TerrainKind.ASPHALT,
+                math.nan,
+                0.01,
+                1.0,
+                (10, 20, 30),
+                (40, 50, 60),
+            )
 
     def test_telemetry_exposes_terrain_components_and_capabilities(self):
         build = CarBuild(motor=1, wheels=2, suspension=3, grip=4)

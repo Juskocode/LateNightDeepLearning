@@ -17,11 +17,32 @@ class SurfaceSector:
     end: float
     kind: TerrainKind
 
+    def __post_init__(self) -> None:
+        for name, value in (("start", self.start), ("end", self.end)):
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                or not 0.0 <= value < 1.0
+            ):
+                raise ValueError(f"Sector {name} must be finite and in [0, 1)")
+        if self.start == self.end:
+            raise ValueError("A surface sector must cover a non-zero portion of a lap")
+        if not isinstance(self.kind, TerrainKind):
+            raise ValueError("Sector kind must be a TerrainKind")
+
     def contains(self, progress: float) -> bool:
         progress %= 1.0
-        if self.start <= self.end:
-            return self.start <= progress <= self.end
-        return progress >= self.start or progress <= self.end
+        if self.start < self.end:
+            return self.start <= progress < self.end
+        return progress >= self.start or progress < self.end
+
+    def intervals(self) -> tuple[tuple[float, float], ...]:
+        """Return one or two half-open intervals on a linearized lap."""
+
+        if self.start < self.end:
+            return ((self.start, self.end),)
+        return ((self.start, 1.0), (0.0, self.end))
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,6 +82,18 @@ class Circuit:
             raise ValueError("Circuit points must be finite")
         if any(length <= 1e-9 for length in self.segment_lengths):
             raise ValueError("Consecutive circuit points must be distinct")
+        if not isinstance(self.runoff, TerrainKind):
+            raise ValueError("Circuit runoff must be a TerrainKind")
+        if any(not isinstance(sector, SurfaceSector) for sector in self.sectors):
+            raise ValueError("Circuit sectors must be SurfaceSector values")
+        for first_index, first in enumerate(self.sectors):
+            for second in self.sectors[first_index + 1 :]:
+                if any(
+                    max(first_start, second_start) < min(first_end, second_end)
+                    for first_start, first_end in first.intervals()
+                    for second_start, second_end in second.intervals()
+                ):
+                    raise ValueError("Circuit surface sectors must not overlap")
 
     @property
     def segment_lengths(self) -> tuple[float, ...]:
@@ -220,6 +253,77 @@ _CIRCUITS = {
             SurfaceSector(0.73, 0.78, TerrainKind.WET_ASPHALT),
         ),
         description="Long straights joined by tight, low-grip switchbacks.",
+    ),
+    "alpine_gauntlet": Circuit(
+        slug="alpine_gauntlet",
+        name="Alpine Gauntlet",
+        points=(
+            Vec2(377.5, 70),
+            Vec2(520, 68),
+            Vec2(680, 120),
+            Vec2(728, 230),
+            Vec2(650, 312),
+            Vec2(720, 405),
+            Vec2(680, 545),
+            Vec2(545, 620),
+            Vec2(400, 570),
+            Vec2(270, 632),
+            Vec2(120, 560),
+            Vec2(66, 440),
+            Vec2(145, 365),
+            Vec2(72, 280),
+            Vec2(104, 130),
+            Vec2(235, 72),
+        ),
+        track_width=52,
+        runoff_width=26,
+        runoff=TerrainKind.SNOW,
+        sectors=(
+            SurfaceSector(0.13, 0.22, TerrainKind.ICE),
+            SurfaceSector(0.56, 0.64, TerrainKind.WET_ASPHALT),
+            SurfaceSector(0.82, 0.88, TerrainKind.SNOW),
+        ),
+        description=(
+            "A fast sixteen-point mountain loop with an icy crest, wet valley, "
+            "and snowy final sector."
+        ),
+    ),
+    "canyon_maze": Circuit(
+        slug="canyon_maze",
+        name="Canyon Maze",
+        points=(
+            Vec2(400, 90),
+            Vec2(700, 90),
+            Vec2(720, 190),
+            Vec2(480, 190),
+            Vec2(480, 290),
+            Vec2(680, 290),
+            Vec2(720, 390),
+            Vec2(630, 470),
+            Vec2(710, 560),
+            Vec2(650, 630),
+            Vec2(100, 630),
+            Vec2(70, 530),
+            Vec2(330, 530),
+            Vec2(330, 430),
+            Vec2(100, 430),
+            Vec2(65, 335),
+            Vec2(170, 265),
+            Vec2(65, 190),
+            Vec2(100, 90),
+        ),
+        track_width=42,
+        runoff_width=22,
+        runoff=TerrainKind.SAND,
+        sectors=(
+            SurfaceSector(0.18, 0.25, TerrainKind.GRAVEL),
+            SurfaceSector(0.44, 0.52, TerrainKind.SAND),
+            SurfaceSector(0.76, 0.82, TerrainKind.WET_ASPHALT),
+        ),
+        description=(
+            "An eighteen-corner precision course of opposing hairpins, dusty "
+            "switchbacks, and a flash-flood crossing."
+        ),
     ),
 }
 

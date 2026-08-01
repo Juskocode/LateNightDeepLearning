@@ -9,7 +9,7 @@ import random
 import pygame
 
 from .circuits import Circuit
-from .environment import DrivingEnv
+from .environment import DrivingEnv, LapPose
 from .math2d import Vec2
 from .terrain import TerrainKind, terrain
 from .vehicle import DriverControls
@@ -32,6 +32,17 @@ COLORS = {
     "red": (242, 83, 74),
     "barrier": (24, 28, 34),
 }
+
+
+def format_lap_time(seconds: float | None) -> str:
+    """Format a simulation-time lap value without depending on wall time."""
+
+    if seconds is None:
+        return "--:--.---"
+    total_milliseconds = round(max(0.0, seconds) * 1_000.0)
+    minutes, remaining_milliseconds = divmod(total_milliseconds, 60_000)
+    whole_seconds, milliseconds = divmod(remaining_milliseconds, 1_000)
+    return f"{minutes:02d}:{whole_seconds:02d}.{milliseconds:03d}"
 
 
 def _font_path() -> Path:
@@ -152,6 +163,77 @@ class CircuitRenderer:
         return surface
 
 
+class RacingGhostRenderer:
+    """Draw a transparent best-lap car and its cached racing line."""
+
+    def __init__(self):
+        self._body = pygame.Surface((32, 50), pygame.SRCALPHA)
+        pygame.draw.polygon(
+            self._body,
+            (66, 225, 255, 105),
+            ((7, 3), (25, 3), (30, 13), (28, 43), (22, 48), (10, 48), (4, 43), (2, 13)),
+        )
+        pygame.draw.polygon(
+            self._body,
+            (208, 250, 255, 92),
+            ((8, 14), (24, 14), (22, 28), (10, 28)),
+        )
+        pygame.draw.rect(self._body, (20, 34, 44, 85), (1, 10, 4, 12), border_radius=2)
+        pygame.draw.rect(self._body, (20, 34, 44, 85), (27, 10, 4, 12), border_radius=2)
+        pygame.draw.rect(self._body, (20, 34, 44, 85), (1, 36, 4, 11), border_radius=2)
+        pygame.draw.rect(self._body, (20, 34, 44, 85), (27, 36, 4, 11), border_radius=2)
+        self._rotations: dict[int, pygame.Surface] = {}
+        self._line_trajectory: tuple[LapPose, ...] | None = None
+        self._line_surface: pygame.Surface | None = None
+
+    def _racing_line(self, trajectory: tuple[LapPose, ...]) -> pygame.Surface | None:
+        if len(trajectory) < 2:
+            return None
+        if trajectory is not self._line_trajectory:
+            overlay = pygame.Surface((TRACK_VIEW_WIDTH, WINDOW_HEIGHT), pygame.SRCALPHA)
+            stride = max(1, len(trajectory) // 420)
+            points = [
+                (round(pose.position.x), round(pose.position.y))
+                for pose in trajectory[::stride]
+            ]
+            if points[-1] != (
+                round(trajectory[-1].position.x),
+                round(trajectory[-1].position.y),
+            ):
+                points.append(
+                    (
+                        round(trajectory[-1].position.x),
+                        round(trajectory[-1].position.y),
+                    )
+                )
+            if len(points) >= 2:
+                pygame.draw.lines(overlay, (70, 225, 255, 55), False, points, 2)
+            self._line_trajectory = trajectory
+            self._line_surface = overlay
+        return self._line_surface
+
+    def draw(
+        self,
+        target: pygame.Surface,
+        pose: LapPose | None,
+        trajectory: tuple[LapPose, ...],
+    ) -> None:
+        line = self._racing_line(trajectory)
+        if line is not None:
+            target.blit(line, (0, 0))
+        if pose is None:
+            return
+        # Quantizing to two degrees bounds the rotation cache without visible
+        # jitter at the scale of the top-down car.
+        angle = round((-math.degrees(pose.heading) - 90.0) / 2.0) * 2
+        image = self._rotations.get(angle)
+        if image is None:
+            image = pygame.transform.rotozoom(self._body, angle, 1.0)
+            self._rotations[angle] = image
+        rect = image.get_rect(center=(round(pose.position.x), round(pose.position.y)))
+        target.blit(image, rect)
+
+
 class TelemetryHUD:
     def __init__(self):
         self.title_font = _font(23, bold=True)
@@ -196,6 +278,7 @@ class TelemetryHUD:
         env: DrivingEnv,
         controls: DriverControls,
         particle_count: int,
+        ghost_enabled: bool = True,
     ) -> None:
         panel = pygame.Rect(TRACK_VIEW_WIDTH, 0, HUD_WIDTH, WINDOW_HEIGHT)
         pygame.draw.rect(target, COLORS["panel"], panel)
@@ -253,10 +336,10 @@ class TelemetryHUD:
         )
 
         pygame.draw.rect(
-            target, COLORS["panel_alt"], (x, 208, HUD_WIDTH - 36, 113), border_radius=8
+            target, COLORS["panel_alt"], (x, 198, HUD_WIDTH - 36, 104), border_radius=8
         )
         self._text(
-            target, self.section_font, "LIVE PHYSICS", (x + 10, 217), COLORS["yellow"]
+            target, self.section_font, "LIVE PHYSICS", (x + 10, 207), COLORS["yellow"]
         )
         rows = (
             ("Terrain", str(snapshot["terrain"])),
@@ -272,15 +355,66 @@ class TelemetryHUD:
             ),
         )
         for row, (label, value) in enumerate(rows):
-            y = 242 + row * 15
+            y = 231 + row * 14
             self._text(target, self.small_font, label, (x + 10, y), COLORS["muted"])
             rendered = self.small_font.render(value, True, COLORS["text"])
             target.blit(
                 rendered, (TRACK_VIEW_WIDTH + HUD_WIDTH - 27 - rendered.get_width(), y)
             )
 
+        pygame.draw.rect(
+            target, COLORS["panel_alt"], (x, 311, HUD_WIDTH - 36, 96), border_radius=8
+        )
         self._text(
-            target, self.section_font, "UPGRADE PARTS  [0-5]", (x, 338), COLORS["cyan"]
+            target,
+            self.section_font,
+            f"LAP TIMER  ·  LAP {int(snapshot['laps']) + 1}",
+            (x + 10, 320),
+            COLORS["green"],
+        )
+        ghost_status = (
+            "OFF"
+            if not ghost_enabled
+            else "ON" if bool(snapshot["ghost_available"]) else "ON · WAIT"
+        )
+        lap_rows = (
+            ("Current", format_lap_time(float(snapshot["current_lap_time"]))),
+            (
+                "Last",
+                format_lap_time(
+                    None
+                    if snapshot["last_lap_time"] is None
+                    else float(snapshot["last_lap_time"])
+                ),
+            ),
+            (
+                "Best",
+                format_lap_time(
+                    None
+                    if snapshot["best_lap_time"] is None
+                    else float(snapshot["best_lap_time"])
+                ),
+            ),
+            (
+                "G  Best-lap ghost",
+                ghost_status,
+            ),
+        )
+        for row, (label, value) in enumerate(lap_rows):
+            y = 344 + row * 15
+            self._text(target, self.small_font, label, (x + 10, y), COLORS["muted"])
+            color = (
+                COLORS["green"]
+                if row == 3 and ghost_enabled and bool(snapshot["ghost_available"])
+                else COLORS["yellow"] if row == 3 and ghost_enabled else COLORS["text"]
+            )
+            rendered = self.small_font.render(value, True, color)
+            target.blit(
+                rendered, (TRACK_VIEW_WIDTH + HUD_WIDTH - 27 - rendered.get_width(), y)
+            )
+
+        self._text(
+            target, self.section_font, "UPGRADE PARTS  [0-5]", (x, 419), COLORS["cyan"]
         )
         labels = (
             ("1 MOTOR", "motor"),
@@ -289,7 +423,7 @@ class TelemetryHUD:
             ("4 GRIP", "grip"),
         )
         for index, (label, key) in enumerate(labels):
-            y = 365 + index * 27
+            y = 443 + index * 20
             level = int(components[key])
             self._text(target, self.small_font, label, (x, y), COLORS["muted"])
             for block in range(5):
@@ -302,7 +436,7 @@ class TelemetryHUD:
                 )
 
         self._text(
-            target, self.section_font, "DRIVER INPUT", (x, 482), COLORS["yellow"]
+            target, self.section_font, "DRIVER INPUT", (x, 529), COLORS["yellow"]
         )
         inputs = (
             ("Throttle", controls.throttle, COLORS["green"]),
@@ -310,7 +444,7 @@ class TelemetryHUD:
             ("Brake", controls.brake, COLORS["red"]),
         )
         for index, (label, value, color) in enumerate(inputs):
-            y = 506 + index * 22
+            y = 552 + index * 19
             self._text(target, self.small_font, label, (x, y), COLORS["muted"])
             center = x + 178
             pygame.draw.line(target, (48, 63, 75), (x + 92, y + 6), (x + 264, y + 6), 5)
@@ -323,52 +457,45 @@ class TelemetryHUD:
 
         reward = sum(float(value) for value in snapshot["reward_terms"].values())
         self._text(
-            target, self.small_font, f"Reward {reward:+.3f}", (x, 580), COLORS["text"]
+            target, self.small_font, f"Reward {reward:+.3f}", (x, 611), COLORS["text"]
         )
         self._text(
             target,
             self.small_font,
             f"Damage {snapshot['damage']:.1f}%",
-            (x + 118, 580),
+            (x + 118, 611),
             COLORS["text"],
         )
         self._text(
             target,
             self.small_font,
             f"Particles {particle_count}",
-            (x, 598),
+            (x, 628),
             COLORS["muted"],
         )
         self._text(
             target,
             self.small_font,
             f"Collisions {snapshot['collisions']}",
-            (x + 118, 598),
+            (x + 118, 628),
             COLORS["muted"],
         )
 
         pygame.draw.line(
-            target, (42, 60, 75), (x, 625), (TRACK_VIEW_WIDTH + HUD_WIDTH - 18, 625), 1
+            target, (42, 60, 75), (x, 647), (TRACK_VIEW_WIDTH + HUD_WIDTH - 18, 647), 1
         )
         self._text(
             target,
             self.small_font,
             "WASD/arrows drive   Space brake",
-            (x, 637),
+            (x, 655),
             COLORS["muted"],
         )
         self._text(
             target,
             self.small_font,
-            "1-4 upgrade   C circuit   R reset",
-            (x, 654),
-            COLORS["muted"],
-        )
-        self._text(
-            target,
-            self.small_font,
-            "V sensors   F12 screenshot   Esc quit",
-            (x, 671),
+            "1-4 parts  C track  G ghost  V rays  R reset",
+            (x, 672),
             COLORS["muted"],
         )
 

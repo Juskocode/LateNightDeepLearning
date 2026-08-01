@@ -13,6 +13,7 @@ from .environment import DrivingEnv, StepResult
 from .math2d import clamp, wrap_angle
 from .rendering import (
     CircuitRenderer,
+    RacingGhostRenderer,
     TelemetryHUD,
     WINDOW_HEIGHT,
     WINDOW_WIDTH,
@@ -43,12 +44,14 @@ class DrivingGame:
             self.screen = pygame.Surface((WINDOW_WIDTH, WINDOW_HEIGHT))
         self.env = DrivingEnv(circuit, build=build, seed=seed)
         self.circuit_renderer = CircuitRenderer()
+        self.ghost_renderer = RacingGhostRenderer()
         self.hud = TelemetryHUD()
         self.particles = ParticleSystem(seed)
         self.car = CarSprite(self.env.vehicle.build, car_sprite_path)
         self.car_group = pygame.sprite.GroupSingle(self.car)
         self.last_controls = DriverControls()
         self.show_sensors = True
+        self.show_ghost = True
         self.running = True
         self.car.sync(self.env.vehicle)
 
@@ -76,15 +79,28 @@ class DrivingGame:
         snapshot = self.env.telemetry()
         snapshot["particles"] = len(self.particles)
         snapshot["sprite_asset_loaded"] = self.car.using_external_image
+        snapshot["ghost_enabled"] = self.show_ghost
         return snapshot
 
     def draw(self) -> pygame.Surface:
         self.screen.blit(self.circuit_renderer.surface_for(self.env.circuit), (0, 0))
+        if self.show_ghost:
+            self.ghost_renderer.draw(
+                self.screen,
+                self.env.ghost_pose_at(),
+                self.env.best_lap_trajectory,
+            )
         self.particles.draw(self.screen)
         if self.show_sensors:
             draw_sensor_rays(self.screen, self.env)
         self.car_group.draw(self.screen)
-        self.hud.draw(self.screen, self.env, self.last_controls, len(self.particles))
+        self.hud.draw(
+            self.screen,
+            self.env,
+            self.last_controls,
+            len(self.particles),
+            ghost_enabled=self.show_ghost,
+        )
         return self.screen
 
     def save_screenshot(self, path: str | Path) -> Path:
@@ -99,6 +115,7 @@ class DrivingGame:
         next_level = (getattr(build, component) + 1) % (MAX_UPGRADE_LEVEL + 1)
         build = replace(build, **{component: next_level})
         self.env.vehicle.set_build(build)
+        self.env.restart_lap_candidate(wait_for_start=True)
         self.car.set_build(build)
         return build
 
@@ -197,6 +214,8 @@ class DrivingGame:
                     self.cycle_circuit()
                 elif event.key == pygame.K_v:
                     self.show_sensors = not self.show_sensors
+                elif event.key == pygame.K_g:
+                    self.show_ghost = not self.show_ghost
                 elif event.key == pygame.K_1:
                     self.cycle_upgrade("motor")
                 elif event.key == pygame.K_2:

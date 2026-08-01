@@ -51,6 +51,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--no-sensors", action="store_true", help="Hide the five live track rays"
     )
+    parser.add_argument(
+        "--no-ghost", action="store_true", help="Hide the in-session best-lap ghost"
+    )
     return parser
 
 
@@ -81,6 +84,7 @@ def main(argv: list[str] | None = None) -> int:
         car_sprite_path=args.car_sprite,
     )
     game.show_sensors = not args.no_sensors
+    game.show_ghost = not args.no_ghost
     try:
         steps = args.steps
         if capture_mode and steps is None:
@@ -90,9 +94,12 @@ def main(argv: list[str] | None = None) -> int:
             output = game.save_screenshot(args.screenshot)
             print(f"Screenshot saved to {output}")
         snapshot = game.telemetry()
+        best_lap = snapshot["best_lap_time"]
+        best_text = "--" if best_lap is None else f"{float(best_lap):.3f}s"
         print(
             f"Circuit {snapshot['circuit']} | progress {snapshot['progress'] * 100:.1f}% | "
-            f"speed {snapshot['speed']:.1f} | collisions {snapshot['collisions']}"
+            f"lap {snapshot['laps'] + 1} | speed {snapshot['speed']:.1f} | "
+            f"best {best_text} | collisions {snapshot['collisions']}"
         )
     finally:
         game.close()

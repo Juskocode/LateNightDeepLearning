@@ -11,6 +11,7 @@ from drivingGameRL.main import main
 from drivingGameRL.src.game import DrivingGame
 from drivingGameRL.src.math2d import Vec2
 from drivingGameRL.src.sprites import CarSprite, ParticleSystem
+from drivingGameRL.src.terrain import TerrainKind, terrain
 from drivingGameRL.src.vehicle import CarBuild, DriverControls, Vehicle
 
 
@@ -59,6 +60,27 @@ class DrivingRenderingTests(unittest.TestCase):
         self.assertEqual(second, first)
         system.emit_collision(Vec2(), 0.0)
         self.assertEqual(len(system), len(second))
+
+    def test_surface_particle_modes_distinguish_ice_from_loose_terrain(self):
+        def emitted_count(kind):
+            vehicle = Vehicle()
+            surface = terrain(kind)
+            vehicle.reset(Vec2(80.0, 80.0), 0.0)
+            vehicle.state.velocity = Vec2(60.0, 0.0)
+            vehicle.step(DriverControls(), surface, 1.0 / 60.0)
+            particles = ParticleSystem(seed=23)
+            for _ in range(20):
+                particles.emit_drive(
+                    vehicle,
+                    surface,
+                    DriverControls(),
+                    1.0 / 60.0,
+                )
+            return len(particles)
+
+        self.assertEqual(emitted_count(TerrainKind.ICE), 0)
+        self.assertGreater(emitted_count(TerrainKind.SAND), 0)
+        self.assertGreater(emitted_count(TerrainKind.SNOW), 0)
 
     def test_game_saves_full_hud_screenshot_and_reports_asset(self):
         with tempfile.TemporaryDirectory() as directory:

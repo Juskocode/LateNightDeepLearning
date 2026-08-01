@@ -4,7 +4,7 @@ Playable arcade environments for watching reinforcement learning from the inside
 
 - **Pacman** supports manual play plus real DQN and Double-DQN training with a four-tab live observatory.
 - **Snake** compares six deep and tabular value-learning methods with held-out seed evaluation, curriculum randomization, and live generalization metrics.
-- **Driving Lab** is a deterministic top-down simulator with three circuits, terrain friction, upgradeable car parts, sensor rays, sprite rendering, and particles.
+- **Driving Lab** is a deterministic top-down simulator with five circuits, eight terrain models, fixed-step lap timing, a best-lap ghost, upgradeable car parts, sensor rays, sprite rendering, and particles.
 
 ![Pacman Double-DQN observatory cycling through the game, vision, metrics, and neural-network views](assets/gifs/pacman-dqn-observatory.gif)
 
@@ -14,7 +14,7 @@ Playable arcade environments for watching reinforcement learning from the inside
 |---|---|
 | ![Pacman gameplay](assets/screenshots/pacman-gameplay.png) | ![Snake agent inspector](assets/screenshots/snake-observatory.png) |
 
-![Driving physics lab with circuit sensors, upgrade telemetry, and the sprite-based car](assets/screenshots/driving-lab.png)
+![Alpine driving circuit with lap telemetry, best-lap racing line and ghost, live sensors, terrain, and upgraded car](assets/screenshots/driving-lab.png)
 
 For the equations, reward contracts, seed-overfitting discussion, and a fair comparison protocol, see the [learning lab guide](docs/learning-lab.md).
 
@@ -322,11 +322,14 @@ python -m drivingGameRL.main --list-circuits
 | `Space` | Brake |
 | `1` / `2` / `3` / `4` | Cycle motor, wheels, suspension, or grip level |
 | `C` | Cycle circuit |
+| `G` | Toggle the best-lap ghost and racing line |
 | `V` | Toggle five live sensor rays |
-| `R` | Reset the car and lap state |
+| `R` | Reset the car and current run; retain in-session circuit records |
 | `F12` | Save `driving-screenshot.png` |
 
-The three circuits are Harbor Loop, Pine Sprint, and Desert Switchback. Asphalt, wet asphalt, gravel, grass, and mud have distinct grip, rolling resistance, and engine-efficiency coefficients. Road sectors use the subtle wet/gravel differences; larger grass, mud, or gravel penalties apply after leaving the road.
+The five circuits are Harbor Loop, Pine Sprint, Desert Switchback, Alpine Gauntlet, and Canyon Maze. The latter two add narrow, corner-dense layouts: Alpine Gauntlet combines ice, wet asphalt, and snow, while Canyon Maze combines gravel, sand, wet asphalt, and sandy runoff. Across the lab, asphalt, wet asphalt, gravel, grass, mud, sand, snow, and ice each have distinct grip, rolling-resistance, engine-efficiency, color, and tire-particle behavior.
+
+The HUD counts completed laps and shows current, last, and best lap times. Timing advances by the environment's fixed simulation step, so the same action sequence produces the same lap time independently of the display FPS. Ordered quarter-lap gates and a forward start-line crossing reject reverse driving, line oscillation, and projection shortcuts. The first valid lap on a circuit establishes an in-session record; a faster lap replaces it and supplies the translucent ghost and racing line for following laps. Records are kept separately for each circuit when `R` resets the car or `C` changes tracks, but a new process starts with no records. The ghost is a presentation-only replay: it never collides with the car and does not alter physics, observations, rewards, or particles. Press `G` to hide or show it, or start with `--no-ghost`.
 
 Each component has levels 0–5 and changes actual physics:
 
@@ -397,7 +400,7 @@ late-night-tests -v
 
 `python -m unittest discover -v` also works from the repository root. Standard discovery searches the current directory, so running it from `~` correctly finds zero project tests.
 
-Coverage includes Pacman contour/combat/level/RL behavior; Snake algorithms, dueling heads, tabular updates, held-out evaluation, seed streams, curricula, checkpoint compatibility, and environment edge cases; and driving circuits, terrain, component effects, collisions, finite stress simulation, sprite fallback, bounded particles, screenshots, and renderer smoke tests.
+Coverage includes Pacman contour/combat/level/RL behavior; Snake algorithms, dueling heads, tabular updates, held-out evaluation, seed streams, curricula, checkpoint compatibility, and environment edge cases; and driving circuit geometry, terrain physics, gated lap records, ghost interpolation, component effects, collisions, finite stress simulation, sprite fallback, bounded particles, screenshots, and renderer smoke tests.
 
 Regenerate documentation media from the real renderers:
 
@@ -415,8 +418,8 @@ python -m snakeGameQDlearning.main \
   --screenshot assets/screenshots/snake-observatory.png
 
 python -m drivingGameRL.main \
-  --circuit pine_sprint --motor 2 --wheels 2 --suspension 2 --grip 2 \
-  --seed 11 --steps 720 --screenshot assets/screenshots/driving-lab.png
+  --circuit alpine_gauntlet --motor 5 --wheels 5 --suspension 5 --grip 5 \
+  --seed 19 --steps 1500 --screenshot assets/screenshots/driving-lab.png
 ```
 
 ## Design notes

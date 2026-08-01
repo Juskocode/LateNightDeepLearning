@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from bisect import bisect_right
 from dataclasses import dataclass
 from enum import IntEnum
 import math
@@ -46,8 +47,32 @@ class StepResult:
         yield self.info
 
 
+@dataclass(frozen=True, slots=True)
+class LapPose:
+    """One deterministic sample from a completed best lap."""
+
+    elapsed: float
+    position: Vec2
+    heading: float
+
+
+@dataclass(frozen=True, slots=True)
+class LapRecord:
+    """Fastest in-session lap and the racing line used by its ghost."""
+
+    circuit: str
+    duration: float
+    trajectory: tuple[LapPose, ...]
+
+
 class DrivingEnv:
     """Fixed-step track environment with observable physics and shaped reward."""
+
+    MAX_GHOST_SAMPLES = 4_096
+    GHOST_SAMPLE_INTERVAL = 1.0 / 30.0
+    LAP_CHECKPOINTS = (0.25, 0.50, 0.75)
+    MAX_LAP_PROGRESS_STEP = 0.075
+    BEST_LAP_EPSILON = 1e-9
 
     OBSERVATION_LABELS = (
         "speed",
@@ -86,6 +111,14 @@ class DrivingEnv:
         self.steps = 0
         self.laps = 0
         self.collisions = 0
+        self.current_lap_time = 0.0
+        self.last_lap_time: float | None = None
+        self._best_laps: dict[str, LapRecord] = {}
+        self._current_lap_trajectory: list[LapPose] = []
+        self._record_interval = fixed_dt
+        self._next_record_time = fixed_dt
+        self._next_lap_checkpoint = 0
+        self._lap_candidate_armed = True
         self._collision_contact = False
         self._lap_progress = 0.0
         self.previous_progress = 0.0
@@ -102,12 +135,109 @@ class DrivingEnv:
         self.steps = 0
         self.laps = 0
         self.collisions = 0
+        self.current_lap_time = 0.0
+        self.last_lap_time = None
         self._collision_contact = False
         self._lap_progress = 0.0
+        self._next_lap_checkpoint = 0
+        self._lap_candidate_armed = True
         self.last_projection = self.circuit.project(position)
         self.previous_progress = self.last_projection.progress
         self.last_reward_terms = {}
+        self._reset_lap_recording()
         return self.observation()
+
+    @property
+    def best_lap_record(self) -> LapRecord | None:
+        """Return the current circuit's fastest in-session lap, if available."""
+
+        return self._best_laps.get(self.circuit.slug)
+
+    @property
+    def best_lap_time(self) -> float | None:
+        record = self.best_lap_record
+        return None if record is None else record.duration
+
+    @property
+    def best_lap_trajectory(self) -> tuple[LapPose, ...]:
+        record = self.best_lap_record
+        return () if record is None else record.trajectory
+
+    @property
+    def current_trajectory_samples(self) -> int:
+        return len(self._current_lap_trajectory)
+
+    def _lap_pose(self, elapsed: float) -> LapPose:
+        state = self.vehicle.state
+        return LapPose(elapsed, state.position, state.heading)
+
+    def _reset_lap_recording(self) -> None:
+        self._record_interval = max(self.fixed_dt, self.GHOST_SAMPLE_INTERVAL)
+        self._next_record_time = self._record_interval
+        self._current_lap_trajectory = [self._lap_pose(0.0)]
+
+    def restart_lap_candidate(self, *, wait_for_start: bool = False) -> None:
+        """Invalidate partial timing without deleting any completed best lap.
+
+        Component changes use ``wait_for_start=True`` so a mid-lap upgrade
+        cannot turn the remaining fraction of the circuit into a best time.
+        """
+
+        self.current_lap_time = 0.0
+        self._lap_progress = 0.0
+        self._next_lap_checkpoint = 0
+        projection = self.circuit.project(self.vehicle.state.position)
+        exactly_on_start = min(projection.progress, 1.0 - projection.progress) <= 1e-9
+        self._lap_candidate_armed = not wait_for_start or exactly_on_start
+        self.previous_progress = projection.progress
+        self.last_projection = projection
+        self._reset_lap_recording()
+
+    def _record_lap_pose(self, *, force: bool = False) -> None:
+        if not force and self.current_lap_time + 1e-12 < self._next_record_time:
+            return
+        if len(self._current_lap_trajectory) >= self.MAX_GHOST_SAMPLES:
+            # Deterministically halve temporal resolution instead of dropping
+            # the beginning of a long lap. This keeps both memory and render
+            # work bounded while retaining the complete racing line.
+            self._current_lap_trajectory = self._current_lap_trajectory[::2]
+            self._record_interval *= 2.0
+        pose = self._lap_pose(self.current_lap_time)
+        if self._current_lap_trajectory[-1].elapsed == pose.elapsed:
+            self._current_lap_trajectory[-1] = pose
+        else:
+            self._current_lap_trajectory.append(pose)
+        self._next_record_time = self.current_lap_time + self._record_interval
+
+    def ghost_pose_at(self, elapsed: float | None = None) -> LapPose | None:
+        """Interpolate the best-lap ghost at deterministic simulation time."""
+
+        record = self.best_lap_record
+        if record is None:
+            return None
+        if elapsed is None and not self._lap_candidate_armed:
+            return None
+        target = self.current_lap_time if elapsed is None else elapsed
+        if not math.isfinite(target) or target < 0.0:
+            raise ValueError("Ghost elapsed time must be finite and non-negative")
+        if target > record.duration:
+            return None
+        trajectory = record.trajectory
+        index = bisect_right(trajectory, target, key=lambda pose: pose.elapsed)
+        if index <= 0:
+            first = trajectory[0]
+            return LapPose(target, first.position, first.heading)
+        if index >= len(trajectory):
+            last = trajectory[-1]
+            return LapPose(target, last.position, last.heading)
+        before = trajectory[index - 1]
+        after = trajectory[index]
+        span = after.elapsed - before.elapsed
+        blend = 0.0 if span <= 1e-12 else (target - before.elapsed) / span
+        position = before.position + (after.position - before.position) * blend
+        heading_delta = wrap_angle(after.heading - before.heading)
+        heading = wrap_angle(before.heading + heading_delta * blend)
+        return LapPose(target, position, heading)
 
     def observation(self) -> tuple[float, ...]:
         state = self.vehicle.state
@@ -173,19 +303,79 @@ class DrivingEnv:
         elif after.distance < self.circuit.collision_radius - 4.0:
             self._collision_contact = False
 
-        delta_progress = after.progress - self.previous_progress
+        raw_delta_progress = after.progress - self.previous_progress
+        delta_progress = raw_delta_progress
         if delta_progress < -0.5:
             delta_progress += 1.0
         elif delta_progress > 0.5:
             delta_progress -= 1.0
 
-        self._lap_progress = max(0.0, self._lap_progress + delta_progress)
-        lap_completed = self._lap_progress >= 1.0 - 1e-9
-        if lap_completed:
-            self.laps += 1
-            self._lap_progress = max(0.0, self._lap_progress - 1.0)
+        valid_forward_progress = 0.0 < delta_progress <= self.MAX_LAP_PROGRESS_STEP
+        forward_start_crossed = valid_forward_progress and raw_delta_progress < -0.5
+        progress_discontinuity = abs(delta_progress) > self.MAX_LAP_PROGRESS_STEP
+        if self._lap_candidate_armed and progress_discontinuity:
+            # A fixed-step car cannot legitimately traverse this much of the
+            # center line at once. Projection switches between nearby hairpin
+            # segments therefore invalidate, rather than shorten, the lap.
+            self.restart_lap_candidate(wait_for_start=True)
+        if self._lap_candidate_armed:
+            self.current_lap_time += self.fixed_dt
+            if abs(delta_progress) <= self.MAX_LAP_PROGRESS_STEP:
+                self._lap_progress = clamp(
+                    self._lap_progress + delta_progress, 0.0, 1.0
+                )
+            if valid_forward_progress and not forward_start_crossed:
+                checkpoint = (
+                    self.LAP_CHECKPOINTS[self._next_lap_checkpoint]
+                    if self._next_lap_checkpoint < len(self.LAP_CHECKPOINTS)
+                    else None
+                )
+                if (
+                    checkpoint is not None
+                    and self.previous_progress < checkpoint <= after.progress
+                ):
+                    self._next_lap_checkpoint += 1
 
-        forward_distance = delta_progress * self.circuit.length
+        lap_completed = (
+            forward_start_crossed
+            and self._lap_candidate_armed
+            and self._next_lap_checkpoint == len(self.LAP_CHECKPOINTS)
+            and self._lap_progress >= 1.0 - 1e-9
+        )
+        if lap_completed:
+            self._record_lap_pose(force=True)
+            self.laps += 1
+            self.last_lap_time = self.current_lap_time
+            previous_best = self.best_lap_record
+            if (
+                previous_best is None
+                or self.last_lap_time < previous_best.duration - self.BEST_LAP_EPSILON
+            ):
+                self._best_laps[self.circuit.slug] = LapRecord(
+                    self.circuit.slug,
+                    self.last_lap_time,
+                    tuple(self._current_lap_trajectory),
+                )
+            self.current_lap_time = 0.0
+            self._lap_progress = 0.0
+            self._next_lap_checkpoint = 0
+            self._reset_lap_recording()
+        elif forward_start_crossed:
+            # Crossing the line without all ordered gates rejects shortcuts
+            # and starts a clean candidate for the following full lap.
+            self.current_lap_time = 0.0
+            self._lap_progress = 0.0
+            self._next_lap_checkpoint = 0
+            self._lap_candidate_armed = True
+            self._reset_lap_recording()
+        else:
+            if self._lap_candidate_armed:
+                self._record_lap_pose()
+
+        reward_progress = (
+            delta_progress if abs(delta_progress) <= self.MAX_LAP_PROGRESS_STEP else 0.0
+        )
+        forward_distance = reward_progress * self.circuit.length
         on_road = after.distance <= self.circuit.track_width * 0.5
         reward_terms = {
             "progress": forward_distance * 0.12,
@@ -210,6 +400,10 @@ class DrivingEnv:
             "progress": after.progress,
             "laps": self.laps,
             "lap_completed": lap_completed,
+            "current_lap_time": self.current_lap_time,
+            "last_lap_time": self.last_lap_time,
+            "best_lap_time": self.best_lap_time,
+            "lap_candidate_valid": self._lap_candidate_armed,
             "collided": collided,
             "collision_started": collision_started,
             "impact_speed": impact_speed,
@@ -234,6 +428,13 @@ class DrivingEnv:
             "circuit": self.circuit.slug,
             "steps": self.steps,
             "laps": self.laps,
+            "current_lap_time": self.current_lap_time,
+            "last_lap_time": self.last_lap_time,
+            "best_lap_time": self.best_lap_time,
+            "lap_candidate_valid": self._lap_candidate_armed,
+            "ghost_available": self.best_lap_record is not None,
+            "ghost_recording_samples": len(self._current_lap_trajectory),
+            "best_trajectory_samples": len(self.best_lap_trajectory),
             "collisions": self.collisions,
             "position": (state.position.x, state.position.y),
             "heading_degrees": math.degrees(state.heading),
