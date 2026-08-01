@@ -1,8 +1,8 @@
 """Deterministic top-down driving laboratory.
 
 The package deliberately keeps vehicle dynamics independent from Pygame so the
-same environment can be used for manual play, reproducible experiments, and RL
-agents.  Rendering is an optional view over that state.
+same environment powers manual play, reproducible value learning, population
+evolution, and champion races. Rendering is an optional view over that state.
 """
 
 from .src.environment import DrivingAction, DrivingEnv
