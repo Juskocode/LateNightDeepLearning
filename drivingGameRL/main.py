@@ -135,6 +135,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="Capture real Overview, Network, Memory, and champion-race frames",
     )
+    learning.add_argument(
+        "--population-cars",
+        "--show-population-cars",
+        action="store_true",
+        help="Start with isolated same-generation rollout cars visible",
+    )
     return parser
 
 
@@ -181,6 +187,8 @@ def _run_learning(args: argparse.Namespace, parser: argparse.ArgumentParser) -> 
         render=not capture_mode,
         learning_speed=args.learning_speed,
         checkpoint_path=args.checkpoint,
+        show_sensor_rays=not args.no_sensors,
+        show_population_cars=args.population_cars,
     )
     try:
         steps = args.steps
@@ -207,6 +215,8 @@ def _run_learning(args: argparse.Namespace, parser: argparse.ArgumentParser) -> 
                 frames_per_tab=3,
                 training_steps_per_frame=60,
                 race_frames=12,
+                show_sensor_rays=not args.no_sensors,
+                show_population_cars=args.population_cars,
             )
             print(f"Learning GIF saved to {output.resolve()}")
         if args.checkpoint and not args.no_save:

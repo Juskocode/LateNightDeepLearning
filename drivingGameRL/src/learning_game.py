@@ -27,6 +27,8 @@ class DrivingLearningGame:
         render: bool = True,
         learning_speed: int = 16,
         checkpoint_path: str | Path | None = None,
+        show_sensor_rays: bool = True,
+        show_population_cars: bool = False,
     ):
         pygame.init()
         pygame.font.init()
@@ -51,9 +53,14 @@ class DrivingLearningGame:
         self.paused = False
         self.running = True
         self.race: ChampionRace | None = None
+        self.show_sensor_rays = bool(show_sensor_rays)
+        self.show_population_cars = bool(show_population_cars)
+        self.population_rollouts: Any | None = None
         self.training_steps = 0
         self._status = "training"
         self._last_telemetry: dict[str, Any] = {}
+        if self.show_population_cars:
+            self._ensure_population_rollouts(force=True)
 
     @property
     def steps_per_frame(self) -> int:
@@ -88,6 +95,29 @@ class DrivingLearningGame:
         else:
             self.leave_race()
 
+    def _ensure_population_rollouts(self, *, force: bool = False) -> Any:
+        if self.population_rollouts is None:
+            from .population_rollout import PopulationRolloutManager
+
+            self.population_rollouts = PopulationRolloutManager(self.session)
+            force = True
+        self.population_rollouts.refresh(force=force)
+        return self.population_rollouts
+
+    def toggle_population_cars(self) -> bool:
+        self.show_population_cars = not self.show_population_cars
+        if self.show_population_cars:
+            self._ensure_population_rollouts(force=True)
+        self._status = (
+            "generation cars on" if self.show_population_cars else "generation cars off"
+        )
+        return self.show_population_cars
+
+    def toggle_sensor_rays(self) -> bool:
+        self.show_sensor_rays = not self.show_sensor_rays
+        self._status = "sensor rays on" if self.show_sensor_rays else "sensor rays off"
+        return self.show_sensor_rays
+
     @staticmethod
     def controls_from_keyboard() -> DriverControls:
         keys = pygame.key.get_pressed()
@@ -115,9 +145,15 @@ class DrivingLearningGame:
                 if event.key == pygame.K_p:
                     self.toggle_race()
                     continue
+                if event.key == pygame.K_v:
+                    self.toggle_sensor_rays()
+                    continue
                 if self.race is not None:
                     if event.key == pygame.K_r:
                         self.start_race()
+                    continue
+                if event.key == pygame.K_m:
+                    self.toggle_population_cars()
                     continue
                 if event.key == pygame.K_SPACE:
                     self.paused = not self.paused
@@ -144,6 +180,8 @@ class DrivingLearningGame:
                 if event.key == pygame.K_n and self.paused:
                     self.session.step()
                     self.training_steps += 1
+                    if self.show_population_cars:
+                        self._ensure_population_rollouts().step()
                     self._status = "single step"
                     continue
                 if event.key == pygame.K_F12:
@@ -153,6 +191,12 @@ class DrivingLearningGame:
 
     def _training_telemetry(self) -> dict[str, Any]:
         data = self.session.telemetry()
+        rollouts: list[dict[str, Any]] = []
+        rollout_generation = self.session.current_generation
+        if self.show_population_cars:
+            manager = self._ensure_population_rollouts()
+            rollouts = manager.telemetry(include_rays=self.show_sensor_rays)
+            rollout_generation = manager.generation
         data.update(
             {
                 "phase": self._status,
@@ -160,6 +204,10 @@ class DrivingLearningGame:
                 "training_speed": self.steps_per_frame,
                 "training_speed_label": self.speed_label,
                 "training_steps": self.training_steps,
+                "show_sensor_rays": self.show_sensor_rays,
+                "show_population_cars": self.show_population_cars,
+                "population_rollouts": rollouts,
+                "population_rollout_generation": rollout_generation,
             }
         )
         return data
@@ -174,6 +222,8 @@ class DrivingLearningGame:
                 "best_fitness": training.get("best_fitness", 0.0),
                 "champion_member": training.get("champion_member", 0),
                 "phase": "race finished" if self.race.finished else "live race",
+                "show_sensor_rays": self.show_sensor_rays,
+                "show_population_cars": False,
             }
         )
         return race
@@ -234,6 +284,10 @@ class DrivingLearningGame:
                         break
                     self.session.step()
                     self.training_steps += 1
+
+                if self.show_population_cars and not self.paused:
+                    manager = self._ensure_population_rollouts()
+                    manager.step()
 
             if self.render_enabled:
                 self.draw()

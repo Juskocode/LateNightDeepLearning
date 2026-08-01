@@ -730,8 +730,9 @@ late-night-driving-rl --algorithm genetic_dqn \
 An explicit `--checkpoint` is loaded when it exists and saved on clean exit.
 `--fresh` skips loading, while `--no-save` keeps the existing file unchanged.
 
-Headless mode and any `--screenshot` request enter deterministic autopilot capture
-mode, which defaults to 240 steps when `--steps` is omitted. `--motor`, `--wheels`,
+Without `--learn`, headless mode and any `--screenshot` request enter deterministic
+autopilot capture mode, which defaults to 240 steps when `--steps` is omitted.
+`--motor`, `--wheels`,
 `--suspension`, and `--grip` each accept levels 0 through 5. `--car-sprite` selects
 another transparent top-down image, while `--no-sensors` hides only the rendered
 rays—not the observation values. `--no-ghost` starts with the best-lap replay and
@@ -761,12 +762,24 @@ Learning mode adds these controls:
 | `N` | Advance one training step while paused |
 | `[` or `,` | Reduce simulation steps per rendered frame |
 | `]` or `.` | Increase simulation steps per rendered frame |
+| `V` | Show or hide the five exact policy sensor rays |
+| `M` | Show or hide isolated rollout cars for the current generation |
 | `P` | Enter or leave the fixed-60-Hz race against the frozen generation champion |
 | `R` | Reset the current evaluation; start a rematch while racing |
 | `S` | Save the current learner checkpoint |
 | Arrows / `WASD` | Drive the human car during the race |
 | `Space` | Brake during the race |
 | `Esc` | Quit |
+
+The five displayed rays are immutable snapshots from the same sampling method
+that supplies `ray_left` through `ray_right` to the network. Their endpoints are
+therefore measurements, not reconstructed decoration. The `M` comparison view
+clones up to twelve current-generation policies into separate identically seeded
+environments and advances those clones greedily at fixed simulation time. The
+scored training environment is still shown separately. Rollout actions never
+enter replay or fitness, and the set is rebuilt when the generation changes.
+Use `--population-cars` to begin with this view enabled or `--no-sensors` to
+begin with ray rendering disabled.
 
 ## Reproducible comparison protocol
 

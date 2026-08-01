@@ -14,6 +14,7 @@ from PIL import Image
 import pygame
 
 from .learning_runtime import ChampionRace, DrivingLearningSession
+from .population_rollout import PopulationRolloutManager
 from .learning_visualization import (
     DrivingLearningVisualization,
     LEARNING_WINDOW_SIZE,
@@ -68,6 +69,8 @@ def capture_learning_gif(
     race_frames: int = 8,
     duration_ms: int = 120,
     palette_colors: int = 96,
+    show_sensor_rays: bool = True,
+    show_population_cars: bool = False,
 ) -> Path:
     """Capture training observatory tabs followed by a champion race.
 
@@ -123,6 +126,7 @@ def capture_learning_gif(
     # sufficient for both local use and SDL's dummy video driver in CI.
     pygame.font.init()
     visualization = DrivingLearningVisualization(session.env, session.telemetry())
+    rollouts = PopulationRolloutManager(session)
     images: list[Image.Image] = []
 
     for tab in TRAINING_TABS:
@@ -130,9 +134,24 @@ def capture_learning_gif(
         for _ in range(frames_per_tab):
             for _ in range(training_steps_per_frame):
                 session.step()
+            if show_population_cars:
+                rollouts.refresh()
+                rollouts.step(training_steps_per_frame)
+            telemetry = session.telemetry()
+            telemetry.update(
+                {
+                    "show_sensor_rays": bool(show_sensor_rays),
+                    "show_population_cars": bool(show_population_cars),
+                    "population_rollouts": (
+                        rollouts.telemetry(include_rays=show_sensor_rays)
+                        if show_population_cars
+                        else []
+                    ),
+                }
+            )
             images.append(
                 _gif_frame(
-                    visualization.draw(session.env, session.telemetry()),
+                    visualization.draw(session.env, telemetry),
                     palette_colors,
                 )
             )
@@ -148,6 +167,12 @@ def capture_learning_gif(
                 race.step(human_controls)
         race_telemetry = session.telemetry()
         race_telemetry.update(race.telemetry())
+        race_telemetry.update(
+            {
+                "show_sensor_rays": bool(show_sensor_rays),
+                "show_population_cars": False,
+            }
+        )
         images.append(
             _gif_frame(
                 visualization.draw_race(

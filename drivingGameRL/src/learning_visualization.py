@@ -24,6 +24,34 @@ LEARNING_WINDOW_SIZE = (LEARNING_WINDOW_WIDTH, LEARNING_WINDOW_HEIGHT)
 
 ACTION_LABELS = ("COAST", "THROTTLE", "BRAKE", "LEFT", "RIGHT")
 
+SENSOR_RAY_COUNT = 5
+SENSOR_MAX_DISTANCE = 150.0
+SENSOR_ANGLE_OFFSETS = (
+    -math.pi / 2,
+    -math.pi / 4,
+    0.0,
+    math.pi / 4,
+    math.pi / 2,
+)
+MAX_POPULATION_CARS = 12
+
+# Deliberately fixed rather than generated from fitness or list order.  A member
+# keeps the same identity color while rankings and positions change.
+POPULATION_CAR_COLORS = (
+    (255, 105, 135),
+    (111, 225, 151),
+    (255, 158, 75),
+    (155, 117, 255),
+    (90, 176, 255),
+    (255, 108, 216),
+    (109, 231, 213),
+    (250, 219, 86),
+    (211, 128, 255),
+    (255, 176, 188),
+    (119, 202, 255),
+    (174, 229, 103),
+)
+
 COLORS = {
     "background": (7, 13, 22),
     "panel": (14, 24, 37),
@@ -73,6 +101,41 @@ def _sequence(value: object) -> list[object]:
 
 def _mapping(value: object) -> Mapping[str, Any]:
     return value if isinstance(value, Mapping) else {}
+
+
+def _flag(value: object, default: bool = False) -> bool:
+    """Interpret a telemetry toggle without treating ``"false"`` as true."""
+
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return math.isfinite(float(value)) and float(value) != 0.0
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on", "enabled"}:
+            return True
+        if normalized in {"0", "false", "no", "off", "disabled", ""}:
+            return False
+    return default
+
+
+def _point(value: object) -> tuple[float, float] | None:
+    """Return a finite world-space point from mappings, vectors, or pairs."""
+
+    if isinstance(value, Mapping):
+        raw_x, raw_y = value.get("x"), value.get("y")
+    elif hasattr(value, "x") and hasattr(value, "y"):
+        raw_x, raw_y = getattr(value, "x"), getattr(value, "y")
+    else:
+        values = _sequence(value)
+        if len(values) < 2:
+            return None
+        raw_x, raw_y = values[:2]
+    x = _finite(raw_x, math.nan)
+    y = _finite(raw_y, math.nan)
+    if not math.isfinite(x) or not math.isfinite(y):
+        return None
+    return x, y
 
 
 def _compact_number(value: float) -> str:
@@ -273,13 +336,27 @@ class DrivingLearningVisualization:
         )
         self._text(subtitle, (23, 44), size=12, color=COLORS["muted"])
         if race:
+            ray_state = "ON" if _flag(data.get("show_sensor_rays")) else "OFF"
+            self._right_text(
+                f"P  TRAINING   ·   V RAYS {ray_state}",
+                1_378,
+                46,
+                size=10,
+                color=COLORS["muted"],
+                bold=True,
+            )
             return
         speed = str(data.get("training_speed_label", "16x")).upper()
+        ray_state = "ON" if _flag(data.get("show_sensor_rays")) else "OFF"
+        cars_state = "ON" if _flag(data.get("show_population_cars")) else "OFF"
         self._right_text(
-            f"P  RACE   ·   [ ]  {speed}   ·   SPACE  PAUSE",
+            (
+                f"P RACE  ·  V RAYS {ray_state}  ·  "
+                f"M GEN CARS {cars_state}  ·  [ ] {speed}"
+            ),
             778,
             46,
-            size=10,
+            size=9,
             color=COLORS["muted"],
             bold=True,
         )
@@ -396,6 +473,226 @@ class DrivingLearningVisualization:
             _finite(heading),
         )
 
+    @staticmethod
+    def _field(value: object, name: str, default: object = None) -> object:
+        if isinstance(value, Mapping):
+            return value.get(name, default)
+        return getattr(value, name, default)
+
+    def _coerce_rays(self, source: object) -> list[dict[str, Any]]:
+        """Normalize SensorRay objects and serialized ray mappings for drawing."""
+
+        if isinstance(source, Mapping):
+            for key in ("rays", "sensor_rays", "vision_rays"):
+                if key in source:
+                    source = source.get(key)
+                    break
+            else:
+                source = [source] if "endpoint" in source else []
+        elif not isinstance(source, Sequence) and source is not None:
+            nested = getattr(source, "rays", getattr(source, "sensor_rays", None))
+            if nested is not None:
+                source = nested
+
+        rays: list[dict[str, Any]] = []
+        for candidate in _sequence(source):
+            origin = _point(self._field(candidate, "origin"))
+            endpoint = _point(
+                self._field(
+                    candidate,
+                    "endpoint",
+                    self._field(candidate, "end"),
+                )
+            )
+            if origin is None or endpoint is None:
+                continue
+            normalized = _finite(
+                self._field(candidate, "normalized_distance"), math.nan
+            )
+            distance = _finite(self._field(candidate, "distance"), math.nan)
+            maximum = _finite(
+                self._field(candidate, "max_distance"), SENSOR_MAX_DISTANCE
+            )
+            if not math.isfinite(normalized):
+                normalized = (
+                    distance / maximum
+                    if math.isfinite(distance) and maximum > 0.0
+                    else 1.0
+                )
+            rays.append(
+                {
+                    "origin": origin,
+                    "endpoint": endpoint,
+                    "distance": distance,
+                    "normalized_distance": max(0.0, min(1.0, normalized)),
+                    "hit": _flag(self._field(candidate, "hit"), normalized < 1.0),
+                }
+            )
+        return rays
+
+    def _environment_rays(
+        self, env: DrivingEnv, explicit_pose: object = None
+    ) -> list[dict[str, Any]]:
+        """Read the environment's exact ray snapshots, with a legacy fallback."""
+
+        environment_pose = self._pose(env)
+        requested_pose = self._pose(env, explicit_pose)
+        pose_matches_environment = explicit_pose is None or all(
+            math.isclose(actual, requested, abs_tol=1e-7)
+            for actual, requested in zip(environment_pose, requested_pose)
+        )
+        sensor_api = getattr(env, "sensor_rays", None)
+        if sensor_api is not None and pose_matches_environment:
+            try:
+                snapshots = sensor_api() if callable(sensor_api) else sensor_api
+                rays = self._coerce_rays(snapshots)
+                if len(rays) >= SENSOR_RAY_COUNT:
+                    return rays[:SENSOR_RAY_COUNT]
+            except (AttributeError, TypeError, ValueError):
+                pass
+
+        # Older environments expose only the normalized observation values.
+        # Rebuilding endpoints from the same fixed angles remains read-only and
+        # keeps this dashboard compatible while SensorRay rolls out.
+        try:
+            readings = [_finite(value) for value in env.observation()[-5:]]
+        except (AttributeError, TypeError, ValueError):
+            readings = []
+        if len(readings) != SENSOR_RAY_COUNT:
+            return []
+        x, y, heading = requested_pose
+        result: list[dict[str, Any]] = []
+        for angle, reading in zip(SENSOR_ANGLE_OFFSETS, readings):
+            normalized = max(0.0, min(1.0, reading))
+            distance = normalized * SENSOR_MAX_DISTANCE
+            endpoint = (
+                x + math.cos(heading + angle) * distance,
+                y + math.sin(heading + angle) * distance,
+            )
+            result.append(
+                {
+                    "origin": (x, y),
+                    "endpoint": endpoint,
+                    "distance": distance,
+                    "normalized_distance": normalized,
+                    "hit": normalized < 1.0,
+                }
+            )
+        return result
+
+    @staticmethod
+    def _stable_member_key(value: object, fallback: int) -> int:
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            numeric = float(value)
+            if math.isfinite(numeric):
+                return int(numeric)
+        text = str(value)
+        if not text or text == "None":
+            return fallback
+        return sum((index + 1) * ord(character) for index, character in enumerate(text))
+
+    def _population_rollouts(
+        self, data: Mapping[str, Any]
+    ) -> list[tuple[Mapping[str, Any], tuple[int, int, int], str]]:
+        raw = _sequence(data.get("population_rollouts"))
+        if not raw:
+            return []
+
+        target_raw = data.get(
+            "population_rollout_generation",
+            data.get("generation", data.get("generation_index")),
+        )
+        target_generation: int | None = None
+        if isinstance(target_raw, (int, float)) and not isinstance(target_raw, bool):
+            if math.isfinite(float(target_raw)):
+                target_generation = int(target_raw)
+        if target_generation is None:
+            for candidate in raw:
+                generation = _mapping(candidate).get("generation")
+                if isinstance(generation, (int, float)) and not isinstance(
+                    generation, bool
+                ):
+                    if math.isfinite(float(generation)):
+                        target_generation = int(generation)
+                        break
+
+        prepared: list[
+            tuple[int, int, Mapping[str, Any], tuple[int, int, int], str]
+        ] = []
+        for ordinal, candidate in enumerate(raw):
+            rollout = _mapping(candidate)
+            if (
+                not rollout
+                or _point(rollout.get("position", rollout.get("pos"))) is None
+            ):
+                continue
+            generation = rollout.get("generation")
+            if (
+                target_generation is not None
+                and isinstance(generation, (int, float))
+                and not isinstance(generation, bool)
+                and math.isfinite(float(generation))
+                and int(generation) != target_generation
+            ):
+                continue
+            member_value = rollout.get(
+                "member_id", rollout.get("index", rollout.get("member", ordinal))
+            )
+            member_key = self._stable_member_key(member_value, ordinal)
+            color = POPULATION_CAR_COLORS[member_key % len(POPULATION_CAR_COLORS)]
+            label_value = rollout.get("index", member_value)
+            label_number = self._stable_member_key(label_value, ordinal)
+            label = f"M{label_number + 1:02d}"[-5:]
+            prepared.append((label_number, ordinal, rollout, color, label))
+        prepared.sort(key=lambda item: (item[0], item[1]))
+        return [
+            (rollout, color, label)
+            for _, _, rollout, color, label in prepared[:MAX_POPULATION_CARS]
+        ]
+
+    @staticmethod
+    def _ray_color(ray: Mapping[str, Any]) -> tuple[int, int, int]:
+        reading = _finite(ray.get("normalized_distance"), 1.0)
+        if reading > 0.55:
+            return COLORS["green"]
+        if reading > 0.25:
+            return COLORS["yellow"]
+        return COLORS["red"]
+
+    def _draw_ray_set(
+        self,
+        layer: pygame.Surface,
+        viewport: pygame.Rect,
+        rays: Sequence[Mapping[str, Any]],
+        *,
+        color: tuple[int, int, int] | None = None,
+        alpha: int = 150,
+        width: int = 1,
+    ) -> None:
+        scale_x = viewport.width / TRACK_VIEW_WIDTH
+        scale_y = viewport.height / TRACK_HEIGHT
+
+        def local(point: tuple[float, float]) -> tuple[int, int]:
+            # Bounding extreme malformed-but-finite inputs avoids passing huge
+            # integers into SDL while still letting normal off-track rays clip.
+            x = max(-TRACK_VIEW_WIDTH * 4, min(TRACK_VIEW_WIDTH * 5, point[0]))
+            y = max(-TRACK_HEIGHT * 4, min(TRACK_HEIGHT * 5, point[1]))
+            return round(x * scale_x), round(y * scale_y)
+
+        for ray in list(rays)[:SENSOR_RAY_COUNT]:
+            origin = _point(ray.get("origin"))
+            endpoint = _point(ray.get("endpoint"))
+            if origin is None or endpoint is None:
+                continue
+            ray_color = color or self._ray_color(ray)
+            start, end = local(origin), local(endpoint)
+            pygame.draw.line(layer, (*ray_color, alpha), start, end, width)
+            if (
+                -4 <= end[0] <= viewport.width + 4
+                and -4 <= end[1] <= viewport.height + 4
+            ):
+                pygame.draw.circle(layer, (*ray_color, min(255, alpha + 55)), end, 3)
+
     def _draw_track(
         self,
         rect: pygame.Rect,
@@ -403,17 +700,57 @@ class DrivingLearningVisualization:
         *,
         title: str = "CURRENT POLICY ON TRACK",
         cars: Sequence[tuple[object, tuple[int, int, int], str]] = (),
+        telemetry: Mapping[str, Any] | None = None,
+        include_population: bool = True,
+        ray_sources: Sequence[
+            tuple[object, DrivingEnv, object, tuple[int, int, int]]
+        ] = (),
     ) -> None:
         self._panel(rect, title, accent=COLORS["green"])
         viewport = pygame.Rect(
             rect.x + 10, rect.y + 38, rect.width - 20, rect.height - 48
         )
         self.surface.blit(self._track_surface(env, viewport.size), viewport)
+        data = _mapping(telemetry)
+        population = (
+            self._population_rollouts(data)
+            if include_population and _flag(data.get("show_population_cars"))
+            else []
+        )
+        if _flag(data.get("show_sensor_rays")):
+            ray_layer = pygame.Surface(viewport.size, pygame.SRCALPHA)
+            if ray_sources:
+                for source, source_env, pose, color in ray_sources:
+                    rays = self._coerce_rays(source)
+                    if len(rays) < SENSOR_RAY_COUNT:
+                        rays = self._environment_rays(source_env, pose)
+                    self._draw_ray_set(
+                        ray_layer, viewport, rays, color=color, alpha=145, width=2
+                    )
+            else:
+                self._draw_ray_set(
+                    ray_layer,
+                    viewport,
+                    self._environment_rays(env),
+                    alpha=165,
+                    width=2,
+                )
+            for rollout, color, _ in population:
+                self._draw_ray_set(
+                    ray_layer,
+                    viewport,
+                    self._coerce_rays(rollout.get("rays")),
+                    color=color,
+                    alpha=58,
+                    width=1,
+                )
+            self.surface.blit(ray_layer, viewport.topleft)
         if not cars:
             cars = ((None, COLORS["cyan"], "POLICY"),)
+        all_cars = [*population, *cars]
         scale_x = viewport.width / TRACK_VIEW_WIDTH
         scale_y = viewport.height / TRACK_HEIGHT
-        for explicit, color, label in cars:
+        for explicit, color, label in all_cars:
             x, y, heading = self._pose(env, explicit)
             center = (
                 round(viewport.x + x * scale_x),
@@ -810,7 +1147,7 @@ class DrivingLearningVisualization:
             )
 
     def _overview(self, env: DrivingEnv, data: Mapping[str, Any]) -> None:
-        self._draw_track(pygame.Rect(20, 94, 752, 646), env)
+        self._draw_track(pygame.Rect(20, 94, 752, 646), env, telemetry=data)
         x, top, width, gap = 792, 94, 588, 8
         card_width = (width - gap * 3) // 4
         algorithm = (
@@ -1177,7 +1514,12 @@ class DrivingLearningVisualization:
             pygame.draw.rect(self.surface, color, fill, border_radius=3)
 
     def _network(self, env: DrivingEnv, data: Mapping[str, Any]) -> None:
-        self._draw_track(pygame.Rect(20, 94, 380, 292), env, title="POLICY POSITION")
+        self._draw_track(
+            pygame.Rect(20, 94, 380, 292),
+            env,
+            title="POLICY POSITION",
+            telemetry=data,
+        )
         self._q_panel(pygame.Rect(20, 396, 380, 344), data)
         self._network_panel(pygame.Rect(420, 94, 960, 514), env, data)
         self._learning_stats(pygame.Rect(420, 618, 960, 122), data)
@@ -1353,7 +1695,12 @@ class DrivingLearningVisualization:
     def _memory(self, env: DrivingEnv, data: Mapping[str, Any]) -> None:
         self._buffer_panel(pygame.Rect(20, 94, 500, 194), data)
         self._training_curves(pygame.Rect(20, 298, 500, 211), data)
-        self._draw_track(pygame.Rect(20, 519, 500, 221), env, title="EXPERIENCE SOURCE")
+        self._draw_track(
+            pygame.Rect(20, 519, 500, 221),
+            env,
+            title="EXPERIENCE SOURCE",
+            telemetry=data,
+        )
         self._sample_panel(pygame.Rect(540, 94, 400, 415), data)
         self._observation_panel(pygame.Rect(960, 94, 420, 415), env, data)
         self._q_panel(pygame.Rect(540, 519, 400, 221), data)
@@ -1541,6 +1888,8 @@ class DrivingLearningVisualization:
             human_pose = human_env.vehicle.state
         if champion_pose is None:
             champion_pose = champion_env.vehicle.state
+        human_rays = human.get("rays", human.get("sensor_rays"))
+        champion_rays = champion.get("rays", champion.get("sensor_rays"))
         self.surface.fill(COLORS["background"])
         self._header(data, race=True)
         self._draw_track(
@@ -1550,6 +1899,12 @@ class DrivingLearningVisualization:
             cars=(
                 (human_pose, COLORS["human"], "YOU"),
                 (champion_pose, COLORS["champion"], "CHAMPION"),
+            ),
+            telemetry=data,
+            include_population=False,
+            ray_sources=(
+                (human_rays, human_env, human_pose, COLORS["human"]),
+                (champion_rays, champion_env, champion_pose, COLORS["champion"]),
             ),
         )
         scoreboard = pygame.Rect(1_030, 94, 350, 510)

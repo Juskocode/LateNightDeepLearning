@@ -501,19 +501,23 @@ class TelemetryHUD:
 
 
 def draw_sensor_rays(target: pygame.Surface, env: DrivingEnv) -> None:
-    state = env.vehicle.state
-    angles = (-math.pi / 2, -math.pi / 4, 0.0, math.pi / 4, math.pi / 2)
-    readings = env.observation()[-5:]
-    origin = (round(state.position.x), round(state.position.y))
-    for angle, reading in zip(angles, readings):
-        distance = float(reading) * 150.0
-        endpoint = state.position + Vec2.from_angle(state.heading + angle) * distance
+    for ray in env.sensor_rays():
+        reading = ray.normalized_distance
         color = (
             COLORS["green"]
             if reading > 0.55
             else COLORS["yellow"] if reading > 0.25 else COLORS["red"]
         )
         pygame.draw.line(
-            target, (*color, 110), origin, (round(endpoint.x), round(endpoint.y)), 1
+            target,
+            (*color, 110),
+            (round(ray.origin.x), round(ray.origin.y)),
+            (round(ray.endpoint.x), round(ray.endpoint.y)),
+            1,
         )
-        pygame.draw.circle(target, color, (round(endpoint.x), round(endpoint.y)), 3)
+        pygame.draw.circle(
+            target,
+            color,
+            (round(ray.endpoint.x), round(ray.endpoint.y)),
+            3,
+        )

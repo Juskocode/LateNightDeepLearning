@@ -171,6 +171,42 @@ class DrivingLearningSession:
             return len(self._population_trainer.history)
         return len(self.generation_history)
 
+    @property
+    def current_generation(self) -> int:
+        """Generation represented by the policies currently being evaluated."""
+
+        if self.is_population:
+            return int(self._population_trainer.generation)
+        return int(self.generation)
+
+    def population_policy_clones(
+        self, *, max_cars: int = 12
+    ) -> tuple[tuple[int, DrivingDQNAgent], ...]:
+        """Return bounded, isolated policies for presentation-only rollouts.
+
+        No caller receives a training-owned agent, which prevents a renderer or
+        comparison view from changing replay, optimizer, fitness, or selection.
+        """
+
+        if isinstance(max_cars, bool) or not isinstance(max_cars, int):
+            raise ValueError("max_cars must be an integer")
+        if max_cars <= 0:
+            raise ValueError("max_cars must be positive")
+        if self.is_population:
+            sources = (
+                (member.member_id, member.agent)
+                for member in self._population_trainer.population[:max_cars]
+            )
+        else:
+            sources = ((0, self.agent),)
+        return tuple(
+            (
+                int(member_id),
+                agent.clone(seed=agent.config.seed, include_optimizer=False),
+            )
+            for member_id, agent in sources
+        )
+
     def step(self) -> Any:
         """Advance exactly one deterministic environment step."""
 

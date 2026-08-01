@@ -415,10 +415,20 @@ The 1,400×760 learning dashboard is fed only by live telemetry:
 | `N` | Advance one training step while paused |
 | `[` or `,` | Reduce simulated training steps per rendered frame |
 | `]` or `.` | Increase simulated training steps per rendered frame |
+| `V` | Show or hide the five exact sensor rays supplied to the policy |
+| `M` | Show or hide isolated rollout cars for the current generation |
 | `P` | Pause training and start/leave a one-lap race against the current generation champion |
 | `R` | Reset the current evaluation; start a rematch while racing |
 | `S` | Save the current learner checkpoint |
 | `Esc` | Quit |
+
+With rays enabled, every line endpoint comes from the same immutable
+`SensorRay` snapshot used to build the final five observation values. `M` adds
+color-coded rollouts for up to twelve current-generation genomes. Those cars
+use cloned policies and private, identically configured environments; they are
+never scored and cannot change replay, gradients, fitness, or selection. They
+refresh automatically when the population evolves. Pass `--population-cars`
+to start with them visible or `--no-sensors` to start with rays hidden.
 
 The race always advances at a fixed 60 simulation steps per second, regardless
 of the accelerated training setting. Drive with arrows or `WASD` and brake with
@@ -520,11 +530,13 @@ python -m drivingGameRL.main \
 python -m drivingGameRL.main \
   --learn --algorithm genetic_dqn --population 4 --elite-count 1 \
   --evaluation-steps 600 --seed 19 --steps 1150 \
+  --population-cars \
   --screenshot assets/screenshots/driving-learning.png
 
 python -m drivingGameRL.main \
   --learn --algorithm genetic_dqn --population 4 --elite-count 1 \
   --evaluation-steps 600 --seed 19 \
+  --population-cars \
   --gif assets/gifs/driving-genetic-dqn.gif --no-save
 ```
 

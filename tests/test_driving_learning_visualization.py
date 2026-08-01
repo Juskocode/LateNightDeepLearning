@@ -1,3 +1,4 @@
+import math
 import os
 from pathlib import Path
 import tempfile
@@ -12,7 +13,9 @@ from drivingGameRL.src.learning_visualization import (
     COLORS,
     DrivingLearningVisualization,
     LEARNING_WINDOW_SIZE,
+    POPULATION_CAR_COLORS,
 )
+from drivingGameRL.src.rendering import TRACK_VIEW_WIDTH, WINDOW_HEIGHT as TRACK_HEIGHT
 
 
 def learning_telemetry(env: DrivingEnv) -> dict[str, object]:
@@ -96,6 +99,48 @@ def learning_telemetry(env: DrivingEnv) -> dict[str, object]:
     }
 
 
+def rollout_rays(
+    position: tuple[float, float], heading: float
+) -> list[dict[str, object]]:
+    distances = (48.0, 72.0, 108.0, 84.0, 60.0)
+    angles = (-math.pi / 2, -math.pi / 4, 0.0, math.pi / 4, math.pi / 2)
+    return [
+        {
+            "origin": position,
+            "endpoint": (
+                position[0] + math.cos(heading + angle) * distance,
+                position[1] + math.sin(heading + angle) * distance,
+            ),
+            "distance": distance,
+            "normalized_distance": distance / 150.0,
+            "hit": distance < 150.0,
+        }
+        for angle, distance in zip(angles, distances)
+    ]
+
+
+def population_rollouts(generation: int = 12) -> list[dict[str, object]]:
+    poses = (
+        ((205.0, 190.0), 0.15),
+        ((425.0, 345.0), 1.25),
+        ((665.0, 485.0), -0.8),
+    )
+    return [
+        {
+            "member_id": member_id,
+            "index": member_id,
+            "generation": generation,
+            "position": position,
+            "heading": heading,
+            "speed": 42.0 + member_id,
+            "progress": 0.2 + member_id * 0.1,
+            "action": member_id % 5,
+            "rays": rollout_rays(position, heading),
+        }
+        for member_id, (position, heading) in enumerate(poses)
+    ]
+
+
 class DrivingLearningVisualizationTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -128,6 +173,111 @@ class DrivingLearningVisualizationTests(unittest.TestCase):
         self.assertEqual(after["steps"], before["steps"])
         self.assertEqual(after["position"], before["position"])
         self.assertEqual(after["current_lap_time"], before["current_lap_time"])
+
+    def test_ray_and_generation_car_toggles_change_only_opted_in_track_layers(self):
+        rollouts = population_rollouts()
+        disabled = {
+            **self.telemetry,
+            "show_sensor_rays": False,
+            "show_population_cars": False,
+            "population_rollouts": rollouts,
+        }
+        no_optional_payload = {
+            key: value
+            for key, value in disabled.items()
+            if key != "population_rollouts"
+        }
+        off_with_payload = self.visualization.draw(telemetry=disabled).copy()
+        off_without_payload = self.visualization.draw(
+            telemetry=no_optional_payload
+        ).copy()
+        self.assertEqual(
+            pygame.image.tostring(off_with_payload, "RGB"),
+            pygame.image.tostring(off_without_payload, "RGB"),
+        )
+
+        track = pygame.Rect(30, 132, 732, 598)
+        off_track = off_with_payload.subsurface(track).copy()
+        rays = (
+            self.visualization.draw(
+                telemetry={
+                    **disabled,
+                    "show_sensor_rays": True,
+                }
+            )
+            .subsurface(track)
+            .copy()
+        )
+        cars = (
+            self.visualization.draw(
+                telemetry={
+                    **disabled,
+                    "show_population_cars": True,
+                }
+            )
+            .subsurface(track)
+            .copy()
+        )
+        self.assertNotEqual(
+            pygame.image.tostring(rays, "RGB"),
+            pygame.image.tostring(off_track, "RGB"),
+        )
+        self.assertNotEqual(
+            pygame.image.tostring(cars, "RGB"),
+            pygame.image.tostring(off_track, "RGB"),
+        )
+
+    def test_same_generation_rollout_cars_have_stable_distinct_colors_and_positions(
+        self,
+    ):
+        rollouts = population_rollouts()
+        # This brightly colored stale-generation pose must not be drawn.
+        rollouts.append(
+            {
+                "member_id": 8,
+                "index": 8,
+                "generation": 11,
+                "position": (770.0, 120.0),
+                "heading": 0.0,
+                "rays": rollout_rays((770.0, 120.0), 0.0),
+            }
+        )
+        telemetry = {
+            **self.telemetry,
+            "show_sensor_rays": True,
+            "show_population_cars": True,
+            "population_rollout_generation": 12,
+            "population_rollouts": rollouts,
+        }
+        before = self.env.telemetry()
+        first = self.visualization.draw(telemetry=telemetry).copy()
+        second = self.visualization.draw(telemetry=telemetry).copy()
+        self.assertEqual(
+            pygame.image.tostring(first, "RGB"), pygame.image.tostring(second, "RGB")
+        )
+
+        viewport = pygame.Rect(30, 132, 732, 598)
+        scale_x = viewport.width / TRACK_VIEW_WIDTH
+        scale_y = viewport.height / TRACK_HEIGHT
+        for rollout in rollouts[:3]:
+            member_id = int(rollout["member_id"])
+            color = POPULATION_CAR_COLORS[member_id % len(POPULATION_CAR_COLORS)]
+            x, y = rollout["position"]
+            center = (
+                round(viewport.x + x * scale_x),
+                round(viewport.y + y * scale_y),
+            )
+            neighborhood = pygame.Rect(center[0] - 24, center[1] - 24, 48, 48)
+            matching = sum(
+                first.get_at((pixel_x, pixel_y))[:3] == color
+                for pixel_x in range(neighborhood.left, neighborhood.right)
+                for pixel_y in range(neighborhood.top, neighborhood.bottom)
+            )
+            self.assertGreater(matching, 8, f"member {member_id} color was not drawn")
+
+        after = self.env.telemetry()
+        self.assertEqual(after["steps"], before["steps"])
+        self.assertEqual(after["position"], before["position"])
 
     def test_keyboard_and_click_navigation_select_every_tab(self):
         self.assertEqual(self.visualization.active_tab, "OVERVIEW")
@@ -182,6 +332,13 @@ class DrivingLearningVisualizationTests(unittest.TestCase):
             "population": None,
             "network": {"architecture": [12, 5], "layers": None},
             "replay_capacity": 0,
+            "show_sensor_rays": "definitely",
+            "show_population_cars": True,
+            "population_rollouts": [
+                None,
+                {"position": (float("inf"), 4.0), "rays": "broken"},
+                {"position": "nowhere", "rays": [{"endpoint": None}]},
+            ],
         }
         for tab in self.visualization.TABS:
             self.visualization.set_tab(tab)
@@ -256,6 +413,35 @@ class DrivingLearningVisualizationTests(unittest.TestCase):
         self.assertEqual(
             result.get_bounding_rect(), pygame.Rect(0, 0, *LEARNING_WINDOW_SIZE)
         )
+
+    def test_explicit_race_pose_anchors_fallback_rays_to_the_drawn_car(self):
+        explicit_pose = {"position": (400.0, 400.0), "heading": 0.25}
+
+        rays = self.visualization._environment_rays(self.env, explicit_pose)
+
+        self.assertEqual(len(rays), 5)
+        for ray in rays:
+            self.assertEqual(ray["origin"], explicit_pose["position"])
+
+    def test_race_sensor_toggle_draws_both_ray_fans_without_moving_either_env(self):
+        champion = DrivingEnv("canyon_maze", seed=22)
+        for _ in range(7):
+            champion.step(DrivingAction.ACCELERATE)
+        human_before = self.env.telemetry()
+        champion_before = champion.telemetry()
+        off = self.visualization.draw_race(
+            self.env, champion, {"show_sensor_rays": False}
+        ).copy()
+        on = self.visualization.draw_race(
+            self.env, champion, {"show_sensor_rays": True}
+        ).copy()
+        track = pygame.Rect(30, 132, 970, 598)
+        self.assertNotEqual(
+            pygame.image.tostring(off.subsurface(track), "RGB"),
+            pygame.image.tostring(on.subsurface(track), "RGB"),
+        )
+        self.assertEqual(self.env.telemetry()["position"], human_before["position"])
+        self.assertEqual(champion.telemetry()["position"], champion_before["position"])
 
 
 if __name__ == "__main__":

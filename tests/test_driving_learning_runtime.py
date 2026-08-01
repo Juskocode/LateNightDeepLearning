@@ -209,6 +209,36 @@ class DrivingLearningGameTests(unittest.TestCase):
             self.game.change_speed(-1)
         self.assertEqual(self.game.steps_per_frame, 1)
 
+    def test_v_and_m_toggle_real_rays_and_generation_rollouts(self):
+        self.assertTrue(self.game.show_sensor_rays)
+        self.assertFalse(self.game.show_population_cars)
+
+        pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_v))
+        pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_m))
+        self.game.handle_events()
+        telemetry = self.game._training_telemetry()
+
+        self.assertFalse(self.game.show_sensor_rays)
+        self.assertTrue(self.game.show_population_cars)
+        self.assertFalse(telemetry["show_sensor_rays"])
+        self.assertTrue(telemetry["show_population_cars"])
+        self.assertEqual(len(telemetry["population_rollouts"]), 1)
+        self.assertEqual(telemetry["population_rollouts"][0]["sensor_rays"], [])
+
+    def test_paused_single_step_advances_enabled_generation_cars(self):
+        self.game.toggle_population_cars()
+        self.game.paused = True
+        manager = self.game.population_rollouts
+        self.assertIsNotNone(manager)
+        before = manager.telemetry(include_rays=False)[0]["steps"]
+
+        pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_n))
+        self.game.handle_events()
+
+        after = manager.telemetry(include_rays=False)[0]["steps"]
+        self.assertEqual(self.game.training_steps, 1)
+        self.assertEqual(after, before + 1)
+
     def test_learning_cli_exposes_all_algorithms_and_population_controls(self):
         args = build_parser().parse_args(
             [
@@ -221,6 +251,8 @@ class DrivingLearningGameTests(unittest.TestCase):
                 "3",
                 "--evaluation-steps",
                 "1200",
+                "--population-cars",
+                "--no-sensors",
             ]
         )
         self.assertTrue(args.learn)
@@ -228,6 +260,8 @@ class DrivingLearningGameTests(unittest.TestCase):
         self.assertEqual(args.population, 14)
         self.assertEqual(args.elite_count, 3)
         self.assertEqual(args.evaluation_steps, 1200)
+        self.assertTrue(args.population_cars)
+        self.assertTrue(args.no_sensors)
 
 
 if __name__ == "__main__":

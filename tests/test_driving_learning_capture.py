@@ -7,7 +7,7 @@ import unittest
 
 os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
 
-from PIL import Image
+from PIL import Image, ImageChops
 import pygame
 import torch
 
@@ -37,6 +37,27 @@ def tiny_session(seed: int = 37) -> DrivingLearningSession:
             warmup_steps=0,
             target_sync_interval=3,
             epsilon_decay_steps=40,
+            seed=seed,
+        ),
+    )
+
+
+def tiny_population_session(seed: int = 43) -> DrivingLearningSession:
+    return DrivingLearningSession(
+        LearningRuntimeConfig(
+            algorithm="genetic_dqn",
+            evaluation_steps=20,
+            population_size=3,
+            elite_count=1,
+            tournament_size=2,
+            seed=seed,
+        ),
+        dqn_config=DQNConfig(
+            algorithm="double_dqn",
+            hidden_sizes=(8,),
+            replay_capacity=64,
+            batch_size=2,
+            warmup_steps=0,
             seed=seed,
         ),
     )
@@ -107,6 +128,45 @@ class DrivingLearningCaptureTests(unittest.TestCase):
                 )
             with self.assertRaises(ValueError):
                 capture_learning_gif(Path(directory) / "capture.png", session)
+
+    def test_capture_flags_render_population_cars_and_real_rays(self):
+        hidden_session = tiny_population_session()
+        visible_session = tiny_population_session()
+        with tempfile.TemporaryDirectory() as directory:
+            hidden_path = capture_learning_gif(
+                Path(directory) / "hidden.gif",
+                hidden_session,
+                frames_per_tab=1,
+                training_steps_per_frame=3,
+                race_frames=1,
+                palette_colors=64,
+                show_sensor_rays=False,
+                show_population_cars=False,
+            )
+            visible_path = capture_learning_gif(
+                Path(directory) / "visible.gif",
+                visible_session,
+                frames_per_tab=1,
+                training_steps_per_frame=3,
+                race_frames=1,
+                palette_colors=64,
+                show_sensor_rays=True,
+                show_population_cars=True,
+            )
+            with Image.open(hidden_path) as hidden, Image.open(visible_path) as visible:
+                hidden.seek(0)
+                visible.seek(0)
+                difference = ImageChops.difference(
+                    hidden.convert("RGB"), visible.convert("RGB")
+                )
+                self.assertIsNotNone(difference.getbbox())
+
+        self.assertEqual(hidden_session.env.telemetry(), visible_session.env.telemetry())
+        for hidden, visible in zip(
+            hidden_session.agent.network.parameters(),
+            visible_session.agent.network.parameters(),
+        ):
+            self.assertTrue(torch.equal(hidden, visible))
 
 
 if __name__ == "__main__":

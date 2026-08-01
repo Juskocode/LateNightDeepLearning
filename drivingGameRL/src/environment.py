@@ -65,6 +65,25 @@ class LapRecord:
     trajectory: tuple[LapPose, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class SensorRay:
+    """One immutable track-clearance ray used by the driving policy.
+
+    ``angle`` is an absolute world-space angle in radians.  ``distance`` and
+    ``endpoint`` describe the first sampled barrier contact, or the full ray
+    when ``hit`` is false.  The normalized distance is the exact value placed
+    in the neural-network observation.
+    """
+
+    angle: float
+    max_distance: float
+    distance: float
+    normalized_distance: float
+    origin: Vec2
+    endpoint: Vec2
+    hit: bool
+
+
 class DrivingEnv:
     """Fixed-step track environment with observable physics and shaped reward."""
 
@@ -73,6 +92,15 @@ class DrivingEnv:
     LAP_CHECKPOINTS = (0.25, 0.50, 0.75)
     MAX_LAP_PROGRESS_STEP = 0.075
     BEST_LAP_EPSILON = 1e-9
+    SENSOR_MAX_DISTANCE = 150.0
+    SENSOR_SAMPLE_STEP = 6.0
+    SENSOR_RELATIVE_ANGLES = (
+        -math.pi / 2,
+        -math.pi / 4,
+        0.0,
+        math.pi / 4,
+        math.pi / 2,
+    )
 
     OBSERVATION_LABELS = (
         "speed",
@@ -246,10 +274,7 @@ class DrivingEnv:
         track_heading = math.atan2(projection.tangent.y, projection.tangent.x)
         heading_error = wrap_angle(state.heading - track_heading) / math.pi
         max_speed = max(1.0, self.vehicle.build.max_speed)
-        sensor_angles = (-math.pi / 2, -math.pi / 4, 0.0, math.pi / 4, math.pi / 2)
-        rays = tuple(
-            self._ray_distance(state.heading + angle) for angle in sensor_angles
-        )
+        rays = self.sensor_rays()
         return (
             clamp(telemetry.speed / max_speed, 0.0, 1.5),
             clamp(telemetry.longitudinal_speed / max_speed, -1.0, 1.0),
@@ -258,20 +283,75 @@ class DrivingEnv:
             clamp(projection.signed_offset / self.circuit.collision_radius, -1.0, 1.0),
             clamp(self.circuit.terrain_at(state.position).grip, 0.0, 1.0),
             projection.progress,
-            *rays,
+            *(ray.normalized_distance for ray in rays),
         )
 
-    def _ray_distance(self, angle: float, max_distance: float = 150.0) -> float:
+    def sensor_rays(
+        self, max_distance: float = SENSOR_MAX_DISTANCE
+    ) -> tuple[SensorRay, ...]:
+        """Return the five policy sensor rays in observation-label order.
+
+        The tuple and its :class:`SensorRay` entries are immutable snapshots.
+        Rendering can therefore consume the same distances as the policy
+        without being able to alter environment state or drift from the
+        observation contract.
+        """
+
+        if (
+            isinstance(max_distance, bool)
+            or not isinstance(max_distance, (int, float))
+            or not math.isfinite(max_distance)
+            or max_distance <= 0.0
+        ):
+            raise ValueError("max_distance must be finite and positive")
+        maximum = float(max_distance)
+        heading = self.vehicle.state.heading
+        return tuple(
+            self._sensor_ray(heading + relative_angle, maximum)
+            for relative_angle in self.SENSOR_RELATIVE_ANGLES
+        )
+
+    def _sensor_ray(self, angle: float, max_distance: float) -> SensorRay:
         origin = self.vehicle.state.position
         direction = Vec2.from_angle(angle)
-        step = 6.0
-        distance = step
+        distance = self.SENSOR_SAMPLE_STEP
         while distance <= max_distance:
             sample = origin + direction * distance
             if self.circuit.project(sample).distance >= self.circuit.collision_radius:
-                return distance / max_distance
-            distance += step
-        return 1.0
+                return SensorRay(
+                    angle=angle,
+                    max_distance=max_distance,
+                    distance=distance,
+                    normalized_distance=distance / max_distance,
+                    origin=origin,
+                    endpoint=sample,
+                    hit=True,
+                )
+            distance += self.SENSOR_SAMPLE_STEP
+        endpoint = origin + direction * max_distance
+        return SensorRay(
+            angle=angle,
+            max_distance=max_distance,
+            distance=max_distance,
+            normalized_distance=1.0,
+            origin=origin,
+            endpoint=endpoint,
+            hit=False,
+        )
+
+    def _ray_distance(
+        self, angle: float, max_distance: float = SENSOR_MAX_DISTANCE
+    ) -> float:
+        """Compatibility helper returning only a ray's normalized distance."""
+
+        if (
+            isinstance(max_distance, bool)
+            or not isinstance(max_distance, (int, float))
+            or not math.isfinite(max_distance)
+            or max_distance <= 0.0
+        ):
+            raise ValueError("max_distance must be finite and positive")
+        return self._sensor_ray(angle, float(max_distance)).normalized_distance
 
     def step(self, action: int | DrivingAction | DriverControls) -> StepResult:
         if isinstance(action, DriverControls):
