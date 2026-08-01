@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import random
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -134,6 +135,7 @@ RELEASE_DELAYS = (0.0, 1.4, 3.6, 5.8)
 SCATTER_TARGETS = ((19, 0), (0, 0), (19, 20), (0, 20))
 PROJECTILE_READY_DELAY = 1.0
 PLAYER_PROJECTILE_COLLISION_RADIUS_TILES = 0.30
+GHOST_REVIVE_DELAY = 0.65
 
 
 class PacmanGame:
@@ -358,6 +360,8 @@ class PacmanGame:
 
         speed_scale = self.ghost_speed_multiplier
         for index, ghost in enumerate(self.ghosts):
+            if ghost.eaten and ghost.target is None and ghost.grid == ghost.spawn:
+                self._revive_ghost(ghost)
             if not ghost.released:
                 ghost.release_timer -= dt
                 if ghost.release_timer <= 0:
@@ -377,10 +381,7 @@ class PacmanGame:
                 self._start_move(ghost, direction)
             arrived = self._advance(ghost, dt)
             if arrived and ghost.eaten and ghost.grid == ghost.spawn:
-                ghost.eaten = False
-                ghost.released = False
-                ghost.release_timer = 0.65
-                ghost.target = None
+                self._revive_ghost(ghost)
             self._check_ghost_collisions()
             if self.phase != GamePhase.ACTIVE:
                 return
@@ -679,6 +680,8 @@ class PacmanGame:
 
     def _choose_ghost_direction(self, ghost: Ghost, index: int) -> Direction:
         available = [direction for direction in Direction if self._can_move(ghost.grid, direction)]
+        if ghost.eaten:
+            return self._shortest_direction(ghost.grid, ghost.spawn, available)
         if ghost.pending_reverse and ghost.direction.opposite in available:
             ghost.pending_reverse = False
             return ghost.direction.opposite
@@ -697,8 +700,67 @@ class PacmanGame:
             ),
         )
 
+    def _shortest_direction(
+        self,
+        origin: tuple[int, int],
+        target: tuple[int, int],
+        available: list[Direction],
+    ) -> Direction:
+        """Choose a deterministic shortest-path step on the real maze graph.
+
+        Returning eyes may reverse direction and must route around the ghost
+        house walls.  A Manhattan-only choice can oscillate above the house,
+        especially for the lower two spawn cells, and never trigger revival.
+        """
+
+        priority = {
+            Direction.UP: 0,
+            Direction.LEFT: 1,
+            Direction.DOWN: 2,
+            Direction.RIGHT: 3,
+        }
+        ordered = sorted(available, key=priority.__getitem__)
+        pending = deque((self._next_grid(origin, direction), direction) for direction in ordered)
+        visited = {origin}
+        while pending:
+            cell, first_direction = pending.popleft()
+            if cell in visited:
+                continue
+            if cell == target:
+                return first_direction
+            visited.add(cell)
+            for direction in sorted(Direction, key=priority.__getitem__):
+                if self._can_move(cell, direction):
+                    pending.append((self._next_grid(cell, direction), first_direction))
+        return ordered[0] if ordered else Direction.UP
+
+    def _next_grid(
+        self,
+        grid: tuple[int, int],
+        direction: Direction,
+    ) -> tuple[int, int]:
+        """Return the normalized neighboring cell, including tunnel wrapping."""
+
+        dx, dy = direction.vector
+        x, y = grid[0] + dx, grid[1] + dy
+        if y == 9:
+            x %= self.cols
+        return x, y
+
+    def _revive_ghost(self, ghost: Ghost) -> None:
+        """Turn returning eyes back into an idle body at their home cell."""
+
+        ghost.eaten = False
+        ghost.released = False
+        ghost.release_timer = GHOST_REVIVE_DELAY
+        ghost.pending_reverse = False
+        ghost.target = None
+        ghost.speed = GHOST_SPEED * self.ghost_speed_multiplier
+
     def _check_ghost_collisions(self) -> None:
         for ghost in self.ghosts:
+            if not ghost.released:
+                continue
             if self.player.position.distance_to(ghost.position) >= TILE_SIZE * 0.62:
                 continue
             if self.frightened_timer > 0 and not ghost.eaten:

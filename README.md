@@ -140,9 +140,9 @@ Visual controls:
 | `S` | Save a checkpoint immediately |
 | `Esc` | Quit; when training, save unless `--no-save` |
 
-The seven visual presets are **1, 5, 15, 30, 60, 120, and 240 decisions per second**. The header shows the current label, target rate, and position on the clickable SLOW-to-MAX scale. `--speed` accepts any starting value in that range; the next speed key moves to the adjacent preset.
+The seven visual presets are **1, 5, 15, 30, 60, 120, and 240 fixed simulation frames per second**. Because game physics uses a 60 Hz step, 30 is half speed, 60 is real time, 120 is 2×, and 240 is 4×. The header shows measured versus target simulation FPS and the position on the clickable SLOW-to-MAX scale. `--speed` accepts any starting value in that range; the next speed key moves to the adjacent preset.
 
-Rendering remains responsive at 60 FPS independently of the selected training rate. Slow presets wait between agent decisions without freezing input, while faster presets can process several decisions per rendered frame. Delayed frames use a bounded catch-up budget so the interface cannot enter an update spiral.
+The interface continues rendering responsively at 60 FPS while simulation pacing changes independently. Slow presets accumulate fractional physics frames; fast presets process several fixed frames per render. RL actions and learning still occur only at grid decision boundaries. Delayed renders use a bounded catch-up budget and discard excess backlog so one hitch cannot create an update spiral.
 
 ### What the Pacman agent sees
 

@@ -18,8 +18,8 @@ def parse_args():
     parser.add_argument(
         "--speed",
         type=int,
-        default=30,
-        help="Initial visual speed from 1 to 240 decisions/s; use 1-7 or [ ] at runtime",
+        default=60,
+        help="Initial simulation speed from 1 to 240 FPS; use 1-7 or [ ] at runtime",
     )
     parser.add_argument(
         "--tab",

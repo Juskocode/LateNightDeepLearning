@@ -1,5 +1,6 @@
 import os
 import unittest
+from collections import deque
 
 os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
 
@@ -34,6 +35,46 @@ class PacmanGameTests(unittest.TestCase):
     def test_tunnel_cells_are_walkable(self):
         self.assertTrue(self.game._can_move((0, 9), Direction.LEFT))
         self.assertTrue(self.game._can_move((19, 9), Direction.RIGHT))
+
+    def test_eaten_ghost_routes_strictly_descend_from_every_reachable_cell(self):
+        def neighboring_cell(cell, direction):
+            dx, dy = direction.vector
+            x, y = cell[0] + dx, cell[1] + dy
+            if y == 9:
+                x %= self.game.cols
+            return x, y
+
+        for index, ghost in enumerate(self.game.ghosts):
+            distance_to_home = {ghost.spawn: 0}
+            frontier = deque([ghost.spawn])
+            while frontier:
+                cell = frontier.popleft()
+                for direction in Direction:
+                    if not self.game._can_move(cell, direction):
+                        continue
+                    neighbor = neighboring_cell(cell, direction)
+                    if neighbor in distance_to_home:
+                        continue
+                    distance_to_home[neighbor] = distance_to_home[cell] + 1
+                    frontier.append(neighbor)
+
+            self.assertGreater(len(distance_to_home), 1)
+            ghost.eaten = True
+            ghost.released = True
+            ghost.target = None
+            for cell, distance in distance_to_home.items():
+                if cell == ghost.spawn:
+                    continue
+                ghost.grid_x, ghost.grid_y = cell
+                for incoming_direction in Direction:
+                    ghost.direction = incoming_direction
+                    chosen = self.game._choose_ghost_direction(ghost, index)
+                    next_cell = neighboring_cell(cell, chosen)
+                    self.assertEqual(
+                        distance_to_home[next_cell],
+                        distance - 1,
+                        (ghost.name, cell, incoming_direction, chosen),
+                    )
 
     def test_next_level_preserves_run_state_and_refills_maze(self):
         self.game.score = 2_340
@@ -75,6 +116,64 @@ class PacmanGameTests(unittest.TestCase):
         self.assertEqual(self.game.score, 900)
         self.assertEqual(self.game.lives, 2)
         self.assertEqual(self.game.phase, GamePhase.READY)
+
+    def test_eaten_ghosts_return_revive_and_render_their_body(self):
+        self.game.phase = GamePhase.ACTIVE
+        self.game.player.reset_position((1, 1), Direction.LEFT)
+        self.game.next_direction = Direction.LEFT
+
+        for tested_ghost in self.game.ghosts:
+            for ghost in self.game.ghosts:
+                ghost.released = False
+                ghost.release_timer = 999.0
+                ghost.eaten = False
+                ghost.target = None
+
+            tested_ghost.reset_position((9, 7), Direction.DOWN)
+            tested_ghost.released = True
+            self.game.player.reset_position(tested_ghost.grid, Direction.LEFT)
+            self.game.frightened_timer = 3.0
+            self.game._check_ghost_collisions()
+            self.assertTrue(tested_ghost.eaten)
+            self.game._render(0.0)
+            self.assertTrue(tested_ghost.sprite.eaten)
+
+            self.game.player.reset_position((1, 1), Direction.LEFT)
+
+            for _ in range(180):
+                self.game._update(1 / 60)
+                if not tested_ghost.eaten:
+                    break
+
+            self.assertFalse(tested_ghost.eaten, tested_ghost.name)
+            self.assertEqual(tested_ghost.grid, tested_ghost.spawn)
+            self.assertFalse(tested_ghost.released)
+
+            self.game._render(0.0)
+            self.assertFalse(tested_ghost.sprite.eaten)
+
+            for _ in range(60):
+                self.game._update(1 / 60)
+                if tested_ghost.released:
+                    break
+            self.assertTrue(tested_ghost.released)
+            self.game._render(0.0)
+            self.assertFalse(tested_ghost.sprite.eaten)
+
+    def test_revived_ghost_cannot_be_immediately_re_eaten_inside_home(self):
+        ghost = self.game.ghosts[0]
+        self.game.phase = GamePhase.ACTIVE
+        self.game.frightened_timer = 2.0
+        self.game.player.reset_position(ghost.spawn, Direction.LEFT)
+        ghost.reset_position(ghost.spawn, Direction.UP)
+        ghost.released = True
+        ghost.eaten = True
+
+        self.game._update(1 / 60)
+
+        self.assertFalse(ghost.eaten)
+        self.assertFalse(ghost.released)
+        self.assertEqual(self.game.ghost_chain, 0)
 
 
 if __name__ == "__main__":

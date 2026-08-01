@@ -7,7 +7,13 @@ from pathlib import Path
 from PIL import Image
 import pygame
 
-from pacManRf.src.rl_session import WINDOW_SIZE, PacmanRLSession, SpeedController
+from pacManRf.src.rl_session import (
+    RENDER_FPS,
+    WINDOW_SIZE,
+    DecisionScheduler,
+    PacmanRLSession,
+    SpeedController,
+)
 from pacManRf.src.visualization import PacmanObservatory
 
 
@@ -24,9 +30,16 @@ def _prime(session: PacmanRLSession, steps: int) -> None:
         session.step()
 
 
-def _telemetry(session: PacmanRLSession, speed: SpeedController) -> dict:
+def _telemetry(
+    session: PacmanRLSession,
+    speed: SpeedController,
+    *,
+    simulation_fps_actual: float | None = None,
+) -> dict:
     data = session.telemetry()
     data.update(speed.telemetry())
+    if simulation_fps_actual is not None:
+        data["simulation_fps_actual"] = simulation_fps_actual
     return data
 
 
@@ -36,7 +49,7 @@ def capture_observatory_png(
     *,
     tab: str = "GAME",
     prime_steps: int = 80,
-    speed: int = 30,
+    speed: int = RENDER_FPS,
 ) -> Path:
     pygame.init()
     output = Path(path)
@@ -63,7 +76,7 @@ def capture_observatory_gif(
     prime_steps: int = 80,
     duration_ms: int = 140,
     output_width: int = 800,
-    speed: int = 30,
+    speed: int = RENDER_FPS,
 ) -> Path:
     """Capture GAME → VISION → METRICS → NETWORK with live values."""
     pygame.init()
@@ -74,15 +87,32 @@ def capture_observatory_gif(
     canvas = pygame.Surface(WINDOW_SIZE)
     ui = PacmanObservatory(initial_tab="GAME")
     speed_controller = SpeedController(speed)
+    scheduler = DecisionScheduler()
     images: list[Image.Image] = []
+    captured_seconds = 0.0
+    captured_simulation_frames = 0
 
     for index in range(frame_count):
-        session.step()
+        frame_seconds = max(40, int(duration_ms)) / 1_000.0
+        simulation_frames = scheduler.frames_for_render(
+            frame_seconds,
+            speed_controller.value,
+        )
+        for _ in range(simulation_frames):
+            session.advance_simulation_frame()
+        captured_seconds += frame_seconds
+        captured_simulation_frames += simulation_frames
         section = min(3, index * 4 // frame_count)
         ui.set_tab(("GAME", "VISION", "METRICS", "NETWORK")[section])
         ui.render(
             canvas,
-            _telemetry(session, speed_controller),
+            _telemetry(
+                session,
+                speed_controller,
+                simulation_fps_actual=(
+                    captured_simulation_frames / captured_seconds
+                ),
+            ),
             history=session.history_snapshot(),
             game_surface=session.render_game(),
         )

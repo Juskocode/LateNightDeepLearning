@@ -20,23 +20,23 @@ WINDOW_SIZE = (1120, 720)
 DEFAULT_CHECKPOINT_DIR = REPO_ROOT / "pacManRf" / "models" / "checkpoints"
 SPEED_PRESETS: tuple[tuple[str, int], ...] = (
     ("SLOW", 1),
-    ("WATCH", 5),
-    ("NORMAL", 15),
-    ("FAST", 30),
-    ("TURBO", 60),
-    ("ULTRA", 120),
+    ("VERY SLOW", 5),
+    ("WATCH", 15),
+    ("HALF", 30),
+    ("NORMAL", 60),
+    ("TURBO", 120),
     ("MAX", 240),
 )
 RENDER_FPS = 60
 
 
 class SpeedController:
-    """Clamp visual speed and expose predictable keyboard-selectable presets."""
+    """Clamp the simulation FPS and expose keyboard-selectable presets."""
 
     minimum = SPEED_PRESETS[0][1]
     maximum = SPEED_PRESETS[-1][1]
 
-    def __init__(self, initial_speed: int = 30):
+    def __init__(self, initial_speed: int = RENDER_FPS):
         self._value = self._clamp(initial_speed)
 
     @classmethod
@@ -117,8 +117,8 @@ class SpeedController:
 
     def telemetry(self) -> dict[str, Any]:
         return {
-            "decisions_per_second": self.value,
-            "speed_target_dps": self.value,
+            "simulation_fps_target": self.value,
+            "speed_target_fps": self.value,
             "speed_label": self.label,
             "speed_preset_index": self.nearest_preset_index,
             "speed_preset_count": len(SPEED_PRESETS),
@@ -127,7 +127,7 @@ class SpeedController:
 
 
 class DecisionScheduler:
-    """Convert elapsed render time into bounded fixed-rate agent decisions."""
+    """Convert elapsed render time into bounded fixed-rate simulation frames."""
 
     def __init__(
         self,
@@ -146,10 +146,10 @@ class DecisionScheduler:
     def reset(self) -> None:
         self._fractional_steps = 0.0
 
-    def steps_for_frame(
+    def frames_for_render(
         self,
         elapsed_seconds: float,
-        decisions_per_second: int,
+        simulation_frames_per_second: int,
         *,
         paused: bool = False,
         single_step: bool = False,
@@ -160,11 +160,28 @@ class DecisionScheduler:
         elapsed = float(elapsed_seconds)
         if not np.isfinite(elapsed) or elapsed < 0:
             raise ValueError("elapsed_seconds must be finite and non-negative")
-        rate = max(1, int(decisions_per_second))
+        rate = max(1, int(simulation_frames_per_second))
         self._fractional_steps += min(elapsed, self.max_elapsed_seconds) * rate
         whole_steps = int(self._fractional_steps)
         self._fractional_steps -= whole_steps
         return min(whole_steps, self.max_steps_per_frame)
+
+    def steps_for_frame(
+        self,
+        elapsed_seconds: float,
+        decisions_per_second: int,
+        *,
+        paused: bool = False,
+        single_step: bool = False,
+    ) -> int:
+        """Backward-compatible alias; values now represent simulation FPS."""
+
+        return self.frames_for_render(
+            elapsed_seconds,
+            decisions_per_second,
+            paused=paused,
+            single_step=single_step,
+        )
 
 
 @dataclass(slots=True)
@@ -237,6 +254,8 @@ class PacmanRLSession:
         }
         self.state = self.env.observation
         self.pending_action = self._select_action(self.state)
+        self._transition_state: np.ndarray | None = None
+        self._transition_action: int | None = None
 
     @property
     def legal_action_mask(self) -> np.ndarray:
@@ -257,9 +276,47 @@ class PacmanRLSession:
 
     def step(self) -> dict[str, Any]:
         """Apply the pending decision, learn once, and prepare the next one."""
-        state = self.state
-        action = self.pending_action
-        next_state, reward, done, info = self.env.step(action)
+
+        self._begin_transition()
+        result = None
+        while result is None:
+            result = self.env.advance_step_frame()
+        return self._complete_transition(result)
+
+    def advance_simulation_frame(self) -> dict[str, Any] | None:
+        """Advance exactly one 60 Hz game frame.
+
+        A result is returned only at the next grid decision, when replay and
+        learning are updated. This keeps visual pacing independent from the
+        variable number of physics frames consumed by an agent action.
+        """
+
+        self._begin_transition()
+        result = self.env.advance_step_frame()
+        if result is None:
+            return None
+        return self._complete_transition(result)
+
+    def _begin_transition(self) -> None:
+        if self.env.step_in_progress:
+            if self._transition_state is None or self._transition_action is None:
+                raise RuntimeError("environment step has no matching session transition")
+            return
+        self._transition_state = self.state.copy()
+        self._transition_action = int(self.pending_action)
+        self.env.begin_step(self._transition_action)
+
+    def _complete_transition(
+        self,
+        result: tuple[np.ndarray, float, bool, dict],
+    ) -> dict[str, Any]:
+        state = self._transition_state
+        action = self._transition_action
+        if state is None or action is None:
+            raise RuntimeError("cannot complete a transition that was not started")
+        self._transition_state = None
+        self._transition_action = None
+        next_state, reward, done, info = result
         next_legal_action_mask = np.asarray(next_state[:4] > 0.5, dtype=np.bool_)
         if not next_legal_action_mask.any():
             next_legal_action_mask[:] = True
@@ -322,6 +379,8 @@ class PacmanRLSession:
     def reset_environment(self) -> None:
         self.agent.reset_episode()
         self.state = self.env.reset()
+        self._transition_state = None
+        self._transition_action = None
         self.last_info = dict(self.env.last_info)
         self.pending_action = self._select_action(self.state)
 
@@ -388,7 +447,7 @@ class PacmanRLSession:
 def run_visual_session(
     session: PacmanRLSession,
     *,
-    speed: int = 30,
+    speed: int = RENDER_FPS,
     initial_tab: str = "GAME",
     save_on_exit: bool = True,
 ) -> None:
@@ -402,6 +461,7 @@ def run_visual_session(
     single_step = False
     running = True
     speed_controller = SpeedController(speed)
+    rate_samples: deque[tuple[float, int]] = deque(maxlen=RENDER_FPS)
 
     try:
         while running:
@@ -410,7 +470,11 @@ def run_visual_session(
                 if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                     speed_preset = observatory.speed_preset_at(event.pos)
                     if speed_preset is not None:
+                        previous_speed = speed_controller.value
                         speed_controller.select(speed_preset)
+                        if speed_controller.value != previous_speed:
+                            scheduler.reset()
+                            rate_samples.clear()
                         continue
                 if observatory.handle_event(event):
                     continue
@@ -423,27 +487,46 @@ def run_visual_session(
                         paused = not paused
                     elif event.key in (pygame.K_n, pygame.K_PERIOD) and paused:
                         single_step = True
-                    elif speed_controller.handle_key(event.key):
-                        pass
-                    elif event.key == pygame.K_r:
+                    else:
+                        previous_speed = speed_controller.value
+                        speed_key = speed_controller.handle_key(event.key)
+                        if speed_key and speed_controller.value != previous_speed:
+                            scheduler.reset()
+                            rate_samples.clear()
+                        if speed_key:
+                            continue
+                    if event.key == pygame.K_r:
                         session.reset_environment()
+                        scheduler.reset()
+                        rate_samples.clear()
                     elif event.key == pygame.K_s:
                         session.save_checkpoint()
 
-            steps_this_frame = scheduler.steps_for_frame(
+            simulation_frames = scheduler.frames_for_render(
                 elapsed_seconds,
                 speed_controller.value,
                 paused=paused,
-                single_step=single_step,
             )
-            for _ in range(steps_this_frame if running else 0):
+            executed_frames = 0
+            if running and paused and single_step:
                 session.step()
+            elif running:
+                for _ in range(simulation_frames):
+                    session.advance_simulation_frame()
+                    executed_frames += 1
             single_step = False
+            rate_samples.append((elapsed_seconds, executed_frames))
 
             telemetry = session.telemetry()
             telemetry["paused"] = paused
             telemetry["render_fps"] = clock.get_fps()
             telemetry["render_fps_target"] = RENDER_FPS
+            sampled_seconds = sum(sample[0] for sample in rate_samples)
+            telemetry["simulation_fps_actual"] = (
+                sum(sample[1] for sample in rate_samples) / sampled_seconds
+                if sampled_seconds > 0
+                else 0.0
+            )
             telemetry.update(speed_controller.telemetry())
             observatory.render(
                 window,

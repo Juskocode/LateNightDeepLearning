@@ -91,6 +91,32 @@ class PacmanEnvironmentTests(unittest.TestCase):
             if first_step[2]:
                 break
 
+    def test_incremental_frames_match_the_atomic_step(self):
+        atomic = PacmanEnv(seed=47)
+        incremental = PacmanEnv(seed=47)
+        expected = atomic.step(0)
+
+        incremental.begin_step(0)
+        self.assertTrue(incremental.step_in_progress)
+        start_position = incremental.game.player.position.copy()
+        result = incremental.advance_step_frame()
+        self.assertIsNone(result)
+        self.assertNotEqual(incremental.game.player.position, start_position)
+        with self.assertRaisesRegex(RuntimeError, "incremental step"):
+            incremental.step(1)
+
+        advanced_frames = 1
+        while result is None:
+            result = incremental.advance_step_frame()
+            advanced_frames += 1
+
+        np.testing.assert_array_equal(result[0], expected[0])
+        self.assertEqual(result[1], expected[1])
+        self.assertEqual(result[2], expected[2])
+        self.assertEqual(result[3]["reward_components"], expected[3]["reward_components"])
+        self.assertEqual(advanced_frames, result[3]["internal_frames"])
+        self.assertFalse(incremental.step_in_progress)
+
     def test_actions_accept_strict_one_hot_only(self):
         env = PacmanEnv(seed=3)
         env.step([1, 0, 0, 0])
@@ -337,10 +363,10 @@ class PacmanSpeedControlTests(unittest.TestCase):
 
     def test_speed_steps_and_direct_keys_are_bounded(self):
         controller = SpeedController(30)
-        self.assertEqual((controller.label, controller.value), ("FAST", 30))
+        self.assertEqual((controller.label, controller.value), ("HALF", 30))
 
         controller.handle_key(pygame.K_LEFTBRACKET)
-        self.assertEqual((controller.label, controller.value), ("NORMAL", 15))
+        self.assertEqual((controller.label, controller.value), ("WATCH", 15))
         controller.handle_key(pygame.K_RIGHTBRACKET)
         self.assertEqual(controller.value, 30)
         controller.handle_key(pygame.K_1)
@@ -366,14 +392,83 @@ class PacmanSpeedControlTests(unittest.TestCase):
 
     def test_decision_scheduler_keeps_rendering_separate_and_bounded(self):
         scheduler = DecisionScheduler()
-        total = sum(scheduler.steps_for_frame(0.1, 30) for _ in range(10))
+        total = sum(scheduler.frames_for_render(0.1, 30) for _ in range(10))
         self.assertEqual(total, 30)
 
         scheduler.reset()
-        self.assertEqual(scheduler.steps_for_frame(1 / 60, 240), 4)
-        self.assertEqual(scheduler.steps_for_frame(0.25, 240), 16)
-        self.assertEqual(scheduler.steps_for_frame(0.1, 30, paused=True), 0)
-        self.assertEqual(scheduler.steps_for_frame(0.1, 30, paused=True, single_step=True), 1)
+        self.assertEqual(scheduler.frames_for_render(1 / 60, 60), 1)
+        self.assertEqual(scheduler.frames_for_render(1 / 60, 240), 4)
+        self.assertEqual(scheduler.frames_for_render(0.25, 240), 16)
+        self.assertEqual(scheduler.frames_for_render(0.0, 240), 0)
+        self.assertEqual(scheduler.frames_for_render(0.1, 30, paused=True), 0)
+        self.assertEqual(
+            scheduler.frames_for_render(0.1, 30, paused=True, single_step=True),
+            1,
+        )
+
+    def test_scheduler_reset_discards_fractional_credit_before_speed_change(self):
+        scheduler = DecisionScheduler()
+        self.assertEqual(scheduler.frames_for_render(0.0095, 100), 0)
+
+        scheduler.reset()
+
+        self.assertEqual(scheduler.frames_for_render(0.1, 1), 0)
+
+    def test_speed_telemetry_reports_simulation_fps_not_decision_rate(self):
+        controller = SpeedController(60)
+
+        self.assertEqual(controller.label, "NORMAL")
+        self.assertEqual(controller.telemetry()["simulation_fps_target"], 60)
+        self.assertNotIn("decisions_per_second", controller.telemetry())
+
+    def test_visual_frame_advancement_learns_only_at_decision_boundaries(self):
+        session = small_session(seed=53)
+        start_position = session.env.game.player.position.copy()
+        start_env_steps = session.agent.env_steps
+        start_memory = len(session.agent.memory)
+
+        result = session.advance_simulation_frame()
+
+        self.assertIsNone(result)
+        self.assertNotEqual(session.env.game.player.position, start_position)
+        self.assertEqual(session.agent.env_steps, start_env_steps)
+        self.assertEqual(len(session.agent.memory), start_memory)
+        while result is None:
+            result = session.advance_simulation_frame()
+        self.assertEqual(session.agent.env_steps, start_env_steps + 1)
+        self.assertEqual(len(session.agent.memory), start_memory + 1)
+        session.close()
+
+    def test_selected_fps_matches_fixed_game_time(self):
+        for target_fps in (30, 60, 120):
+            with self.subTest(target_fps=target_fps):
+                session = PacmanRLSession(
+                    SessionConfig(
+                        seed=59,
+                        training=False,
+                        fresh=True,
+                        hidden_sizes=(16, 8),
+                    )
+                )
+                for ghost in session.env.game.ghosts:
+                    ghost.released = False
+                    ghost.release_timer = 999.0
+                scheduler = DecisionScheduler()
+                start_time = session.env.game.animation_time
+                simulated_frames = 0
+
+                for _ in range(60):
+                    frames = scheduler.frames_for_render(1 / 60, target_fps)
+                    for _ in range(frames):
+                        session.advance_simulation_frame()
+                    simulated_frames += frames
+
+                self.assertEqual(simulated_frames, target_fps)
+                self.assertAlmostEqual(
+                    session.env.game.animation_time - start_time,
+                    target_fps * session.env.frame_dt,
+                )
+                session.close()
 
 
 class PacmanObservatoryTests(unittest.TestCase):
@@ -420,6 +515,7 @@ class PacmanObservatoryTests(unittest.TestCase):
         controller = SpeedController(30)
         telemetry = controller.telemetry()
         telemetry["algorithm"] = "double_dqn"
+        telemetry["simulation_fps_actual"] = 29.8
         ui = PacmanObservatory()
 
         for width in (620, 879, 880, 980, 1120):
@@ -451,7 +547,9 @@ class PacmanObservatoryTests(unittest.TestCase):
                 duration_ms=50,
             )
             with Image.open(path) as image:
-                self.assertGreaterEqual(image.n_frames, 10)
+                # Telemetry-only frames between grid decisions may be coalesced,
+                # but every tab must retain multiple live animation frames.
+                self.assertGreaterEqual(image.n_frames, 8)
                 self.assertEqual(image.format, "GIF")
         session.close()
 

@@ -10,7 +10,7 @@ results do not depend on the host machine's frame rate.
 from __future__ import annotations
 
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import IntEnum
 from numbers import Integral
 from typing import Sequence
@@ -79,6 +79,30 @@ class RewardConfig:
     level_cleared: float = 500.0
 
 
+@dataclass
+class _PendingStep:
+    """State captured while one grid decision advances frame by frame."""
+
+    action_index: int
+    requested_direction: Direction
+    start_grid: tuple[int, int]
+    start_level: int
+    score_before: int
+    lives_before: int
+    dots_before: int
+    pellets_before: int
+    power_before: int
+    eaten_before: tuple[bool, ...]
+    shots_before: int
+    fireball_hits_before: int
+    freeze_ball_hits_before: int
+    nearest_pellet_before: int | None
+    action_blocked: bool
+    internal_frames: int = 0
+    stalled: bool = False
+    projectile_events: list = field(default_factory=list)
+
+
 class PacmanEnv:
     """Grid-decision RL environment backed by :class:`PacmanGame`.
 
@@ -128,6 +152,7 @@ class PacmanEnv:
         self.last_action_index = int(RelativeAction.STRAIGHT)
         self.last_info: dict = {}
         self._terminated = False
+        self._pending_step: _PendingStep | None = None
         self._observation = np.zeros(self.observation_size, dtype=np.float32)
         self.reset(seed=self.seed)
 
@@ -140,6 +165,12 @@ class PacmanEnv:
     @property
     def terminated(self) -> bool:
         return self._terminated
+
+    @property
+    def step_in_progress(self) -> bool:
+        """Whether an action is currently between two grid decisions."""
+
+        return self._pending_step is not None
 
     def reset(self, *, seed: int | None = None) -> np.ndarray:
         """Start a fresh run and return its active-round observation.
@@ -159,6 +190,7 @@ class PacmanEnv:
         self.last_reward = 0.0
         self.last_action_index = int(RelativeAction.STRAIGHT)
         self._terminated = False
+        self._pending_step = None
         self._fast_forward_to_active()
         self._observation = self._get_observation()
         self.last_info = self._base_info()
@@ -170,48 +202,88 @@ class PacmanEnv:
     ) -> tuple[np.ndarray, float, bool, dict]:
         """Apply one relative action and advance to the next grid decision."""
 
+        if self.step_in_progress:
+            raise RuntimeError("step() called while an incremental step is in progress")
+        self.begin_step(action)
+        result = None
+        while result is None:
+            result = self.advance_step_frame()
+        return result
+
+    def begin_step(self, action: int | Sequence[int | float]) -> None:
+        """Start one action without advancing its fixed-rate physics frames.
+
+        Visual runtimes use this together with :meth:`advance_step_frame` so
+        rendering can remain smooth. The regular :meth:`step` API stays atomic
+        for headless training.
+        """
+
         if self._terminated:
             raise RuntimeError("step() called on a terminated episode; call reset() first")
+        if self.step_in_progress:
+            raise RuntimeError("begin_step() called while another step is in progress")
 
         action_index = self._coerce_action(action)
         relative_directions = self._relative_directions(self.game.player.direction)
         requested_direction = relative_directions[action_index]
         start_grid = self.game.player.grid
-        start_level = self.game.level
-        score_before = self.game.score
-        lives_before = self.game.lives
-        dots_before = self.game._count_dots()
-        pellets_before = self._count_cell(".")
-        power_before = self._count_cell("o")
-        eaten_before = tuple(ghost.eaten for ghost in self.game.ghosts)
-        shots_before = self.game.projectile_shots_fired
-        fireball_hits_before = self.game.fireball_hits
-        freeze_ball_hits_before = self.game.freeze_ball_hits
-        nearest_pellet_before = self._nearest_distance(self._dot_cells())
-        action_blocked = not self.game._can_move(start_grid, requested_direction)
-
+        self._pending_step = _PendingStep(
+            action_index=action_index,
+            requested_direction=requested_direction,
+            start_grid=start_grid,
+            start_level=self.game.level,
+            score_before=self.game.score,
+            lives_before=self.game.lives,
+            dots_before=self.game._count_dots(),
+            pellets_before=self._count_cell("."),
+            power_before=self._count_cell("o"),
+            eaten_before=tuple(ghost.eaten for ghost in self.game.ghosts),
+            shots_before=self.game.projectile_shots_fired,
+            fireball_hits_before=self.game.fireball_hits,
+            freeze_ball_hits_before=self.game.freeze_ball_hits,
+            nearest_pellet_before=self._nearest_distance(self._dot_cells()),
+            action_blocked=not self.game._can_move(start_grid, requested_direction),
+        )
         self.game.next_direction = requested_direction
-        internal_frames = 0
-        stalled = False
-        projectile_events = []
-        while True:
-            internal_frames += 1
-            self.game._update(self.frame_dt)
-            projectile_events.extend(self.game.last_projectile_events)
 
-            if self.game.lives < lives_before:
-                break
-            if self.game.status in (GameStatus.LOST, GameStatus.WON) or not self.game.running:
-                break
-            if self.game.phase == GamePhase.CLEARING:
-                break
-            if self.game.player.grid != start_grid:
-                break
-            if self.game.phase == GamePhase.ACTIVE and self.game.player.target is None:
-                stalled = True
-                break
-            if internal_frames > 240:
-                raise RuntimeError("Pacman transition did not reach a decision boundary")
+    def advance_step_frame(self) -> tuple[np.ndarray, float, bool, dict] | None:
+        """Advance one fixed physics frame, completing the action if ready."""
+
+        pending = self._pending_step
+        if pending is None:
+            raise RuntimeError("advance_step_frame() called before begin_step()")
+
+        pending.internal_frames += 1
+        self.game._update(self.frame_dt)
+        pending.projectile_events.extend(self.game.last_projectile_events)
+
+        finished = (
+            self.game.lives < pending.lives_before
+            or self.game.status in (GameStatus.LOST, GameStatus.WON)
+            or not self.game.running
+            or self.game.phase == GamePhase.CLEARING
+            or self.game.player.grid != pending.start_grid
+        )
+        if (
+            not finished
+            and self.game.phase == GamePhase.ACTIVE
+            and self.game.player.target is None
+        ):
+            pending.stalled = True
+            finished = True
+        if pending.internal_frames > 240:
+            self._pending_step = None
+            raise RuntimeError("Pacman transition did not reach a decision boundary")
+        if not finished:
+            return None
+        return self._finish_step(pending)
+
+    def _finish_step(
+        self, pending: _PendingStep
+    ) -> tuple[np.ndarray, float, bool, dict]:
+        """Finalize reward and observations at a completed grid decision."""
+
+        self._pending_step = None
 
         # Capture events before a life or level transition resets transient game
         # state.  This makes telemetry faithful to the experience put in replay.
@@ -219,28 +291,28 @@ class PacmanEnv:
         pellets_after_event = self._count_cell(".")
         power_after_event = self._count_cell("o")
         eaten_after_event = tuple(ghost.eaten for ghost in self.game.ghosts)
-        score_delta = self.game.score - score_before
-        pellets_eaten = max(0, pellets_before - pellets_after_event)
-        power_pellets_eaten = max(0, power_before - power_after_event)
+        score_delta = self.game.score - pending.score_before
+        pellets_eaten = max(0, pending.pellets_before - pellets_after_event)
+        power_pellets_eaten = max(0, pending.power_before - power_after_event)
         ghosts_eaten = sum(
             int(not was_eaten and is_eaten)
-            for was_eaten, is_eaten in zip(eaten_before, eaten_after_event)
+            for was_eaten, is_eaten in zip(pending.eaten_before, eaten_after_event)
         )
-        projectiles_fired = self.game.projectile_shots_fired - shots_before
-        fireball_hits = self.game.fireball_hits - fireball_hits_before
-        freeze_ball_hits = self.game.freeze_ball_hits - freeze_ball_hits_before
-        life_lost = self.game.lives < lives_before
+        projectiles_fired = self.game.projectile_shots_fired - pending.shots_before
+        fireball_hits = self.game.fireball_hits - pending.fireball_hits_before
+        freeze_ball_hits = self.game.freeze_ball_hits - pending.freeze_ball_hits_before
+        life_lost = self.game.lives < pending.lives_before
         level_cleared = (
             self.game.phase == GamePhase.CLEARING
             or self.game.status == GameStatus.WON
-            or (dots_before > 0 and dots_after_event == 0)
+            or (pending.dots_before > 0 and dots_after_event == 0)
         )
         game_over = self.game.status == GameStatus.LOST or self.game.lives <= 0
 
         components = {
             "step": self.rewards.step,
             "score": score_delta * self.rewards.score_scale,
-            "blocked_action": self.rewards.blocked_action if action_blocked else 0.0,
+            "blocked_action": self.rewards.blocked_action if pending.action_blocked else 0.0,
             "pellet_progress": 0.0,
             "freeze_hit": self.rewards.freeze_hit * freeze_ball_hits,
             "life_lost": self.rewards.life_lost if life_lost else 0.0,
@@ -252,17 +324,17 @@ class PacmanEnv:
         # target disappeared, so that delta would punish successful collection.
         if not pellets_eaten and not power_pellets_eaten:
             nearest_pellet_after = self._nearest_distance(self._dot_cells())
-            if nearest_pellet_before is not None and nearest_pellet_after is not None:
-                if nearest_pellet_after < nearest_pellet_before:
+            if pending.nearest_pellet_before is not None and nearest_pellet_after is not None:
+                if nearest_pellet_after < pending.nearest_pellet_before:
                     components["pellet_progress"] = self.rewards.closer_to_pellet
-                elif nearest_pellet_after > nearest_pellet_before:
+                elif nearest_pellet_after > pending.nearest_pellet_before:
                     components["pellet_progress"] = self.rewards.farther_from_pellet
 
         reward = float(sum(components.values()))
         self.episode_steps += 1
         self.episode_return += reward
         self.last_reward = reward
-        self.last_action_index = action_index
+        self.last_action_index = pending.action_index
 
         termination_reason: str | None = None
         terminated = False
@@ -296,13 +368,13 @@ class PacmanEnv:
         info.update(
             {
                 "reset": False,
-                "action_index": action_index,
-                "action_label": ACTION_LABELS[action_index],
-                "requested_direction": requested_direction.name,
+                "action_index": pending.action_index,
+                "action_label": ACTION_LABELS[pending.action_index],
+                "requested_direction": pending.requested_direction.name,
                 "applied_direction": self.game.player.direction.name,
-                "action_blocked": action_blocked,
-                "stalled": stalled,
-                "internal_frames": internal_frames,
+                "action_blocked": pending.action_blocked,
+                "stalled": pending.stalled,
+                "internal_frames": pending.internal_frames,
                 "score_delta": score_delta,
                 "pellets_eaten": pellets_eaten,
                 "power_pellets_eaten": power_pellets_eaten,
@@ -322,13 +394,13 @@ class PacmanEnv:
                         "damage": event.damage,
                         "slow_fraction": event.slow_fraction,
                     }
-                    for event in projectile_events
+                    for event in pending.projectile_events
                 ],
                 "pacman_slowed": self.game.player_slow.active,
                 "slow_remaining_seconds": self.game.player_slow.remaining_seconds,
                 "life_lost": life_lost,
                 "level_cleared": level_cleared,
-                "cleared_level": start_level if level_cleared else None,
+                "cleared_level": pending.start_level if level_cleared else None,
                 "terminated": terminated,
                 "termination_reason": termination_reason,
                 "reward": reward,

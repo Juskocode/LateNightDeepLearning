@@ -293,12 +293,24 @@ class PacmanObservatory:
         hint_image = self._font(8).render(hint, True, self.theme.muted)
         surface.blit(hint_image, (rect.right - hint_image.get_width(), 8))
 
-        speed = _number(_first(telemetry, "decisions_per_second", "speed"))
+        speed = _number(
+            _first(
+                telemetry,
+                "simulation_fps_target",
+                "speed_target_fps",
+                "decisions_per_second",
+                "speed",
+            )
+        )
         if speed is None:
             return ()
         raw_label = _first(telemetry, "speed_label", "speed_mode")
         label = "CUSTOM" if raw_label in (_MISSING, None) else str(raw_label).upper()
-        value_text = f"{label}  ·  target {int(speed)}/s"
+        measured = _number(_first(telemetry, "simulation_fps_actual"))
+        if measured is not None and rect.width >= 190:
+            value_text = f"{label}  ·  sim {measured:.1f} / {int(speed)} FPS"
+        else:
+            value_text = f"{label}  ·  target {int(speed)} sim FPS"
         value_color = self.theme.yellow if label == "MAX" else self.theme.cyan
         value_image = self._font(10, bold=True).render(value_text, True, value_color)
         surface.blit(value_image, (rect.right - value_image.get_width(), 27))
