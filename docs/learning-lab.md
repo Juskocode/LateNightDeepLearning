@@ -369,9 +369,10 @@ suite.
 
 `drivingGameRL` separates deterministic vehicle dynamics from presentation. Its
 `DrivingEnv` has a Gym-like `reset`/`step` contract without requiring Gym, so the
-same fixed-step simulation can support manual driving, scripted controllers, and
-future learning agents. The current scope supplies the environment and telemetry;
-it does not yet supply a DQN, PPO, or other driving trainer.
+same fixed-step simulation supports manual driving, scripted controllers, four
+learning modes, and a human-versus-champion race. The learner is also independent
+of Pygame: headless and visual experiments call the same environment, replay,
+network, and population code.
 
 ### Vehicle state and fixed-step physics
 
@@ -528,6 +529,157 @@ vehicle telemetry. Episodes do not currently terminate from damage or collision.
 They truncate at the configured step limit, which defaults to 10,800 steps
 (three minutes at 60 Hz).
 
+### Driving value network and replay
+
+All driving learners operate on the same 12 observations and five discrete
+actions. The deep action-value function is a fully connected network:
+
+```text
+12 observations → 128 ReLU → 128 ReLU → 5 Q-values
+```
+
+The five outputs estimate the discounted return for coast, accelerate, brake,
+steer left, and steer right. In the standalone deep modes, epsilon-greedy action
+selection adds exploration and every transition enters a bounded replay memory:
+
+```text
+(state, action, reward, next_state, done)
+```
+
+Uniformly sampled mini-batches train the online network with Huber loss, Adam,
+and gradient clipping. The target network is copied periodically from the online
+network. Standard DQN uses the target network for both selection and evaluation:
+
+```text
+y_DQN = r + gamma * (1 - done) * max_a Q_target(next_state, a)
+```
+
+Double DQN splits those responsibilities:
+
+```text
+a*       = argmax_a Q_online(next_state, a)
+y_DDQN   = r + gamma * (1 - done) * Q_target(next_state, a*)
+```
+
+`--algorithm dqn` and `--algorithm double_dqn` keep one learner across
+episodes. In the dashboard, an "episode" is presented as a one-member generation
+so the same fitness and history views work for all four modes.
+
+### Genetic neuroevolution
+
+`--algorithm genetic` treats every online-network weight and bias as a genome.
+It does not insert replay transitions, run an optimizer, or update a target
+network during evaluation. Each member acts greedily for the configured step
+budget, and its fitness is exactly its accumulated shaped environment reward:
+
+```text
+fitness_i = sum(t=0..T-1) reward_i,t
+```
+
+Population evaluation is sequential and seeded. This keeps the visible car equal
+to the policy currently earning fitness and avoids worker-timing nondeterminism.
+After every member has been evaluated, the next generation is built as follows:
+
+1. Rank the population by fitness, with stable member IDs breaking ties.
+2. Copy the configured number of elites without crossover or mutation.
+3. Select each pair of parents by seeded tournament selection.
+4. Apply either uniform crossover or BLX-alpha blend crossover.
+5. Apply masked zero-mean Gaussian noise to the selected child parameters.
+6. Synchronize each changed child's target network before evaluation.
+
+Uniform crossover chooses each parameter from one of the two parents. For one
+parameter index `j`:
+
+```text
+child_j = parent_A,j  when mask_j = 1
+          parent_B,j  otherwise
+```
+
+Masked Gaussian mutation is:
+
+```text
+child_j <- child_j + Bernoulli(mutation_rate) * Normal(0, mutation_std)
+```
+
+Strict elitism prevents a good genome from being destroyed by random operators,
+while tournament selection still gives weaker genomes a non-zero path into the
+next generation. The dashboard reports best, mean, median, and worst fitness,
+fitness spread, genome diversity, ancestry, and the active member.
+
+### Hybrid genetic DQN
+
+`--algorithm genetic_dqn` uses the same population and evolutionary operators,
+but every member is also a real Double-DQN learner during its evaluation. It acts
+epsilon-greedily, stores experience, and performs replay-based TD updates before
+its final learned weights are ranked. This creates two time scales:
+
+```mermaid
+flowchart LR
+    E["Drive and collect transitions"] --> R["Replay TD updates"]
+    R --> F["Evaluate accumulated return"]
+    F --> S["Elitism and tournament selection"]
+    S --> C["Crossover and mutation"]
+    C --> E
+```
+
+Gradient descent supplies local improvement within a member's lifetime;
+selection and mutation search across initializations and policy regions between
+generations. Children inherit network parameters, not replay transitions or
+shared optimizer state. This avoids teaching a new policy from experience
+collected under a different parent while keeping learned weights heritable.
+
+The hybrid is not automatically superior. It spends more computation per
+environment transition and combines two sources of stochasticity. Pure
+`genetic` is the clean ablation for the evolutionary contribution, while
+standalone `double_dqn` is the clean ablation for population search.
+
+### Live dashboard and the `P` champion race
+
+The 1,400×760 dashboard is a view over learner telemetry; it does not own or
+synthesize training state.
+
+| Tab | What it answers |
+|---|---|
+| Overview | Which member is driving, what it observes and chooses, and how current/best/mean fitness changes across the population and generations |
+| Network | Which real layers and connections produced the current Q-values; colors and intensity come from current activations and weights |
+| Memory | How full replay is, whether action selection explored, and what loss, TD error, gradient steps, action counts, and target synchronization are doing |
+
+Pressing `P` pauses accelerated training and creates two private environments on
+the current circuit. One receives continuous human controls; the other receives
+greedy actions from an isolated, frozen clone of the current generation's best
+available policy. Both advance at a fixed 60 Hz for one lap. Press `P` again to
+return to training. The clone cannot write replay, update gradients, change
+generation fitness, or participate in selection, so the race is observational
+rather than an extra training episode.
+
+The human uses arrows or `WASD` for throttle/reverse and steering and `Space` for
+the brake. A faster training preset changes only how many simulation steps are
+processed per rendered frame; it does not change driving physics or race time.
+
+### Driving generalization and overfitting
+
+A high return on `harbor_loop` does not imply a robust driver. The observation is
+local and compact, but a large network or population can still specialize to one
+circuit's turn sequence, one component build, or reward-shaped behaviors such as
+safe slow progress. The hybrid can overfit faster because it has both gradient
+updates and population selection amplifying the same training signal.
+
+Use at least three disjoint layers of variation:
+
+- train with several learner seeds and report the distribution, not one champion;
+- rotate or randomize training circuits and terrain-heavy sections;
+- reserve circuits, component builds, and seeds for frozen-policy evaluation.
+
+Do not use the interactive `P` race as the held-out metric: a human adapts between
+races, and repeatedly choosing a favorite champion is itself selection on the
+demo. Use it to understand behavior, then report scripted frozen evaluations
+under equal environment-decision budgets. For a population run, the interaction
+budget per full generation is approximately:
+
+```text
+population_size * evaluation_steps
+```
+
 ### Driving commands and controls
 
 These commands match the inspected CLI:
@@ -551,7 +703,32 @@ python -m drivingGameRL.main \
 
 # Print circuit descriptions and exit
 python -m drivingGameRL.main --list-circuits
+
+# Standalone DQN and Double-DQN learning
+python -m drivingGameRL.main --learn --algorithm dqn
+python -m drivingGameRL.main --learn --algorithm double_dqn
+
+# Pure neural-weight evolution
+python -m drivingGameRL.main --learn --algorithm genetic \
+  --population 12 --elite-count 2 --evaluation-steps 1800
+
+# Hybrid population-based Double DQN (editable-install launcher)
+late-night-driving-rl --algorithm genetic_dqn \
+  --population 12 --elite-count 2 --evaluation-steps 1800
+
+# Bounded headless comparisons
+python -m drivingGameRL.main --learn --algorithm double_dqn \
+  --headless --steps 50000
+python -m drivingGameRL.main --learn --algorithm genetic_dqn \
+  --headless --generations 20 --population 12
+
+# Resume and persist a compatible population
+late-night-driving-rl --algorithm genetic_dqn \
+  --checkpoint drivingGameRL/models/checkpoints/hybrid-driver.pth
 ```
+
+An explicit `--checkpoint` is loaded when it exists and saved on clean exit.
+`--fresh` skips loading, while `--no-save` keeps the existing file unchanged.
 
 Headless mode and any `--screenshot` request enter deterministic autopilot capture
 mode, which defaults to 240 steps when `--steps` is omitted. `--motor`, `--wheels`,
@@ -574,9 +751,27 @@ racing line hidden; recording still runs, and `G` can reveal the overlay later.
 | `F12` | Save `driving-screenshot.png` |
 | `Esc` | Quit |
 
+Learning mode adds these controls:
+
+| Input | Learning action |
+|---|---|
+| `1` / `2` / `3` | Open Overview / Network / Memory |
+| `Tab` | Cycle dashboard tabs |
+| `Space` | Pause or resume training |
+| `N` | Advance one training step while paused |
+| `[` or `,` | Reduce simulation steps per rendered frame |
+| `]` or `.` | Increase simulation steps per rendered frame |
+| `P` | Enter or leave the fixed-60-Hz race against the frozen generation champion |
+| `R` | Reset the current evaluation; start a rematch while racing |
+| `S` | Save the current learner checkpoint |
+| Arrows / `WASD` | Drive the human car during the race |
+| `Space` | Brake during the race |
+| `Esc` | Quit |
+
 ## Reproducible comparison protocol
 
-Use this protocol across the implemented neural and tabular baselines.
+Use this protocol across the implemented neural, tabular, and population
+baselines.
 
 ### 1. Freeze the experiment contract
 
@@ -597,7 +792,9 @@ The fairest budget is environment decisions, not wall-clock time or episodes.
 Longer-lived policies otherwise receive more learning transitions per episode.
 If the current `--games` interface is used, record both games and decisions and
 stop all runs at the same predeclared criterion. A decision-budget CLI is still a
-recommended upgrade for Snake.
+recommended upgrade for Snake. For driving populations, count every member's
+evaluation steps: 20 generations of 12 members at 1,800 steps is a budget of up
+to 432,000 environment decisions, not 36,000.
 
 ### 4. Change one factor at a time
 
@@ -606,6 +803,10 @@ samples, batch size, epsilon schedule, and target-sync cadence. Only the bootstr
 selection rule should differ. For a dueling comparison, report parameter counts;
 the architecture necessarily changes. For tabular methods, report table coverage
 and update count rather than pretending neural optimizer steps are equivalent.
+For `genetic` versus `genetic_dqn`, keep population size, evaluation budget,
+initial weight seeds, elitism, tournaments, crossover, and mutation fixed; report
+the hybrid's additional optimizer updates and compute cost. For population versus
+standalone DQN, equalize total environment decisions rather than generations.
 
 ### 5. Evaluate frozen checkpoints
 

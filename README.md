@@ -4,7 +4,7 @@ Playable arcade environments for watching reinforcement learning from the inside
 
 - **Pacman** supports manual play plus real DQN and Double-DQN training with a four-tab live observatory.
 - **Snake** compares six deep and tabular value-learning methods with held-out seed evaluation, curriculum randomization, and live generalization metrics.
-- **Driving Lab** is a deterministic top-down simulator with five circuits, eight terrain models, fixed-step lap timing, a best-lap ghost, upgradeable car parts, sensor rays, sprite rendering, and particles.
+- **Driving Lab** combines deterministic top-down vehicle physics with DQN, Double DQN, genetic neuroevolution, and a hybrid genetic-DQN population lab. Its live dashboard exposes the real network, replay memory, and generation fitness, and `P` starts a one-lap race against the current champion.
 
 ![Pacman Double-DQN observatory cycling through the game, vision, metrics, and neural-network views](assets/gifs/pacman-dqn-observatory.gif)
 
@@ -53,9 +53,13 @@ python -m snakeGameQDlearning.main --algorithm double_dqn
 # Play the top-down driving lab
 python -m drivingGameRL.main --circuit harbor_loop
 # or: late-night-driving --circuit harbor_loop
+
+# Evolve a population whose members also learn with Double DQN
+python -m drivingGameRL.main --learn --algorithm genetic_dqn
+# or: late-night-driving-rl --algorithm genetic_dqn
 ```
 
-Pacman exposes DQN and Double DQN. Snake additionally exposes dueling variants, tabular Q-learning, and Expected SARSA.
+Pacman exposes DQN and Double DQN. Snake additionally exposes dueling variants, tabular Q-learning, and Expected SARSA. Driving adds pure neuroevolution and a hybrid that combines population selection with replay-based TD learning.
 
 ## Pacman arcade mode
 
@@ -342,6 +346,95 @@ Each component has levels 0–5 and changes actual physics:
 
 The reusable `DrivingEnv` returns 12 normalized observations: speed, longitudinal/lateral velocity, heading error, track offset, terrain grip, lap progress, and five barrier rays. Its five discrete actions are coast, accelerate, brake, steer left, and steer right; continuous `DriverControls` power manual play. The renderer uses an alpha-cropped car-body asset with procedural wheel/suspension layers and a code-only fallback. Seeded, bounded particles visualize gravel/mud spray, tire slip, braking, and barrier impacts without affecting physics.
 
+### Driving DQN and population lab
+
+The learning mode uses the same fixed-step `DrivingEnv` as manual play. All four
+algorithms receive the 12-value observation above and choose among the same five
+actions. Deep modes use an inspectable network:
+
+![Driving genetic Double-DQN observatory cycling through live population, network, memory, and champion-race views](assets/gifs/driving-genetic-dqn.gif)
+
+```text
+12 observations → 128 ReLU → 128 ReLU → 5 Q-values
+```
+
+| Algorithm | What changes during an evaluation | How the next policy is produced |
+|---|---|---|
+| `dqn` | Replay-based TD updates with an online and target network | The same learner continues into the next episode |
+| `double_dqn` | The online network selects the bootstrap action; the target network evaluates it | The same learner continues into the next episode |
+| `genetic` | Nothing: each weight genome drives greedily and earns fitness | Strict elites survive; tournament-selected parents create crossed-over, Gaussian-mutated children |
+| `genetic_dqn` | Every member explores, stores transitions, and performs Double-DQN updates during its lifetime | Learned weights then undergo the same elitism, crossover, and mutation cycle |
+
+`genetic_dqn` is a population-based training hybrid: gradient descent can refine
+a policy within one evaluation, while selection can retain useful changes and
+mutation can escape a weak local strategy. Replay memories are private to each
+member and are not inherited by children, so ancestry transfers network weights
+rather than stale transitions. Pure `genetic` mode is a useful control because
+it has the same population operators without replay, targets, or TD learning.
+
+```bash
+# Standard and Double-DQN episode learners
+python -m drivingGameRL.main --learn --algorithm dqn
+python -m drivingGameRL.main --learn --algorithm double_dqn
+
+# Weight-only neuroevolution
+python -m drivingGameRL.main --learn --algorithm genetic \
+  --population 12 --elite-count 2 --evaluation-steps 1800
+
+# Hybrid population-based Double DQN
+late-night-driving-rl --algorithm genetic_dqn \
+  --population 12 --elite-count 2 --evaluation-steps 1800
+
+# Bounded experiments without a window
+python -m drivingGameRL.main --learn --algorithm double_dqn \
+  --headless --steps 50000
+python -m drivingGameRL.main --learn --algorithm genetic_dqn \
+  --headless --generations 20 --population 12
+
+# Resume and persist one compatible experiment
+late-night-driving-rl --algorithm genetic_dqn \
+  --checkpoint drivingGameRL/models/checkpoints/hybrid-driver.pth
+```
+
+When `--checkpoint` names an existing compatible file, the full policy or
+population ancestry is restored; a clean exit saves back to that path. Use
+`--fresh` to ignore an existing file or `--no-save` to leave it unchanged.
+
+The 1,400×760 learning dashboard is fed only by live telemetry:
+
+| Tab | Live evidence |
+|---|---|
+| Overview | Current car and circuit, generation/member progress, population fitness, best/mean history, observations, selected action, and Q-values |
+| Network | The current network's actual architecture, activations, parameter count, and sampled connection weights |
+| Memory | Replay occupancy, epsilon, loss, TD error, gradient updates, action use, target synchronization, and recent learning state |
+
+| Learning input | Action |
+|---|---|
+| `1` / `2` / `3` or `Tab` | Open Overview / Network / Memory, or cycle tabs |
+| `Space` | Pause or resume training |
+| `N` | Advance one training step while paused |
+| `[` or `,` | Reduce simulated training steps per rendered frame |
+| `]` or `.` | Increase simulated training steps per rendered frame |
+| `P` | Pause training and start/leave a one-lap race against the current generation champion |
+| `R` | Reset the current evaluation; start a rematch while racing |
+| `S` | Save the current learner checkpoint |
+| `Esc` | Quit |
+
+The race always advances at a fixed 60 simulation steps per second, regardless
+of the accelerated training setting. Drive with arrows or `WASD` and brake with
+`Space`. The opponent is an isolated, frozen clone of the current generation's
+best available policy, and the human and champion receive independent but
+identically configured environments. Race actions cannot add replay items,
+perform optimizer steps, change fitness, or alter selection. This makes `P` a
+direct qualitative check rather than another source of training data.
+
+One seed and one circuit are not evidence of general driving ability. A large
+network or population can still overfit the reward quirks and geometry of a
+single track. Compare algorithms under equal environment-step budgets, train
+with several seeds and circuits, and evaluate frozen champions on held-out
+circuits, terrain combinations, and component builds. The
+[learning lab guide](docs/learning-lab.md) gives a complete comparison protocol.
+
 ## CLI reference
 
 ```bash
@@ -381,8 +474,11 @@ LateNightDeepLearning/
 │       ├── ml/
 │       └── utils/
 ├── drivingGameRL/
-│   ├── main.py                 # Play, headless simulation, screenshot CLI
-│   └── src/                    # Circuits, terrain, physics, sprites, HUD, env
+│   ├── main.py                 # Manual, learning, race, and headless CLI
+│   └── src/
+│       ├── ml/                 # DQN replay, networks, population evolution
+│       ├── learning_runtime.py # Unified sessions and frozen-champion race
+│       └── ...                 # Circuits, terrain, physics, sprites, HUD, env
 ├── docs/
 │   └── learning-lab.md         # Algorithms, equations, experiment protocol
 ├── late_night_deep_learning/   # Portable project test launcher
@@ -400,7 +496,7 @@ late-night-tests -v
 
 `python -m unittest discover -v` also works from the repository root. Standard discovery searches the current directory, so running it from `~` correctly finds zero project tests.
 
-Coverage includes Pacman contour/combat/level/RL behavior; Snake algorithms, dueling heads, tabular updates, held-out evaluation, seed streams, curricula, checkpoint compatibility, and environment edge cases; and driving circuit geometry, terrain physics, gated lap records, ghost interpolation, component effects, collisions, finite stress simulation, sprite fallback, bounded particles, screenshots, and renderer smoke tests.
+Coverage includes Pacman contour/combat/level/RL behavior; Snake algorithms, dueling heads, tabular updates, held-out evaluation, seed streams, curricula, checkpoint compatibility, and environment edge cases; and driving circuit geometry, terrain physics, gated lap records, ghost interpolation, DQN targets, bounded replay, evolutionary operators, isolated champion races, component effects, collisions, particles, screenshots, and renderer smoke tests.
 
 Regenerate documentation media from the real renderers:
 
@@ -420,13 +516,23 @@ python -m snakeGameQDlearning.main \
 python -m drivingGameRL.main \
   --circuit alpine_gauntlet --motor 5 --wheels 5 --suspension 5 --grip 5 \
   --seed 19 --steps 1500 --screenshot assets/screenshots/driving-lab.png
+
+python -m drivingGameRL.main \
+  --learn --algorithm genetic_dqn --population 4 --elite-count 1 \
+  --evaluation-steps 600 --seed 19 --steps 1150 \
+  --screenshot assets/screenshots/driving-learning.png
+
+python -m drivingGameRL.main \
+  --learn --algorithm genetic_dqn --population 4 --elite-count 1 \
+  --evaluation-steps 600 --seed 19 \
+  --gif assets/gifs/driving-genetic-dqn.gif --no-save
 ```
 
 ## Design notes
 
 - Game state, learning logic, rendering, sprites, replay storage, and observability have separate responsibilities.
 - All three environments accept seeds; Pacman decisions and driving physics are fixed-step and deterministic for testing.
-- Headless and visual runs use the same environment and selected learning backend. Neural modes also share replay and optimizer paths; Expected SARSA intentionally skips replay-based updates.
+- Headless and visual runs use the same environment and selected learning backend. Neural modes also share replay and optimizer paths; Expected SARSA and pure driving neuroevolution intentionally skip replay-based updates.
 - Neural-network visuals are generated from current parameters and activations; missing telemetry renders an explicit empty state instead of invented values.
-- Driving physics is independent of Pygame; rendering, generated body art, procedural upgrade layers, and particles are presentation-only.
+- Driving physics and learning are independent of Pygame; rendering, generated body art, procedural upgrade layers, particles, and the frozen-champion race view do not mutate the learner.
 - Runtime checkpoints and generated training models are ignored by Git.
