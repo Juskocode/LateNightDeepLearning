@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "late-night-deep-learning"
-version = "0.3.0"
-description = "Sprite-driven Pacman and observable DQN/Double-DQN game trainers"
+version = "0.4.0"
+description = "Observable arcade reinforcement-learning labs and a component-based driving simulator"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -20,8 +20,9 @@ dependencies = [
 late-night-pacman = "pacManRf.main:main"
 late-night-pacman-rl = "pacManRf.main:rl_main"
 late-night-snake = "snakeGameQDlearning.main:main"
+late-night-driving = "drivingGameRL.main:main"
 late-night-tests = "late_night_deep_learning.test_runner:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["pacManRf*", "snakeGameQDlearning*", "late_night_deep_learning*"]
+include = ["pacManRf*", "snakeGameQDlearning*", "drivingGameRL*", "late_night_deep_learning*"]
