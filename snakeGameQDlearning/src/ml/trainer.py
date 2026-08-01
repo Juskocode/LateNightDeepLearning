@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from typing import List, Literal, Union
 
 import numpy as np
@@ -15,21 +16,24 @@ Algorithm = Literal["dqn", "double_dqn"]
 
 
 class QTrainer:
-    def __init__(self, model: nn.Module, learning_rate: float, gamma: float,
-                 algorithm: Algorithm = "double_dqn"):
+    def __init__(
+        self,
+        model: nn.Module,
+        learning_rate: float,
+        gamma: float,
+        algorithm: Algorithm = "double_dqn",
+        weight_decay: float = 1e-5,
+    ):
         if algorithm not in ("dqn", "double_dqn"):
             raise ValueError("algorithm must be 'dqn' or 'double_dqn'")
         self.model = model
-        self.target_model = type(model)(
-            model.linear1.in_features,
-            model.linear1.out_features,
-            model.linear3.out_features,
-        )
-        self.target_model.load_state_dict(model.state_dict())
+        self.target_model = deepcopy(model)
         self.target_model.eval()
         self.algorithm = algorithm
         self.gamma = gamma
-        self.optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+        self.optimizer = optim.Adam(
+            model.parameters(), lr=learning_rate, weight_decay=weight_decay
+        )
         self.criterion = nn.SmoothL1Loss()
         self.update_target_counter = 0
         self.target_update_freq = TARGET_UPDATE_FREQUENCY
@@ -46,12 +50,25 @@ class QTrainer:
                 # The target network both selects and evaluates the maximum action.
                 return target_q.max(dim=1).values
             # The online network selects; the target network independently evaluates.
-            selected_actions = self.model(next_states).argmax(dim=1, keepdim=True)
+            # Dropout regularizes the fitted prediction, but it must not turn the
+            # Double-DQN bootstrap rule into a different stochastic policy every
+            # time the same replay batch is sampled.
+            was_training = self.model.training
+            self.model.eval()
+            try:
+                selected_actions = self.model(next_states).argmax(dim=1, keepdim=True)
+            finally:
+                self.model.train(was_training)
             return target_q.gather(1, selected_actions).squeeze(1)
 
-    def train_step(self, state: Union[np.ndarray, List], action: Union[np.ndarray, List],
-                   reward: Union[float, List], next_state: Union[np.ndarray, List],
-                   done: Union[bool, List]) -> float:
+    def train_step(
+        self,
+        state: Union[np.ndarray, List],
+        action: Union[np.ndarray, List],
+        reward: Union[float, List],
+        next_state: Union[np.ndarray, List],
+        done: Union[bool, List],
+    ) -> float:
         states = torch.as_tensor(np.asarray(state), dtype=torch.float32)
         next_states = torch.as_tensor(np.asarray(next_state), dtype=torch.float32)
         actions = torch.as_tensor(np.asarray(action), dtype=torch.long)
@@ -63,11 +80,19 @@ class QTrainer:
             actions = actions.unsqueeze(0)
             rewards = rewards.unsqueeze(0)
             dones = dones.unsqueeze(0)
-        if states.ndim != 2 or states.shape[1] != self.model.linear1.in_features:
+        input_size = getattr(self.model, "input_size", self.model.linear1.in_features)
+        output_size = getattr(
+            self.model,
+            "output_size",
+            getattr(getattr(self.model, "linear3", None), "out_features", None),
+        )
+        if states.ndim != 2 or states.shape[1] != input_size:
             raise ValueError("state batch has an unexpected shape")
-        if actions.ndim != 2 or actions.shape[1] != self.model.linear3.out_features:
+        if actions.ndim != 2 or actions.shape[1] != output_size:
             raise ValueError("action batch has an unexpected shape")
-        if not torch.all((actions == 0) | (actions == 1)) or not torch.all(actions.sum(dim=1) == 1):
+        if not torch.all((actions == 0) | (actions == 1)) or not torch.all(
+            actions.sum(dim=1) == 1
+        ):
             raise ValueError("actions must be one-hot encoded")
 
         self.model.train()
@@ -79,7 +104,9 @@ class QTrainer:
         self.optimizer.zero_grad()
         loss = self.criterion(predicted_q, targets)
         loss.backward()
-        gradient_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+        gradient_norm = torch.nn.utils.clip_grad_norm_(
+            self.model.parameters(), max_norm=1.0
+        )
         self.optimizer.step()
 
         self.update_target_counter += 1

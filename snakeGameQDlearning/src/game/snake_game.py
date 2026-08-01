@@ -13,17 +13,45 @@ import pygame
 from .constants import Direction, FRAME_TIMEOUT_MULTIPLIER, Point
 from .sprites import SnakeSpriteAtlas
 from snakeGameQDlearning.src.config.settings import (
-    BLACK, BLOCK_SIZE, BLUE2, COLLISION_PENALTY, FONT_PATH, FOOD_REWARD,
-    GAME_HEIGHT, GAME_SPEED, GAME_WIDTH, GREEN, GRID, GRID_HIGHLIGHT,
-    HEADER_HEIGHT, LOOP_PENALTY, MARGIN, MUTED, ORANGE, PANEL_BG, PANEL_WIDTH,
-    PURPLE, RED, WHITE, WIN_REWARD, YELLOW,
+    BLACK,
+    BLOCK_SIZE,
+    BLUE2,
+    COLLISION_PENALTY,
+    FONT_PATH,
+    FOOD_REWARD,
+    GAME_HEIGHT,
+    GAME_SPEED,
+    GAME_WIDTH,
+    GREEN,
+    GRID,
+    GRID_HIGHLIGHT,
+    HEADER_HEIGHT,
+    LOOP_PENALTY,
+    MARGIN,
+    MUTED,
+    ORANGE,
+    PANEL_BG,
+    PANEL_WIDTH,
+    PURPLE,
+    RED,
+    WHITE,
+    WIN_REWARD,
+    YELLOW,
 )
 
 
 VISION_LABELS = (
-    "danger ahead", "danger right", "danger left", "heading left",
-    "heading right", "heading up", "heading down", "food left", "food right",
-    "food up", "food down",
+    "danger ahead",
+    "danger right",
+    "danger left",
+    "heading left",
+    "heading right",
+    "heading up",
+    "heading down",
+    "food left",
+    "food right",
+    "food up",
+    "food down",
 )
 ACTION_LABELS = ("STRAIGHT", "TURN RIGHT", "TURN LEFT")
 _CLOCKWISE = (Direction.RIGHT, Direction.DOWN, Direction.LEFT, Direction.UP)
@@ -37,9 +65,16 @@ class SnakeGameAI:
     the exact observation/action pair currently being evaluated.
     """
 
-    def __init__(self, width: int = GAME_WIDTH, height: int = GAME_HEIGHT,
-                 render: bool = True, speed: int = GAME_SPEED,
-                 seed: Optional[int] = None):
+    def __init__(
+        self,
+        width: int = GAME_WIDTH,
+        height: int = GAME_HEIGHT,
+        render: bool = True,
+        speed: int = GAME_SPEED,
+        seed: Optional[int] = None,
+        randomize_start: bool = False,
+        process_events: bool = True,
+    ):
         if width % BLOCK_SIZE or height % BLOCK_SIZE:
             raise ValueError(f"width and height must be multiples of {BLOCK_SIZE}")
         if width < BLOCK_SIZE * 4 or height < BLOCK_SIZE * 3:
@@ -54,8 +89,13 @@ class SnakeGameAI:
         self.render_enabled = render
         self.speed = max(1, int(speed))
         self.rng = random.Random(seed)
+        self.episode_seed = seed
+        self.default_randomize_start = bool(randomize_start)
+        self.process_events = bool(process_events)
         if render:
-            self.display = pygame.display.set_mode((self.window_width, self.window_height))
+            self.display = pygame.display.set_mode(
+                (self.window_width, self.window_height)
+            )
             pygame.display.set_caption("Snake RL Observatory")
         else:
             self.display = pygame.Surface((self.window_width, self.window_height))
@@ -73,7 +113,7 @@ class SnakeGameAI:
         self.show_vision = True
         self._single_step = False
         self.telemetry: dict = {}
-        self.reset()
+        self.reset(seed=seed, randomize_start=randomize_start)
 
     def _font(self, size: int):
         try:
@@ -85,15 +125,26 @@ class SnakeGameAI:
     def starvation_budget(self) -> int:
         return FRAME_TIMEOUT_MULTIPLIER * len(self.snake)
 
-    def reset(self) -> None:
+    def reset(
+        self, *, seed: Optional[int] = None, randomize_start: Optional[bool] = None
+    ) -> None:
+        if seed is not None:
+            self.rng.seed(seed)
+            self.episode_seed = seed
+        if randomize_start is None:
+            randomize_start = self.default_randomize_start
         columns = self.width // BLOCK_SIZE
         rows = self.height // BLOCK_SIZE
-        self.direction = Direction.RIGHT
-        self.head = Point((columns // 2) * BLOCK_SIZE, (rows // 2) * BLOCK_SIZE)
+        if randomize_start:
+            self.direction, self.head = self._random_start(columns, rows)
+        else:
+            self.direction = Direction.RIGHT
+            self.head = Point((columns // 2) * BLOCK_SIZE, (rows // 2) * BLOCK_SIZE)
+        dx, dy = self.direction.value
         self.snake = [
             self.head,
-            Point(self.head.x - BLOCK_SIZE, self.head.y),
-            Point(self.head.x - 2 * BLOCK_SIZE, self.head.y),
+            Point(self.head.x - dx * BLOCK_SIZE, self.head.y - dy * BLOCK_SIZE),
+            Point(self.head.x - 2 * dx * BLOCK_SIZE, self.head.y - 2 * dy * BLOCK_SIZE),
         ]
         self.best_score = max(self.score, self.best_score)
         self.score = 0
@@ -112,6 +163,27 @@ class SnakeGameAI:
         self.path_history = deque([self.head], maxlen=120)
         self.visit_counts = Counter({self.head: 1})
         self._place_food()
+
+    def _random_start(self, columns: int, rows: int) -> tuple[Direction, Point]:
+        """Choose a valid orientation and head while keeping three cells in-bounds."""
+
+        direction = self.rng.choice(list(Direction))
+        dx, dy = direction.value
+        candidates = []
+        for column in range(columns):
+            for row in range(rows):
+                tail_column = column - 2 * dx
+                tail_row = row - 2 * dy
+                next_column = column + dx
+                next_row = row + dy
+                if (
+                    0 <= tail_column < columns
+                    and 0 <= tail_row < rows
+                    and 0 <= next_column < columns
+                    and 0 <= next_row < rows
+                ):
+                    candidates.append(Point(column * BLOCK_SIZE, row * BLOCK_SIZE))
+        return direction, self.rng.choice(candidates)
 
     def _place_food(self) -> bool:
         occupied = set(self.snake)
@@ -132,6 +204,8 @@ class SnakeGameAI:
         self.telemetry.update(telemetry)
 
     def _handle_events(self) -> None:
+        if not self.process_events:
+            return
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 self.running = False
@@ -151,10 +225,16 @@ class SnakeGameAI:
                     self._single_step = True
                 elif event.key in (pygame.K_MINUS, pygame.K_LEFTBRACKET):
                     self.speed = max(1, self.speed // 2)
-                elif event.key in (pygame.K_EQUALS, pygame.K_PLUS, pygame.K_RIGHTBRACKET):
+                elif event.key in (
+                    pygame.K_EQUALS,
+                    pygame.K_PLUS,
+                    pygame.K_RIGHTBRACKET,
+                ):
                     self.speed = min(1000, self.speed * 2)
 
-    def play_step(self, action: Optional[Sequence[int]], *, render_frame: bool = True) -> Tuple[float, bool, int]:
+    def play_step(
+        self, action: Optional[Sequence[int]], *, render_frame: bool = True
+    ) -> Tuple[float, bool, int]:
         """Apply one relative action and return ``(reward, terminal, score)``.
 
         ``action`` may be ``None`` while paused, allowing the UI event loop to
@@ -221,7 +301,9 @@ class SnakeGameAI:
             self.snake.pop()
 
         if self.food is not None:
-            self.last_distance_delta = self._distance_to_food(self.head) - previous_distance
+            self.last_distance_delta = (
+                self._distance_to_food(self.head) - previous_distance
+            )
         if not game_over and self.steps_since_food > self.starvation_budget:
             self.termination_reason = "timeout"
             reward = float(LOOP_PENALTY)
@@ -236,8 +318,15 @@ class SnakeGameAI:
             return 0
         return abs(point.x - self.food.x) + abs(point.y - self.food.y)
 
-    def _collision_kind(self, point: Point, *, include_tail: bool = False) -> Optional[str]:
-        if point.x < 0 or point.x >= self.width or point.y < 0 or point.y >= self.height:
+    def _collision_kind(
+        self, point: Point, *, include_tail: bool = False
+    ) -> Optional[str]:
+        if (
+            point.x < 0
+            or point.x >= self.width
+            or point.y < 0
+            or point.y >= self.height
+        ):
             return "wall"
         occupied = self.snake if include_tail else self.snake[:-1]
         if point in occupied:
@@ -251,7 +340,12 @@ class SnakeGameAI:
         non-growing step and is therefore a legal destination.
         """
         target = self.head if point is None else point
-        if target.x < 0 or target.x >= self.width or target.y < 0 or target.y >= self.height:
+        if (
+            target.x < 0
+            or target.x >= self.width
+            or target.y < 0
+            or target.y >= self.height
+        ):
             return True
         if point is None:
             return target in self.snake[1:]
@@ -276,17 +370,23 @@ class SnakeGameAI:
     def _draw_header(self) -> None:
         title = self.font.render("SNAKE  /  RL OBSERVATORY", True, WHITE)
         subtitle = self.small_font.render(
-            "SPACE pause   N step   [ ] speed   V vision   R reset   ESC quit", True, MUTED
+            "SPACE pause   N step   [ ] speed   V vision   R reset   ESC quit",
+            True,
+            MUTED,
         )
         self.display.blit(title, (MARGIN, 14))
         self.display.blit(subtitle, (MARGIN, 40))
 
-        score = self.font.render(f"SCORE  {self.score:03d}     BEST  {self.best_score:03d}", True, GREEN)
+        score = self.font.render(
+            f"SCORE  {self.score:03d}     BEST  {self.best_score:03d}", True, GREEN
+        )
         self.display.blit(score, (self.window_width - score.get_width() - MARGIN, 16))
         status = "PAUSED" if self.paused else f"{self.speed} FPS"
         status_color = YELLOW if self.paused else MUTED
         status_text = self.tiny_font.render(status, True, status_color)
-        self.display.blit(status_text, (self.window_width - status_text.get_width() - MARGIN, 43))
+        self.display.blit(
+            status_text, (self.window_width - status_text.get_width() - MARGIN, 43)
+        )
 
     def _draw_board(self) -> None:
         board_x, board_y = MARGIN, HEADER_HEIGHT
@@ -294,20 +394,31 @@ class SnakeGameAI:
         pygame.draw.rect(self.display, PANEL_BG, board, border_radius=8)
 
         for x in range(0, self.width + 1, BLOCK_SIZE):
-            pygame.draw.line(self.display, GRID, (board_x + x, board_y),
-                             (board_x + x, board_y + self.height))
+            pygame.draw.line(
+                self.display,
+                GRID,
+                (board_x + x, board_y),
+                (board_x + x, board_y + self.height),
+            )
         for y in range(0, self.height + 1, BLOCK_SIZE):
-            pygame.draw.line(self.display, GRID, (board_x, board_y + y),
-                             (board_x + self.width, board_y + y))
+            pygame.draw.line(
+                self.display,
+                GRID,
+                (board_x, board_y + y),
+                (board_x + self.width, board_y + y),
+            )
 
         # Recent positions form a faint trail; repeated cells become easier to spot.
         trail = pygame.Surface((self.width, self.height), pygame.SRCALPHA)
         recent = list(self.path_history)[-42:]
         for index, point in enumerate(recent):
             alpha = 6 + round(24 * (index + 1) / max(1, len(recent)))
-            pygame.draw.rect(trail, (*PURPLE, alpha),
-                             (point.x + 2, point.y + 2, BLOCK_SIZE - 4, BLOCK_SIZE - 4),
-                             border_radius=4)
+            pygame.draw.rect(
+                trail,
+                (*PURPLE, alpha),
+                (point.x + 2, point.y + 2, BLOCK_SIZE - 4, BLOCK_SIZE - 4),
+                border_radius=4,
+            )
         self.display.blit(trail, (board_x, board_y))
 
         if self.show_vision:
@@ -322,55 +433,95 @@ class SnakeGameAI:
                 neighbours = [self.snake[index - 1]]
                 if index + 1 < len(self.snake):
                     neighbours.append(self.snake[index + 1])
-                connections = [self._direction_between(point, neighbour) for neighbour in neighbours]
+                connections = [
+                    self._direction_between(point, neighbour)
+                    for neighbour in neighbours
+                ]
                 image = self.sprites.body(connections, ticks, index)
             self.display.blit(image, (board_x + point.x, board_y + point.y))
 
         if self.food is not None:
-            self.display.blit(self.sprites.food(ticks),
-                              (board_x + self.food.x, board_y + self.food.y))
-        if self.crash_point is not None and 0 <= self.crash_point.x < self.width and 0 <= self.crash_point.y < self.height:
-            self.display.blit(self.sprites.crash(),
-                              (board_x + self.crash_point.x, board_y + self.crash_point.y))
+            self.display.blit(
+                self.sprites.food(ticks), (board_x + self.food.x, board_y + self.food.y)
+            )
+        if (
+            self.crash_point is not None
+            and 0 <= self.crash_point.x < self.width
+            and 0 <= self.crash_point.y < self.height
+        ):
+            self.display.blit(
+                self.sprites.crash(),
+                (board_x + self.crash_point.x, board_y + self.crash_point.y),
+            )
 
-        budget_fraction = min(1.0, self.steps_since_food / max(1, self.starvation_budget))
-        meter = pygame.Rect(board_x + 10, board_y + self.height - 15, self.width - 20, 5)
+        budget_fraction = min(
+            1.0, self.steps_since_food / max(1, self.starvation_budget)
+        )
+        meter = pygame.Rect(
+            board_x + 10, board_y + self.height - 15, self.width - 20, 5
+        )
         pygame.draw.rect(self.display, GRID_HIGHLIGHT, meter, border_radius=3)
         meter.width = round(meter.width * budget_fraction)
         if meter.width:
-            pygame.draw.rect(self.display, RED if budget_fraction > 0.8 else YELLOW,
-                             meter, border_radius=3)
+            pygame.draw.rect(
+                self.display,
+                RED if budget_fraction > 0.8 else YELLOW,
+                meter,
+                border_radius=3,
+            )
 
         if self.paused:
             shade = pygame.Surface((self.width, self.height), pygame.SRCALPHA)
             shade.fill((7, 10, 22, 125))
             self.display.blit(shade, (board_x, board_y))
             paused = self.font.render("PAUSED  ·  N TO STEP", True, WHITE)
-            self.display.blit(paused, (board_x + (self.width - paused.get_width()) // 2,
-                                       board_y + self.height // 2 - 12))
+            self.display.blit(
+                paused,
+                (
+                    board_x + (self.width - paused.get_width()) // 2,
+                    board_y + self.height // 2 - 12,
+                ),
+            )
 
     def _draw_vision_overlay(self, board_x: int, board_y: int) -> None:
         state = list(self.telemetry.get("state", [0] * 11))
-        head_center = (board_x + self.head.x + BLOCK_SIZE // 2,
-                       board_y + self.head.y + BLOCK_SIZE // 2)
+        head_center = (
+            board_x + self.head.x + BLOCK_SIZE // 2,
+            board_y + self.head.y + BLOCK_SIZE // 2,
+        )
         overlay = pygame.Surface((self.width, self.height), pygame.SRCALPHA)
 
         if self.food is not None:
-            food_center = (board_x + self.food.x + BLOCK_SIZE // 2,
-                           board_y + self.food.y + BLOCK_SIZE // 2)
-            self._dashed_line(self.display, PURPLE, head_center, food_center, dash=7, gap=7, width=1)
+            food_center = (
+                board_x + self.food.x + BLOCK_SIZE // 2,
+                board_y + self.food.y + BLOCK_SIZE // 2,
+            )
+            self._dashed_line(
+                self.display, PURPLE, head_center, food_center, dash=7, gap=7, width=1
+            )
 
-        for index, (label, direction) in enumerate(zip(("S", "R", "L"), self._relative_directions())):
+        for index, (label, direction) in enumerate(
+            zip(("S", "R", "L"), self._relative_directions())
+        ):
             dx, dy = direction.value
             target = Point(self.head.x + dx * BLOCK_SIZE, self.head.y + dy * BLOCK_SIZE)
-            danger = bool(state[index]) if index < len(state) else self.is_collision(target)
+            danger = (
+                bool(state[index]) if index < len(state) else self.is_collision(target)
+            )
             color = RED if danger else GREEN
             if 0 <= target.x < self.width and 0 <= target.y < self.height:
-                pygame.draw.rect(overlay, (*color, 42),
-                                 (target.x + 1, target.y + 1, BLOCK_SIZE - 2, BLOCK_SIZE - 2),
-                                 border_radius=4)
-                rect = pygame.Rect(board_x + target.x + 1, board_y + target.y + 1,
-                                   BLOCK_SIZE - 2, BLOCK_SIZE - 2)
+                pygame.draw.rect(
+                    overlay,
+                    (*color, 42),
+                    (target.x + 1, target.y + 1, BLOCK_SIZE - 2, BLOCK_SIZE - 2),
+                    border_radius=4,
+                )
+                rect = pygame.Rect(
+                    board_x + target.x + 1,
+                    board_y + target.y + 1,
+                    BLOCK_SIZE - 2,
+                    BLOCK_SIZE - 2,
+                )
                 pygame.draw.rect(self.display, color, rect, 1, border_radius=4)
                 marker = self.micro_font.render(label, True, color)
                 self.display.blit(marker, (rect.x + 3, rect.y + 2))
@@ -379,7 +530,9 @@ class SnakeGameAI:
         self.display.blit(overlay, (board_x, board_y))
 
     @staticmethod
-    def _dashed_line(surface, color, start, end, *, dash: int, gap: int, width: int) -> None:
+    def _dashed_line(
+        surface, color, start, end, *, dash: int, gap: int, width: int
+    ) -> None:
         vector = pygame.Vector2(end) - pygame.Vector2(start)
         length = vector.length()
         if not length:
@@ -388,8 +541,13 @@ class SnakeGameAI:
         distance = 0.0
         while distance < length:
             segment_end = min(distance + dash, length)
-            pygame.draw.line(surface, color, pygame.Vector2(start) + direction * distance,
-                             pygame.Vector2(start) + direction * segment_end, width)
+            pygame.draw.line(
+                surface,
+                color,
+                pygame.Vector2(start) + direction * distance,
+                pygame.Vector2(start) + direction * segment_end,
+                width,
+            )
             distance += dash + gap
 
     def _draw_inspector(self) -> None:
@@ -400,26 +558,46 @@ class SnakeGameAI:
         width = PANEL_WIDTH - 32
         y = HEADER_HEIGHT + 12
 
-        algorithm = str(self.telemetry.get("algorithm", "double_dqn")).upper().replace("_", " ")
+        algorithm = (
+            str(self.telemetry.get("algorithm", "double_dqn")).upper().replace("_", " ")
+        )
         policy = str(self.telemetry.get("policy_mode", "explore")).upper()
         self._label("DECISION ENGINE", x, y)
         self._chip(algorithm, x + 124, y - 4, PURPLE)
-        self._chip(policy, x + 246, y - 4, YELLOW if policy == "EXPLORE" else GREEN)
+        policy_text = self.micro_font.render(policy, True, WHITE)
+        self._chip(
+            policy,
+            x + width - policy_text.get_width() - 12,
+            y - 4,
+            YELLOW if policy == "EXPLORE" else GREEN,
+        )
         y += 25
 
         q_values = [float(value) for value in self.telemetry.get("q_values", [0.0] * 3)]
-        target_values = [float(value) for value in self.telemetry.get("target_q_values", [0.0] * 3)]
+        target_values = [
+            float(value) for value in self.telemetry.get("target_q_values", [0.0] * 3)
+        ]
         selected = int(self.telemetry.get("action_index", 0))
         scale = max(1.0, *(abs(value) for value in q_values))
         bar_x, bar_width = x + 94, width - 140
         center = bar_x + bar_width // 2
         for index, label in enumerate(ACTION_LABELS):
             row_y = y + index * 23
-            self._text(label, x, row_y + 2, WHITE if index == selected else MUTED, self.tiny_font)
+            self._text(
+                label,
+                x,
+                row_y + 2,
+                WHITE if index == selected else MUTED,
+                self.tiny_font,
+            )
             bar = pygame.Rect(bar_x, row_y, bar_width, 16)
             pygame.draw.rect(self.display, GRID, bar, border_radius=4)
-            pygame.draw.line(self.display, MUTED, (center, row_y + 2), (center, row_y + 14), 1)
-            magnitude = max(1, round((bar_width // 2 - 2) * abs(q_values[index]) / scale))
+            pygame.draw.line(
+                self.display, MUTED, (center, row_y + 2), (center, row_y + 14), 1
+            )
+            magnitude = max(
+                1, round((bar_width // 2 - 2) * abs(q_values[index]) / scale)
+            )
             if q_values[index] >= 0:
                 value_bar = pygame.Rect(center, row_y + 2, magnitude, 12)
                 color = GREEN if index == selected else BLUE2
@@ -429,21 +607,42 @@ class SnakeGameAI:
             pygame.draw.rect(self.display, color, value_bar, border_radius=3)
             if index == selected:
                 pygame.draw.rect(self.display, WHITE, bar, 1, border_radius=4)
-            self._text(f"{q_values[index]:+.2f}", x + width - 39, row_y + 2, WHITE, self.tiny_font)
+            self._text(
+                f"{q_values[index]:+.2f}",
+                x + width - 39,
+                row_y + 2,
+                WHITE,
+                self.tiny_font,
+            )
         y += 76
 
         reward = float(self.telemetry.get("reward", 0.0))
         reason = str(self.telemetry.get("termination_reason") or "transition active")
-        self._text(f"LAST  r {reward:+.2f}  ·  {reason}", x, y,
-                   RED if reward < 0 else GREEN if reward > 0 else MUTED, self.tiny_font)
-        target_gap = max((abs(a - b) for a, b in zip(q_values, target_values)), default=0.0)
-        self._text(f"target gap {target_gap:.3f}", x + width - 104, y, MUTED, self.tiny_font)
+        self._text(
+            f"LAST  r {reward:+.2f}  ·  {reason}",
+            x,
+            y,
+            RED if reward < 0 else GREEN if reward > 0 else MUTED,
+            self.tiny_font,
+        )
+        target_gap = max(
+            (abs(a - b) for a, b in zip(q_values, target_values)), default=0.0
+        )
+        self._text(
+            f"target gap {target_gap:.3f}", x + width - 104, y, MUTED, self.tiny_font
+        )
         y += 21
 
         state = list(self.telemetry.get("state", [0] * 11))
         bits = "".join("1" if bool(value) else "0" for value in state)
         self._label("VISION  /  11 BINARY FEATURES", x, y)
-        self._text(f"{bits[:3]} · {bits[3:7]} · {bits[7:]}", x + width - 105, y, MUTED, self.micro_font)
+        self._text(
+            f"{bits[:3]} · {bits[3:7]} · {bits[7:]}",
+            x + width - 105,
+            y,
+            MUTED,
+            self.micro_font,
+        )
         y += 18
         for index, label in enumerate(VISION_LABELS):
             column = index // 6
@@ -451,7 +650,9 @@ class SnakeGameAI:
             bx = x + column * 184
             by = y + row * 17
             active = bool(state[index]) if index < len(state) else False
-            pygame.draw.circle(self.display, GREEN if active else GRID_HIGHLIGHT, (bx + 4, by + 6), 4)
+            pygame.draw.circle(
+                self.display, GREEN if active else GRID_HIGHLIGHT, (bx + 4, by + 6), 4
+            )
             self._text(label, bx + 13, by, WHITE if active else MUTED, self.micro_font)
         y += 108
 
@@ -476,7 +677,9 @@ class SnakeGameAI:
         memory = int(self.telemetry.get("memory", 0))
         capacity = max(1, int(self.telemetry.get("memory_capacity", 100_000)))
         self._label("REPLAY MEMORY", x, y)
-        self._text(f"{memory:,} / {capacity:,}", x + width - 97, y, WHITE, self.micro_font)
+        self._text(
+            f"{memory:,} / {capacity:,}", x + width - 97, y, WHITE, self.micro_font
+        )
         y += 16
         pygame.draw.rect(self.display, GRID, (x, y, width, 8), border_radius=4)
         fill = min(width, round(width * memory / capacity))
@@ -489,19 +692,51 @@ class SnakeGameAI:
         for index in range(24):
             value = recent_rewards[index] if index < len(recent_rewards) else None
             terminal = bool(recent_dones[index]) if index < len(recent_dones) else False
-            color = GRID_HIGHLIGHT if value is None else (GREEN if value > 0 else RED if value < 0 else BLUE2)
+            color = (
+                GRID_HIGHLIGHT
+                if value is None
+                else (GREEN if value > 0 else RED if value < 0 else BLUE2)
+            )
             if terminal:
                 color = YELLOW
-            pygame.draw.rect(self.display, color,
-                             (x + index * (slot_width + 1), y, slot_width, 7), border_radius=2)
+            pygame.draw.rect(
+                self.display,
+                color,
+                (x + index * (slot_width + 1), y, slot_width, 7),
+                border_radius=2,
+            )
         y += 14
 
         sync_progress = float(self.telemetry.get("target_sync_progress", 0.0))
-        self._text("ONLINE  11 → 512 → 256 → 3", x, y, WHITE, self.micro_font)
-        self._text(f"TARGET SYNC {sync_progress:5.1%}", x + width - 106, y, MUTED, self.micro_font)
+        structure = str(
+            self.telemetry.get("model_structure", "ONLINE  11 → 512 → 256 → 3")
+        )
+        self._text(structure, x, y, WHITE, self.micro_font)
+        if self.telemetry.get("algorithm_family", "deep") == "deep":
+            self._text(
+                f"SYNC {sync_progress:5.1%}",
+                x + width - 72,
+                y,
+                MUTED,
+                self.micro_font,
+            )
         y += 14
         pygame.draw.line(self.display, GRID_HIGHLIGHT, (x, y), (x + width, y), 1)
-        self._text("green +Q   orange −Q   yellow terminal memory", x, y + 6, MUTED, self.micro_font)
+        evaluation = dict(self.telemetry.get("evaluation", {}))
+        evaluation_episodes = int(evaluation.get("episodes", 0))
+        stage = str(self.telemetry.get("curriculum_stage", "orientation")).replace(
+            "_", " "
+        )
+        if evaluation_episodes:
+            evaluation_text = (
+                f"VALIDATION {float(evaluation.get('mean_score', 0.0)):.2f}"
+                f" ±{float(evaluation.get('std_score', 0.0)):.2f}  "
+                f"GAP {float(evaluation.get('generalization_gap', 0.0)):+.2f}"
+                f"  ·  {stage}"
+            )
+        else:
+            evaluation_text = f"VALIDATION pending  ·  curriculum {stage}"
+        self._text(evaluation_text, x, y + 6, MUTED, self.micro_font)
 
     def _chip(self, value: str, x: int, y: int, color) -> None:
         text = self.micro_font.render(value, True, color)
@@ -517,7 +752,11 @@ class SnakeGameAI:
 
     def _relative_directions(self):
         index = _CLOCKWISE.index(self.direction)
-        return _CLOCKWISE[index], _CLOCKWISE[(index + 1) % 4], _CLOCKWISE[(index - 1) % 4]
+        return (
+            _CLOCKWISE[index],
+            _CLOCKWISE[(index + 1) % 4],
+            _CLOCKWISE[(index - 1) % 4],
+        )
 
     @staticmethod
     def _direction_between(origin: Point, neighbour: Point) -> Direction:
@@ -525,11 +764,17 @@ class SnakeGameAI:
         try:
             return Direction((int(np.sign(delta[0])), int(np.sign(delta[1]))))
         except ValueError as error:
-            raise ValueError("snake segments must occupy adjacent grid cells") from error
+            raise ValueError(
+                "snake segments must occupy adjacent grid cells"
+            ) from error
 
     def _resolve_action(self, action: Sequence[int]):
         values = np.asarray(action)
-        if values.shape != (3,) or not np.isin(values, (0, 1)).all() or int(values.sum()) != 1:
+        if (
+            values.shape != (3,)
+            or not np.isin(values, (0, 1)).all()
+            or int(values.sum()) != 1
+        ):
             raise ValueError("action must be one-hot: [straight, right, left]")
         action_index = int(values.argmax())
         index = _CLOCKWISE.index(self.direction)
