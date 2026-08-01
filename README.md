@@ -3,7 +3,8 @@
 Playable arcade environments for watching reinforcement learning from the inside:
 
 - **Pacman** supports manual play plus real DQN and Double-DQN training with a four-tab live observatory.
-- **Snake** trains DQN or Double DQN while exposing its vision rays, action values, replay memory, reward, loss, and exploration schedule.
+- **Snake** compares six deep and tabular value-learning methods with held-out seed evaluation, curriculum randomization, and live generalization metrics.
+- **Driving Lab** is a deterministic top-down simulator with three circuits, terrain friction, upgradeable car parts, sensor rays, sprite rendering, and particles.
 
 ![Pacman Double-DQN observatory cycling through the game, vision, metrics, and neural-network views](assets/gifs/pacman-dqn-observatory.gif)
 
@@ -13,9 +14,13 @@ Playable arcade environments for watching reinforcement learning from the inside
 |---|---|
 | ![Pacman gameplay](assets/screenshots/pacman-gameplay.png) | ![Snake agent inspector](assets/screenshots/snake-observatory.png) |
 
+![Driving physics lab with circuit sensors, upgrade telemetry, and the sprite-based car](assets/screenshots/driving-lab.png)
+
+For the equations, reward contracts, seed-overfitting discussion, and a fair comparison protocol, see the [learning lab guide](docs/learning-lab.md).
+
 ## Quick start
 
-Python 3.10+ is recommended.
+Python 3.10+ is required.
 
 ```bash
 git clone git@github.com:Juskocode/LateNightDeepLearning.git
@@ -27,7 +32,10 @@ python -m pip install --upgrade pip
 python -m pip install -e .
 ```
 
-The editable install registers every package and launcher. After that one-time step, these commands work from any directory, including your home folder.
+The supported setup is the editable source install above. It registers every
+package and launcher while retaining the repository's built-in media and
+default model/checkpoint directories. After that one-time step, these commands
+work from any directory, including your home folder.
 
 ```bash
 # Play Pacman manually
@@ -41,9 +49,13 @@ python -m pacManRf.main --rl --algorithm double_dqn
 # Open the Snake Double-DQN trainer
 python -m snakeGameQDlearning.main --algorithm double_dqn
 # or: late-night-snake --algorithm double_dqn
+
+# Play the top-down driving lab
+python -m drivingGameRL.main --circuit harbor_loop
+# or: late-night-driving --circuit harbor_loop
 ```
 
-Use `--algorithm dqn` with either learner to run standard DQN instead.
+Pacman exposes DQN and Double DQN. Snake additionally exposes dueling variants, tabular Q-learning, and Expected SARSA.
 
 ## Pacman arcade mode
 
@@ -179,9 +191,9 @@ Pacman training defaults:
 
 Checkpoints are written atomically to `pacManRf/models/checkpoints/pacman_dqn_latest.pth` or `pacman_double_dqn_latest.pth`. Model, target network, optimizer, counters, random state, and metadata are restored. Replay remains memory-only by default; pass `--save-replay` to include it in the checkpoint or `--no-save` to leave the existing checkpoint untouched.
 
-## DQN versus Double DQN
+## Value-learning choices
 
-Both games use experience replay, a periodically synchronized target network, Huber loss, Adam-family optimization, and gradient clipping. The algorithms differ in how they value the next action.
+Pacman and Snake's deep learners use experience replay, a periodically synchronized target network, Huber loss, Adam-family optimization, and gradient clipping. The DQN target rules differ in how they value the next action.
 
 Standard DQN lets the target network both select and evaluate the best legal next action:
 
@@ -198,6 +210,8 @@ y = reward + gamma * Q_target(next_state, best_action)
 
 That separation reduces the optimistic value bias created by a single maximization estimate. For a controlled comparison, run both with `--fresh --seed N` and switch only `--algorithm dqn` / `--algorithm double_dqn`.
 
+Snake also supports dueling networks, which learn separate state-value and action-advantage streams, plus inspectable tabular Q-learning and online Expected SARSA. These are real interchangeable learning backends, not labels over one trainer. The [learning lab guide](docs/learning-lab.md) derives each target and explains when comparisons are valid.
+
 ```mermaid
 flowchart LR
     E["Pacman environment"] -->|32-value observation| P["Masked epsilon-greedy policy"]
@@ -210,7 +224,7 @@ flowchart LR
     M --> V
 ```
 
-## Snake RL observatory
+## Snake generalization lab
 
 The Snake policy receives an 11-value binary vector:
 
@@ -220,20 +234,49 @@ The Snake policy receives an 11-value binary vector:
  food left, food right, food up, food down]
 ```
 
-The first three values are drawn as rays around the snake's head. Red means the probed move collides; green means it is safe. The observation passes through:
+The first three values are drawn as rays around the snake's head. Red means the probed move collides; green means it is safe. Deep modes use an MLP or dueling MLP; tabular modes use the same 11 bits as a key among at most 2,048 observable states.
 
 ```text
-11 inputs  →  512 ReLU  →  256 ReLU  →  3 Q-values
+MLP:      11 inputs → 512 ReLU → 256 ReLU → 3 Q-values
+Dueling:  11 inputs → 512 ReLU → 256 ReLU → value + advantage → 3 Q-values
+Tabular:  11 bits   → Q table   → 3 action values
 ```
 
-Outputs estimate **straight**, **turn right**, and **turn left**. The board also shows the collision probes, dashed food vector, recent path visits, starvation budget, online action values, a target-network gap, exploration/exploitation mode, recent replay, and training metrics.
+Outputs estimate **straight**, **turn right**, and **turn left**. The board also shows the collision probes, dashed food vector, recent path visits, starvation budget, action values, replay state, curriculum stage, held-out mean and variance, and the live train–evaluation gap.
+
+| Algorithm | Representation | Update |
+|---|---|---|
+| `dqn` | MLP | Target-network maximum |
+| `double_dqn` | MLP | Online selection, target evaluation |
+| `dueling_dqn` | Value/advantage MLP | DQN target |
+| `dueling_double_dqn` | Value/advantage MLP | Double-DQN target |
+| `q_learning` | Q table | Off-policy greedy bootstrap |
+| `sarsa` | Q table | Online Expected SARSA; no replay |
+
+Training, validation, and final testing use three deterministic seed streams.
+Training episodes get new food layouts and increasingly varied valid starts.
+Every periodic validation reuses the same fixed suite, while a distinct
+final-test suite is reserved for one-time reporting. Evaluation does not train,
+consume exploration RNG, or write replay. Training score and mean improvements
+may still write checkpoints; once validation-backed checkpoints exist,
+best-model loading prefers validation mean instead of training record.
 
 ```bash
-# Headless training
-python -m snakeGameQDlearning.main --headless --games 100
+# Compare from identical train/evaluation roots
+python -m snakeGameQDlearning.main --algorithm dueling_double_dqn \
+  --headless --games 100 --fresh --no-save --seed 7 --evaluation-seed 9001
 
-# Start without loading the current best checkpoint
-python -m snakeGameQDlearning.main --fresh
+# Inspect a compact tabular environment
+python -m snakeGameQDlearning.main --algorithm q_learning --environment tutorial
+
+# Evaluate a compatible frozen checkpoint on 20 validation episodes
+python -m snakeGameQDlearning.main --algorithm double_dqn \
+  --eval-only --eval-episodes 20 --evaluation-seed 9001
+
+# Report once on a separate final-test suite (never used for selection)
+python -m snakeGameQDlearning.main --algorithm double_dqn \
+  --eval-only --eval-suite final_test --final-test-seed 12001 \
+  --final-test-episodes 20
 
 # Slow the renderer for inspection
 python -m snakeGameQDlearning.main --speed 30
@@ -242,16 +285,71 @@ python -m snakeGameQDlearning.main --speed 30
 python -m snakeGameQDlearning.main --plot
 ```
 
-Snake models and metadata are versioned under `snakeGameQDlearning/models/saved_models/`; a new version is saved when a score record is achieved.
+Educational board presets are `tutorial`, `compact`, `standard`, and `wide`.
+Use `--no-domain-randomization` for the classic fixed start, `--no-curriculum`
+for immediate full randomization, or `--eval-every 0` to disable periodic
+validation. Snake models and algorithm-tagged metadata are versioned under
+`snakeGameQDlearning/models/saved_models/`; each new checkpoint records its
+environment, experiment settings, validation round, and exact
+validation/final-test seed lists. With no explicit validation override,
+`--eval-only` reuses a compatible checkpoint's recorded validation suite.
+
+Snake checkpoints restore the learned network weights or Q table and episode
+metadata, but not optimizer state, replay contents, learner RNG state, or
+target-sync counters. Training continuation is therefore not bit-for-bit
+reproducible. Greedy evaluation remains reproducible because it needs only the
+frozen policy and recorded suite. `--no-save` guarantees comparison runs do not
+write checkpoints. See the dedicated [Snake guide](snakeGameQDlearning/README.md)
+for the full matrix.
+
+## 2D driving physics lab
+
+```bash
+# Drive manually
+python -m drivingGameRL.main --circuit harbor_loop
+
+# Deterministic upgraded-car autopilot without a window
+python -m drivingGameRL.main --headless --circuit pine_sprint --steps 1_000 \
+  --motor 2 --wheels 2 --suspension 2 --grip 2 --seed 11
+
+# Show every available circuit
+python -m drivingGameRL.main --list-circuits
+```
+
+| Input | Action |
+|---|---|
+| `WASD` or arrows | Throttle/reverse and steer |
+| `Space` | Brake |
+| `1` / `2` / `3` / `4` | Cycle motor, wheels, suspension, or grip level |
+| `C` | Cycle circuit |
+| `V` | Toggle five live sensor rays |
+| `R` | Reset the car and lap state |
+| `F12` | Save `driving-screenshot.png` |
+
+The three circuits are Harbor Loop, Pine Sprint, and Desert Switchback. Asphalt, wet asphalt, gravel, grass, and mud have distinct grip, rolling resistance, and engine-efficiency coefficients. Road sectors use the subtle wet/gravel differences; larger grass, mud, or gravel penalties apply after leaving the road.
+
+Each component has levels 0–5 and changes actual physics:
+
+| Component | Improves |
+|---|---|
+| Motor | Acceleration and maximum speed |
+| Wheels | Steering angle and steering response |
+| Suspension | Yaw response and lateral recovery |
+| Grip | Tire grip, cornering authority, and lateral recovery |
+
+The reusable `DrivingEnv` returns 12 normalized observations: speed, longitudinal/lateral velocity, heading error, track offset, terrain grip, lap progress, and five barrier rays. Its five discrete actions are coast, accelerate, brake, steer left, and steer right; continuous `DriverControls` power manual play. The renderer uses an alpha-cropped car-body asset with procedural wheel/suspension layers and a code-only fallback. Seeded, bounded particles visualize gravel/mud spray, tire slip, braking, and barrier impacts without affecting physics.
 
 ## CLI reference
 
 ```bash
 python -m pacManRf.main --help
 python -m snakeGameQDlearning.main --help
+python -m drivingGameRL.main --help
 ```
 
-Built-in assets and default model/checkpoint locations are resolved from the repository; user-supplied output and custom checkpoint paths are resolved from the current directory.
+In the editable source install, built-in assets and default model/checkpoint
+locations are resolved from the repository checkout. User-supplied output and
+custom checkpoint paths are resolved from the current directory.
 
 ## Project layout
 
@@ -279,6 +377,11 @@ LateNightDeepLearning/
 │       ├── game/
 │       ├── ml/
 │       └── utils/
+├── drivingGameRL/
+│   ├── main.py                 # Play, headless simulation, screenshot CLI
+│   └── src/                    # Circuits, terrain, physics, sprites, HUD, env
+├── docs/
+│   └── learning-lab.md         # Algorithms, equations, experiment protocol
 ├── late_night_deep_learning/   # Portable project test launcher
 └── tests/
 ```
@@ -294,7 +397,7 @@ late-night-tests -v
 
 `python -m unittest discover -v` also works from the repository root. Standard discovery searches the current directory, so running it from `~` correctly finds zero project tests.
 
-Coverage includes every concave and diagonal maze contour, score-preserving level transitions, gradual difficulty scaling, seeded weapon unlocks, projectile range/cooldown/collision rules, freeze and fire effects, projectile-aware 32-value observations, deterministic RL transitions, legal-action target masking, DQN versus Double-DQN bootstrap behavior, bounded/serializable replay, checkpoint round trips, real network telemetry, all observatory tabs, animated GIF output, Snake edge cases, renderer smoke tests, and finite learning updates.
+Coverage includes Pacman contour/combat/level/RL behavior; Snake algorithms, dueling heads, tabular updates, held-out evaluation, seed streams, curricula, checkpoint compatibility, and environment edge cases; and driving circuits, terrain, component effects, collisions, finite stress simulation, sprite fallback, bounded particles, screenshots, and renderer smoke tests.
 
 Regenerate documentation media from the real renderers:
 
@@ -307,14 +410,20 @@ python -m pacManRf.main \
   --gif assets/gifs/pacman-dqn-observatory.gif
 
 python -m snakeGameQDlearning.main \
-  --algorithm double_dqn --fresh \
+  --algorithm dueling_double_dqn --fresh --no-save --seed 1 \
+  --eval-episodes 4 \
   --screenshot assets/screenshots/snake-observatory.png
+
+python -m drivingGameRL.main \
+  --circuit pine_sprint --motor 2 --wheels 2 --suspension 2 --grip 2 \
+  --seed 11 --steps 720 --screenshot assets/screenshots/driving-lab.png
 ```
 
 ## Design notes
 
 - Game state, learning logic, rendering, sprites, replay storage, and observability have separate responsibilities.
-- Both environments accept seeds; Pacman decisions are also fixed-step and deterministic for testing.
-- Headless and visual training use the same environment, replay, policy, and optimizer paths.
+- All three environments accept seeds; Pacman decisions and driving physics are fixed-step and deterministic for testing.
+- Headless and visual runs use the same environment and selected learning backend. Neural modes also share replay and optimizer paths; Expected SARSA intentionally skips replay-based updates.
 - Neural-network visuals are generated from current parameters and activations; missing telemetry renders an explicit empty state instead of invented values.
+- Driving physics is independent of Pygame; rendering, generated body art, procedural upgrade layers, and particles are presentation-only.
 - Runtime checkpoints and generated training models are ignored by Git.
