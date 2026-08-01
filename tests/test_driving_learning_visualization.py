@@ -10,10 +10,12 @@ import pygame
 
 from drivingGameRL.src.environment import DrivingAction, DrivingEnv
 from drivingGameRL.src.learning_visualization import (
+    CAR_ROTATION_STEP_DEGREES,
     COLORS,
     DrivingLearningVisualization,
     LEARNING_WINDOW_SIZE,
     POPULATION_CAR_COLORS,
+    TEXT_SURFACE_CACHE_LIMIT,
 )
 from drivingGameRL.src.rendering import TRACK_VIEW_WIDTH, WINDOW_HEIGHT as TRACK_HEIGHT
 
@@ -422,6 +424,52 @@ class DrivingLearningVisualizationTests(unittest.TestCase):
         self.assertEqual(len(rays), 5)
         for ray in rays:
             self.assertEqual(ray["origin"], explicit_pose["position"])
+
+    def test_exact_sensor_api_takes_precedence_over_observation_fallback(self):
+        expected = self.env.sensor_rays()
+        observation = list(self.env.observation())
+        observation[-5:] = [0.0] * 5
+        telemetry = {
+            **self.telemetry,
+            "observation": observation,
+            "show_sensor_rays": True,
+            "show_population_cars": False,
+        }
+
+        rays = self.visualization._environment_rays(self.env, observation=observation)
+        self.visualization.draw(telemetry=telemetry)
+
+        self.assertEqual(len(rays), len(expected))
+        for rendered, snapshot in zip(rays, expected):
+            self.assertAlmostEqual(
+                rendered["normalized_distance"], snapshot.normalized_distance
+            )
+            self.assertAlmostEqual(rendered["endpoint"][0], snapshot.endpoint.x)
+            self.assertAlmostEqual(rendered["endpoint"][1], snapshot.endpoint.y)
+
+    def test_dynamic_visual_caches_are_reused_and_bounded(self):
+        size = (180, 120)
+        first_layer = self.visualization._ray_layer(size)
+        pygame.draw.circle(first_layer, (255, 255, 255, 255), (12, 12), 3)
+        second_layer = self.visualization._ray_layer(size)
+        self.assertIs(second_layer, first_layer)
+        self.assertEqual(second_layer.get_at((12, 12)).a, 0)
+
+        for index in range(TEXT_SURFACE_CACHE_LIMIT + 30):
+            self.visualization._render_text(
+                f"frame {index}", size=10, color=COLORS["text"]
+            )
+        self.assertEqual(
+            len(self.visualization._text_surfaces), TEXT_SURFACE_CACHE_LIMIT
+        )
+
+        color = POPULATION_CAR_COLORS[0]
+        for degrees in range(360):
+            self.visualization._draw_car((40, 40), math.radians(degrees), color)
+        variants = [key for key in self.visualization._car_rotations if key[0] == color]
+        self.assertLessEqual(
+            len(variants), math.ceil(360 / CAR_ROTATION_STEP_DEGREES) + 1
+        )
 
     def test_race_sensor_toggle_draws_both_ray_fans_without_moving_either_env(self):
         champion = DrivingEnv("canyon_maze", seed=22)

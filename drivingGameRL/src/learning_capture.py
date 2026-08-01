@@ -71,6 +71,7 @@ def capture_learning_gif(
     palette_colors: int = 96,
     show_sensor_rays: bool = True,
     show_population_cars: bool = False,
+    population_car_limit: int = 8,
 ) -> Path:
     """Capture training observatory tabs followed by a champion race.
 
@@ -116,6 +117,12 @@ def capture_learning_gif(
         minimum=16,
         maximum=256,
     )
+    population_car_limit = _bounded_integer(
+        "population_car_limit",
+        population_car_limit,
+        minimum=1,
+        maximum=PopulationRolloutManager.HARD_MAX_CARS,
+    )
 
     output = Path(path).expanduser().resolve()
     if output.suffix.lower() != ".gif":
@@ -126,7 +133,7 @@ def capture_learning_gif(
     # sufficient for both local use and SDL's dummy video driver in CI.
     pygame.font.init()
     visualization = DrivingLearningVisualization(session.env, session.telemetry())
-    rollouts = PopulationRolloutManager(session)
+    rollouts = PopulationRolloutManager(session, max_cars=population_car_limit)
     images: list[Image.Image] = []
 
     for tab in TRAINING_TABS:
@@ -142,6 +149,7 @@ def capture_learning_gif(
                 {
                     "show_sensor_rays": bool(show_sensor_rays),
                     "show_population_cars": bool(show_population_cars),
+                    "population_car_limit": population_car_limit,
                     "population_rollouts": (
                         rollouts.telemetry(include_rays=show_sensor_rays)
                         if show_population_cars

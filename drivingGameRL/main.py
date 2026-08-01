@@ -141,6 +141,14 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Start with isolated same-generation rollout cars visible",
     )
+    learning.add_argument(
+        "--preview-cars",
+        "--population-preview-cars",
+        type=int,
+        choices=(2, 4, 8, 12),
+        default=8,
+        help="Maximum live comparison cars; C cycles 2, 4, 8, and 12",
+    )
     return parser
 
 
@@ -189,6 +197,7 @@ def _run_learning(args: argparse.Namespace, parser: argparse.ArgumentParser) -> 
         checkpoint_path=args.checkpoint,
         show_sensor_rays=not args.no_sensors,
         show_population_cars=args.population_cars,
+        population_car_limit=args.preview_cars,
     )
     try:
         steps = args.steps
@@ -217,6 +226,7 @@ def _run_learning(args: argparse.Namespace, parser: argparse.ArgumentParser) -> 
                 race_frames=12,
                 show_sensor_rays=not args.no_sensors,
                 show_population_cars=args.population_cars,
+                population_car_limit=args.preview_cars,
             )
             print(f"Learning GIF saved to {output.resolve()}")
         if args.checkpoint and not args.no_save:

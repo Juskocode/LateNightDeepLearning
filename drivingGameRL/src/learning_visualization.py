@@ -7,6 +7,7 @@ Double-DQN, and population-based variants without coupling it to one trainer.
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from collections.abc import Mapping, Sequence
 import math
 from pathlib import Path
@@ -34,6 +35,8 @@ SENSOR_ANGLE_OFFSETS = (
     math.pi / 2,
 )
 MAX_POPULATION_CARS = 12
+CAR_ROTATION_STEP_DEGREES = 6
+TEXT_SURFACE_CACHE_LIMIT = 512
 
 # Deliberately fixed rather than generated from fitness or list order.  A member
 # keeps the same identity color while rankings and positions change.
@@ -174,8 +177,12 @@ class DrivingLearningVisualization:
         self.active_tab = self.TABS[0]
         self.return_to_training_requested = False
         self._fonts: dict[tuple[int, bool], pygame.font.Font] = {}
+        self._text_surfaces: OrderedDict[
+            tuple[str, int, bool, tuple[int, int, int]], pygame.Surface
+        ] = OrderedDict()
         self._track_renderer = CircuitRenderer()
         self._scaled_tracks: dict[tuple[str, int, int], pygame.Surface] = {}
+        self._ray_layers: dict[tuple[int, int], pygame.Surface] = {}
         self._car_bodies: dict[tuple[int, int, int], pygame.Surface] = {}
         self._car_rotations: dict[tuple[tuple[int, int, int], int], pygame.Surface] = {}
         self.tab_rects: dict[str, pygame.Rect] = {
@@ -204,8 +211,27 @@ class DrivingLearningVisualization:
         target: pygame.Surface | None = None,
     ) -> pygame.Rect:
         destination = target or self.surface
-        rendered = self._font(size, bold).render(str(text), True, color)
+        rendered = self._render_text(text, size=size, color=color, bold=bold)
         return destination.blit(rendered, position)
+
+    def _render_text(
+        self,
+        text: object,
+        *,
+        size: int,
+        color: tuple[int, int, int],
+        bold: bool = False,
+    ) -> pygame.Surface:
+        """Render text through a bounded LRU shared by every dashboard panel."""
+
+        key = (str(text), size, bold, color)
+        rendered = self._text_surfaces.pop(key, None)
+        if rendered is None:
+            rendered = self._font(size, bold).render(key[0], True, color)
+            if len(self._text_surfaces) >= TEXT_SURFACE_CACHE_LIMIT:
+                self._text_surfaces.popitem(last=False)
+        self._text_surfaces[key] = rendered
+        return rendered
 
     def _right_text(
         self,
@@ -217,7 +243,7 @@ class DrivingLearningVisualization:
         color: tuple[int, int, int] = COLORS["text"],
         bold: bool = False,
     ) -> pygame.Rect:
-        rendered = self._font(size, bold).render(str(text), True, color)
+        rendered = self._render_text(text, size=size, color=color, bold=bold)
         return self.surface.blit(rendered, (right - rendered.get_width(), y))
 
     def _fit_text(self, text: object, width: int, size: int, bold: bool = False) -> str:
@@ -263,11 +289,15 @@ class DrivingLearningVisualization:
     def _combined_telemetry(
         self, env: DrivingEnv, supplied: Mapping[str, Any] | None
     ) -> dict[str, Any]:
-        try:
-            combined: dict[str, Any] = dict(env.telemetry())
-        except (AttributeError, TypeError, ValueError):
-            combined = {}
         source = _mapping(self.telemetry if supplied is None else supplied)
+        environment_snapshot = _mapping(source.get("environment"))
+        if environment_snapshot:
+            combined: dict[str, Any] = dict(environment_snapshot)
+        else:
+            try:
+                combined = dict(env.telemetry())
+            except (AttributeError, TypeError, ValueError):
+                combined = {}
         # Common containers are flattened for algorithms that keep environment,
         # learner, and evolutionary statistics in separate dictionaries.
         for name in ("environment", "env", "agent", "learning", "metrics"):
@@ -349,10 +379,29 @@ class DrivingLearningVisualization:
         speed = str(data.get("training_speed_label", "16x")).upper()
         ray_state = "ON" if _flag(data.get("show_sensor_rays")) else "OFF"
         cars_state = "ON" if _flag(data.get("show_population_cars")) else "OFF"
+        car_limit = max(1, _integer(data.get("population_car_limit", 8), 8))
+        requested_steps = max(
+            1,
+            _integer(
+                data.get(
+                    "requested_training_steps_per_frame",
+                    data.get("training_speed"),
+                ),
+                1,
+            ),
+        )
+        frame_steps = max(0, _integer(data.get("frame_training_steps"), 0))
+        if (
+            _flag(data.get("training_slice_capped"))
+            and 0 < frame_steps < requested_steps
+        ):
+            speed = f"{speed}:{frame_steps}/F"
+        fps = _finite(data.get("render_fps"))
+        fps_hint = f"  ·  {fps:.0f} FPS" if fps >= 1.0 else ""
         self._right_text(
             (
-                f"P RACE  ·  V RAYS {ray_state}  ·  "
-                f"M GEN CARS {cars_state}  ·  [ ] {speed}"
+                f"P RACE  ·  V RAYS {ray_state}  ·  M CARS {cars_state}  ·  "
+                f"C {car_limit}  ·  [ ] {speed}{fps_hint}"
             ),
             778,
             46,
@@ -376,8 +425,11 @@ class DrivingLearningVisualization:
                 border_radius=8,
             )
             label = f"{self.TABS.index(name) + 1}  {name}"
-            label_surface = self._font(13, True).render(
-                label, True, COLORS["background"] if selected else COLORS["text"]
+            label_surface = self._render_text(
+                label,
+                size=13,
+                bold=True,
+                color=COLORS["background"] if selected else COLORS["text"],
             )
             self.surface.blit(label_surface, label_surface.get_rect(center=rect.center))
         phase = str(
@@ -431,7 +483,10 @@ class DrivingLearningVisualization:
         *,
         label: str | None = None,
     ) -> None:
-        angle = round((-math.degrees(heading) - 90.0) / 3.0) * 3
+        angle = (
+            round((-math.degrees(heading) - 90.0) / CAR_ROTATION_STEP_DEGREES)
+            * CAR_ROTATION_STEP_DEGREES
+        )
         key = (color, angle)
         image = self._car_rotations.get(key)
         if image is None:
@@ -440,7 +495,7 @@ class DrivingLearningVisualization:
         pygame.draw.circle(self.surface, (*color,), center, 18, 2)
         self.surface.blit(image, image.get_rect(center=center))
         if label:
-            text = self._font(10, True).render(label, True, color)
+            text = self._render_text(label, size=10, color=color, bold=True)
             box = text.get_rect(midbottom=(center[0], center[1] - 22))
             backdrop = box.inflate(8, 4)
             pygame.draw.rect(
@@ -531,7 +586,10 @@ class DrivingLearningVisualization:
         return rays
 
     def _environment_rays(
-        self, env: DrivingEnv, explicit_pose: object = None
+        self,
+        env: DrivingEnv,
+        explicit_pose: object = None,
+        observation: object = None,
     ) -> list[dict[str, Any]]:
         """Read the environment's exact ray snapshots, with a legacy fallback."""
 
@@ -551,13 +609,22 @@ class DrivingLearningVisualization:
             except (AttributeError, TypeError, ValueError):
                 pass
 
+        observation_values = _sequence(observation)
+        readings = (
+            [_finite(value) for value in observation_values[-SENSOR_RAY_COUNT:]]
+            if len(observation_values) >= SENSOR_RAY_COUNT
+            else []
+        )
         # Older environments expose only the normalized observation values.
         # Rebuilding endpoints from the same fixed angles remains read-only and
         # keeps this dashboard compatible while SensorRay rolls out.
-        try:
-            readings = [_finite(value) for value in env.observation()[-5:]]
-        except (AttributeError, TypeError, ValueError):
-            readings = []
+        if not readings:
+            try:
+                readings = [
+                    _finite(value) for value in env.observation()[-SENSOR_RAY_COUNT:]
+                ]
+            except (AttributeError, TypeError, ValueError):
+                readings = []
         if len(readings) != SENSOR_RAY_COUNT:
             return []
         x, y, heading = requested_pose
@@ -693,6 +760,17 @@ class DrivingLearningVisualization:
             ):
                 pygame.draw.circle(layer, (*ray_color, min(255, alpha + 55)), end, 3)
 
+    def _ray_layer(self, size: tuple[int, int]) -> pygame.Surface:
+        """Return a cleared reusable alpha layer for one track viewport."""
+
+        layer = self._ray_layers.get(size)
+        if layer is None:
+            layer = pygame.Surface(size, pygame.SRCALPHA)
+            self._ray_layers[size] = layer
+        else:
+            layer.fill((0, 0, 0, 0))
+        return layer
+
     def _draw_track(
         self,
         rect: pygame.Rect,
@@ -718,7 +796,7 @@ class DrivingLearningVisualization:
             else []
         )
         if _flag(data.get("show_sensor_rays")):
-            ray_layer = pygame.Surface(viewport.size, pygame.SRCALPHA)
+            ray_layer = self._ray_layer(viewport.size)
             if ray_sources:
                 for source, source_env, pose, color in ray_sources:
                     rays = self._coerce_rays(source)
@@ -731,7 +809,10 @@ class DrivingLearningVisualization:
                 self._draw_ray_set(
                     ray_layer,
                     viewport,
-                    self._environment_rays(env),
+                    self._environment_rays(
+                        env,
+                        observation=data.get("observation", data.get("observations")),
+                    ),
                     alpha=165,
                     width=2,
                 )
@@ -757,17 +838,21 @@ class DrivingLearningVisualization:
                 round(viewport.y + y * scale_y),
             )
             self._draw_car(center, heading, color, label=label)
-        try:
-            snapshot = env.telemetry()
-        except (AttributeError, TypeError, ValueError):
-            snapshot = {}
+        snapshot = data
+        if not any(key in snapshot for key in ("terrain", "speed", "laps")):
+            try:
+                snapshot = env.telemetry()
+            except (AttributeError, TypeError, ValueError):
+                snapshot = {}
         terrain = str(snapshot.get("terrain", "unknown")).replace("_", " ").upper()
         footer = (
             f"{env.circuit.name.upper()}   ·   {terrain}   ·   "
             f"{_finite(snapshot.get('speed')):05.1f} U/S   ·   "
             f"LAP {_integer(snapshot.get('laps')) + 1}"
         )
-        label_surface = self._font(11, True).render(footer, True, COLORS["text"])
+        label_surface = self._render_text(
+            footer, size=11, color=COLORS["text"], bold=True
+        )
         label_rect = label_surface.get_rect(
             bottomleft=(viewport.x + 10, viewport.bottom - 9)
         )
@@ -1380,7 +1465,7 @@ class DrivingLearningVisualization:
                 label = ""
                 if layer_index == 0 and source_index < len(observations):
                     label = observations[source_index][0]
-                    text = self._font(7).render(label[:14], True, COLORS["muted"])
+                    text = self._render_text(label[:14], size=7, color=COLORS["muted"])
                     self.surface.blit(text, (x - 14 - text.get_width(), y - 4))
                 elif layer_index == len(layers) - 1 and source_index < len(q_values):
                     label = q_values[source_index][0]
@@ -1417,7 +1502,9 @@ class DrivingLearningVisualization:
         )
         if not streamed_weights:
             message = "Architecture available · waiting for live connection weights"
-            text = self._font(10, True).render(message, True, COLORS["yellow"])
+            text = self._render_text(
+                message, size=10, color=COLORS["yellow"], bold=True
+            )
             box = text.get_rect(midtop=(rect.centerx, rect.y + 35))
             self.surface.blit(text, box)
 

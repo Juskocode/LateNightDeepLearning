@@ -108,6 +108,44 @@ class PopulationRolloutManagerTests(unittest.TestCase):
             )
         )
 
+    def test_refresh_reuses_isolated_policy_shells_and_restores_live_weights(self):
+        session = _tiny_session()
+        manager = PopulationRolloutManager(session)
+        original_agents = tuple(rollout.agent for rollout in manager._rollouts)
+        source_agents = tuple(
+            member.agent for member in session._population_trainer.population
+        )
+
+        with torch.no_grad():
+            next(original_agents[0].online_network.parameters()).add_(10.0)
+        manager.refresh(force=True)
+
+        refreshed_agents = tuple(rollout.agent for rollout in manager._rollouts)
+        self.assertEqual(
+            tuple(id(agent) for agent in refreshed_agents),
+            tuple(id(agent) for agent in original_agents),
+        )
+        for clone, source in zip(refreshed_agents, source_agents):
+            for clone_parameter, source_parameter in zip(
+                clone.online_network.parameters(),
+                source.online_network.parameters(),
+            ):
+                self.assertTrue(torch.equal(clone_parameter, source_parameter))
+                self.assertNotEqual(
+                    clone_parameter.untyped_storage().data_ptr(),
+                    source_parameter.untyped_storage().data_ptr(),
+                )
+
+    def test_training_owned_agents_cannot_be_reused_as_policy_clones(self):
+        session = _tiny_session()
+        training_agent = session._population_trainer.population[-1].agent
+
+        with self.assertRaisesRegex(ValueError, "training-owned"):
+            session.population_policy_clones(
+                max_cars=2,
+                reusable_policy_clones=(training_agent,),
+            )
+
     def test_sensor_rays_are_the_real_observation_distances(self):
         manager = PopulationRolloutManager(_tiny_session())
         manager.step(3)

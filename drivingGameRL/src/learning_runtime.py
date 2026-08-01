@@ -11,7 +11,7 @@ from collections import deque
 from dataclasses import dataclass, replace
 import math
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Sequence
 
 import numpy as np
 
@@ -180,32 +180,70 @@ class DrivingLearningSession:
         return int(self.generation)
 
     def population_policy_clones(
-        self, *, max_cars: int = 12
+        self,
+        *,
+        max_cars: int = 12,
+        reusable_policy_clones: Sequence[DrivingDQNAgent] = (),
     ) -> tuple[tuple[int, DrivingDQNAgent], ...]:
         """Return bounded, isolated policies for presentation-only rollouts.
 
         No caller receives a training-owned agent, which prevents a renderer or
         comparison view from changing replay, optimizer, fitness, or selection.
+        Existing presentation-owned clones can be supplied when a generation
+        changes. Compatible networks are updated in place, avoiding repeated
+        optimizer and replay-buffer allocation while retaining independent
+        parameter storage.
         """
 
         if isinstance(max_cars, bool) or not isinstance(max_cars, int):
             raise ValueError("max_cars must be an integer")
         if max_cars <= 0:
             raise ValueError("max_cars must be positive")
+        reusable = tuple(reusable_policy_clones)
+        if any(not isinstance(agent, DrivingDQNAgent) for agent in reusable):
+            raise TypeError(
+                "reusable_policy_clones must contain DrivingDQNAgent instances"
+            )
         if self.is_population:
-            sources = (
+            training_agents = tuple(
+                member.agent for member in self._population_trainer.population
+            )
+            sources = tuple(
                 (member.member_id, member.agent)
                 for member in self._population_trainer.population[:max_cars]
             )
         else:
+            training_agents = (self.agent,)
             sources = ((0, self.agent),)
-        return tuple(
-            (
-                int(member_id),
-                agent.clone(seed=agent.config.seed, include_optimizer=False),
+        training_agent_ids = {id(agent) for agent in training_agents}
+        if any(id(agent) in training_agent_ids for agent in reusable):
+            raise ValueError(
+                "reusable_policy_clones cannot contain training-owned agents"
             )
-            for member_id, agent in sources
-        )
+
+        clones: list[tuple[int, DrivingDQNAgent]] = []
+        for index, (member_id, source) in enumerate(sources):
+            clone = reusable[index] if index < len(reusable) else None
+            compatible = (
+                clone is not None
+                and clone.online_network.architecture
+                == source.online_network.architecture
+            )
+            if compatible:
+                # ``load_state_dict`` copies tensor values into the already
+                # independent storage; no tensor or optimizer is shared with
+                # the population trainer.
+                source_weights = source.online_network.state_dict()
+                clone.online_network.load_state_dict(source_weights)
+                clone.target_network.load_state_dict(source_weights)
+                clone.target_network.eval()
+            else:
+                clone = source.clone(
+                    seed=source.config.seed,
+                    include_optimizer=False,
+                )
+            clones.append((int(member_id), clone))
+        return tuple(clones)
 
     def step(self) -> Any:
         """Advance exactly one deterministic environment step."""

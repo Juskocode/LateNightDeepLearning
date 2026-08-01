@@ -21,6 +21,70 @@ from drivingGameRL.src.vehicle import CarBuild, DriverControls, Vehicle
 
 
 class DrivingPhysicsTests(unittest.TestCase):
+    def test_cached_projection_geometry_matches_reference_algorithm(self):
+        def reference(circuit, position):
+            lengths = tuple(
+                (
+                    circuit.points[(index + 1) % len(circuit.points)] - point
+                ).length()
+                for index, point in enumerate(circuit.points)
+            )
+            total = sum(lengths)
+            best = None
+            traversed = 0.0
+            for index, start in enumerate(circuit.points):
+                end = circuit.points[(index + 1) % len(circuit.points)]
+                segment = end - start
+                length_squared = segment.length_squared()
+                along = max(
+                    0.0,
+                    min(
+                        1.0,
+                        (position - start).dot(segment) / length_squared,
+                    ),
+                )
+                nearest = start + segment * along
+                delta = position - nearest
+                distance_squared = delta.length_squared()
+                tangent = segment.normalized()
+                if best is None or distance_squared < best[0]:
+                    best = (
+                        distance_squared,
+                        nearest,
+                        tangent,
+                        traversed + along * lengths[index],
+                        index,
+                        tangent.perpendicular().dot(delta),
+                    )
+                traversed += lengths[index]
+            distance_squared, point, tangent, distance, index, signed = best
+            return (
+                point,
+                tangent,
+                math.sqrt(distance_squared),
+                signed,
+                (distance / total) % 1.0,
+                index,
+            )
+
+        sample_points = (
+            Vec2(0.0, 0.0),
+            Vec2(400.0, 350.0),
+            Vec2(799.0, 699.0),
+            Vec2(123.25, 456.75),
+        )
+        for circuit in all_circuits():
+            self.assertIs(circuit.segment_lengths, circuit.segment_lengths)
+            for position in (*sample_points, *circuit.points):
+                expected = reference(circuit, position)
+                actual = circuit.project(position)
+                self.assertEqual(actual.point, expected[0])
+                self.assertEqual(actual.tangent, expected[1])
+                self.assertEqual(actual.segment_index, expected[5])
+                self.assertAlmostEqual(actual.distance, expected[2], places=12)
+                self.assertAlmostEqual(actual.signed_offset, expected[3], places=12)
+                self.assertAlmostEqual(actual.progress, expected[4], places=12)
+
     def test_circuit_registry_is_deterministic_and_contains_complex_tracks(self):
         self.assertEqual(circuit_names(), circuit_names())
         self.assertGreaterEqual(len(all_circuits()), 5)

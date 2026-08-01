@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import math
 
 from .math2d import Vec2, clamp
@@ -65,6 +65,13 @@ class Circuit:
     runoff: TerrainKind
     sectors: tuple[SurfaceSector, ...] = ()
     description: str = ""
+    _segment_lengths: tuple[float, ...] = field(
+        init=False, repr=False, compare=False
+    )
+    _projection_segments: tuple[
+        tuple[Vec2, Vec2, float, Vec2, float], ...
+    ] = field(init=False, repr=False, compare=False)
+    _total_length: float = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if len(self.points) < 3:
@@ -80,8 +87,30 @@ class Circuit:
             for value in (point.x, point.y)
         ):
             raise ValueError("Circuit points must be finite")
-        if any(length <= 1e-9 for length in self.segment_lengths):
+        lengths = tuple(
+            (self.points[(index + 1) % len(self.points)] - point).length()
+            for index, point in enumerate(self.points)
+        )
+        if any(length <= 1e-9 for length in lengths):
             raise ValueError("Consecutive circuit points must be distinct")
+        traversed = 0.0
+        projection_segments = []
+        for index, start in enumerate(self.points):
+            segment = self.points[(index + 1) % len(self.points)] - start
+            length = lengths[index]
+            projection_segments.append(
+                (
+                    start,
+                    segment,
+                    segment.length_squared(),
+                    segment / length,
+                    traversed,
+                )
+            )
+            traversed += length
+        object.__setattr__(self, "_segment_lengths", lengths)
+        object.__setattr__(self, "_projection_segments", tuple(projection_segments))
+        object.__setattr__(self, "_total_length", traversed)
         if not isinstance(self.runoff, TerrainKind):
             raise ValueError("Circuit runoff must be a TerrainKind")
         if any(not isinstance(sector, SurfaceSector) for sector in self.sectors):
@@ -97,14 +126,11 @@ class Circuit:
 
     @property
     def segment_lengths(self) -> tuple[float, ...]:
-        return tuple(
-            (self.points[(index + 1) % len(self.points)] - point).length()
-            for index, point in enumerate(self.points)
-        )
+        return self._segment_lengths
 
     @property
     def length(self) -> float:
-        return sum(self.segment_lengths)
+        return self._total_length
 
     @property
     def collision_radius(self) -> float:
@@ -113,44 +139,55 @@ class Circuit:
     def project(self, position: Vec2) -> TrackProjection:
         if not all(math.isfinite(value) for value in (position.x, position.y)):
             raise ValueError("Projected position must be finite")
-        lengths = self.segment_lengths
-        total = sum(lengths)
-        best: tuple[float, Vec2, Vec2, float, int, float] | None = None
-        traversed = 0.0
+        best: tuple[float, float, float, Vec2, float, int, float] | None = None
+        position_x, position_y = position.x, position.y
 
-        for index, start in enumerate(self.points):
-            end = self.points[(index + 1) % len(self.points)]
-            segment = end - start
-            length_squared = segment.length_squared()
+        for index, (start, segment, length_squared, tangent, traversed) in enumerate(
+            self._projection_segments
+        ):
             along = 0.0
             if length_squared > 1e-12:
                 along = clamp(
-                    (position - start).dot(segment) / length_squared, 0.0, 1.0
+                    (
+                        (position_x - start.x) * segment.x
+                        + (position_y - start.y) * segment.y
+                    )
+                    / length_squared,
+                    0.0,
+                    1.0,
                 )
-            nearest = start + segment * along
-            delta = position - nearest
-            distance_squared = delta.length_squared()
-            tangent = segment.normalized()
+            nearest_x = start.x + segment.x * along
+            nearest_y = start.y + segment.y * along
+            delta_x = position_x - nearest_x
+            delta_y = position_y - nearest_y
+            distance_squared = delta_x * delta_x + delta_y * delta_y
             if best is None or distance_squared < best[0]:
-                progress_distance = traversed + along * lengths[index]
                 best = (
                     distance_squared,
-                    nearest,
+                    nearest_x,
+                    nearest_y,
                     tangent,
-                    progress_distance,
+                    traversed + along * self._segment_lengths[index],
                     index,
-                    tangent.perpendicular().dot(delta),
+                    -tangent.y * delta_x + tangent.x * delta_y,
                 )
-            traversed += lengths[index]
 
         assert best is not None
-        distance_squared, point, tangent, progress_distance, index, signed = best
+        (
+            distance_squared,
+            nearest_x,
+            nearest_y,
+            tangent,
+            progress_distance,
+            index,
+            signed,
+        ) = best
         return TrackProjection(
-            point=point,
+            point=Vec2(nearest_x, nearest_y),
             tangent=tangent,
             distance=math.sqrt(distance_squared),
             signed_offset=signed,
-            progress=(progress_distance / total) % 1.0,
+            progress=(progress_distance / self._total_length) % 1.0,
             segment_index=index,
         )
 
@@ -168,24 +205,22 @@ class Circuit:
 
     def start_pose(self) -> tuple[Vec2, float]:
         start = self.points[0]
-        tangent = (self.points[1] - start).normalized()
+        tangent = self._projection_segments[0][3]
         heading = math.atan2(tangent.y, tangent.x)
         return start, heading
 
     def point_tangent_at(self, progress: float) -> tuple[Vec2, Vec2]:
         """Interpolate the center line at normalized lap *progress*."""
 
-        target = (progress % 1.0) * self.length
-        for index, segment_length in enumerate(self.segment_lengths):
+        target = (progress % 1.0) * self._total_length
+        for index, segment_length in enumerate(self._segment_lengths):
             if target <= segment_length:
-                start = self.points[index]
-                end = self.points[(index + 1) % len(self.points)]
-                tangent = (end - start).normalized()
+                start, segment, _, tangent, _ = self._projection_segments[index]
                 fraction = 0.0 if segment_length <= 1e-12 else target / segment_length
-                return start + (end - start) * fraction, tangent
+                return start + segment * fraction, tangent
             target -= segment_length
         start = self.points[0]
-        return start, (self.points[1] - start).normalized()
+        return start, self._projection_segments[0][3]
 
 
 _CIRCUITS = {

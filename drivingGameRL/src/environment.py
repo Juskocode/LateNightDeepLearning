@@ -152,6 +152,12 @@ class DrivingEnv:
         self.previous_progress = 0.0
         self.last_projection: TrackProjection | None = None
         self.last_reward_terms: dict[str, float] = {}
+        # Observation, telemetry, and rendering often request the same rays in
+        # one frame. Track projection is comparatively expensive, so retain
+        # the immutable tuple for the current pose instead of resampling it.
+        # A pose-derived key makes movement and circuit swaps self-invalidating.
+        self._sensor_ray_cache_key: tuple[object, ...] | None = None
+        self._sensor_ray_cache: tuple[SensorRay, ...] = ()
         self.reset(seed=seed)
 
     def reset(self, *, seed: int | None = None) -> tuple[float, ...]:
@@ -305,11 +311,26 @@ class DrivingEnv:
         ):
             raise ValueError("max_distance must be finite and positive")
         maximum = float(max_distance)
-        heading = self.vehicle.state.heading
-        return tuple(
+        state = self.vehicle.state
+        heading = state.heading
+        cache_key: tuple[object, ...] = (
+            id(self.circuit),
+            state.position.x,
+            state.position.y,
+            heading,
+            maximum,
+            float(self.SENSOR_SAMPLE_STEP),
+            float(self.circuit.collision_radius),
+        )
+        if cache_key == self._sensor_ray_cache_key:
+            return self._sensor_ray_cache
+        rays = tuple(
             self._sensor_ray(heading + relative_angle, maximum)
             for relative_angle in self.SENSOR_RELATIVE_ANGLES
         )
+        self._sensor_ray_cache_key = cache_key
+        self._sensor_ray_cache = rays
+        return rays
 
     def _sensor_ray(self, angle: float, max_distance: float) -> SensorRay:
         origin = self.vehicle.state.position

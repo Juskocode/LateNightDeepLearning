@@ -128,6 +128,12 @@ class DrivingLearningCaptureTests(unittest.TestCase):
                 )
             with self.assertRaises(ValueError):
                 capture_learning_gif(Path(directory) / "capture.png", session)
+            with self.assertRaises(ValueError):
+                capture_learning_gif(
+                    Path(directory) / "capture.gif",
+                    session,
+                    population_car_limit=0,
+                )
 
     def test_capture_flags_render_population_cars_and_real_rays(self):
         hidden_session = tiny_population_session()

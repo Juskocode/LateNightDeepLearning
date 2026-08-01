@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import math
+from numbers import Real
 from pathlib import Path
+from time import perf_counter
 from typing import Any
 
 import pygame
@@ -19,6 +22,8 @@ class DrivingLearningGame:
     """Run accelerated training and fair 60-Hz champion races in one window."""
 
     SPEED_PRESETS = (1, 4, 16, 64, 256)
+    POPULATION_CAR_PRESETS = (2, 4, 8, 12)
+    DEFAULT_TRAINING_FRAME_BUDGET_MS = 12.0
 
     def __init__(
         self,
@@ -29,7 +34,23 @@ class DrivingLearningGame:
         checkpoint_path: str | Path | None = None,
         show_sensor_rays: bool = True,
         show_population_cars: bool = False,
+        population_car_limit: int = 8,
+        training_frame_budget_ms: float = DEFAULT_TRAINING_FRAME_BUDGET_MS,
     ):
+        if (
+            isinstance(population_car_limit, bool)
+            or not isinstance(population_car_limit, int)
+            or population_car_limit not in self.POPULATION_CAR_PRESETS
+        ):
+            choices = ", ".join(str(value) for value in self.POPULATION_CAR_PRESETS)
+            raise ValueError(f"population_car_limit must be one of: {choices}")
+        if (
+            isinstance(training_frame_budget_ms, bool)
+            or not isinstance(training_frame_budget_ms, Real)
+            or not math.isfinite(float(training_frame_budget_ms))
+            or float(training_frame_budget_ms) <= 0
+        ):
+            raise ValueError("training_frame_budget_ms must be finite and positive")
         pygame.init()
         pygame.font.init()
         self.session = session
@@ -55,8 +76,13 @@ class DrivingLearningGame:
         self.race: ChampionRace | None = None
         self.show_sensor_rays = bool(show_sensor_rays)
         self.show_population_cars = bool(show_population_cars)
+        self.population_car_limit = int(population_car_limit)
+        self.training_frame_budget_ms = float(training_frame_budget_ms)
         self.population_rollouts: Any | None = None
         self.training_steps = 0
+        self._last_training_slice_steps = 0
+        self._training_slice_capped = False
+        self._render_fps = 0.0
         self._status = "training"
         self._last_telemetry: dict[str, Any] = {}
         if self.show_population_cars:
@@ -79,6 +105,20 @@ class DrivingLearningGame:
         self._status = f"training speed {self.speed_label}"
         return self.steps_per_frame
 
+    def change_population_car_limit(self, direction: int) -> int:
+        """Cycle the visual rollout breadth without touching scored training."""
+
+        index = self.POPULATION_CAR_PRESETS.index(self.population_car_limit)
+        index = (index + direction) % len(self.POPULATION_CAR_PRESETS)
+        self.population_car_limit = self.POPULATION_CAR_PRESETS[index]
+        # A manager owns exactly the clones it displays. Recreate it only when
+        # the visualization is enabled; changing C while hidden does no work.
+        self.population_rollouts = None
+        if self.show_population_cars:
+            self._ensure_population_rollouts(force=True)
+        self._status = f"generation cars limit {self.population_car_limit}"
+        return self.population_car_limit
+
     def start_race(self) -> ChampionRace:
         self.race = ChampionRace(self.session)
         self._status = "race"
@@ -99,7 +139,10 @@ class DrivingLearningGame:
         if self.population_rollouts is None:
             from .population_rollout import PopulationRolloutManager
 
-            self.population_rollouts = PopulationRolloutManager(self.session)
+            self.population_rollouts = PopulationRolloutManager(
+                self.session,
+                max_cars=self.population_car_limit,
+            )
             force = True
         self.population_rollouts.refresh(force=force)
         return self.population_rollouts
@@ -155,6 +198,9 @@ class DrivingLearningGame:
                 if event.key == pygame.K_m:
                     self.toggle_population_cars()
                     continue
+                if event.key == pygame.K_c:
+                    self.change_population_car_limit(1)
+                    continue
                 if event.key == pygame.K_SPACE:
                     self.paused = not self.paused
                     self._status = "paused" if self.paused else "training"
@@ -180,6 +226,7 @@ class DrivingLearningGame:
                 if event.key == pygame.K_n and self.paused:
                     self.session.step()
                     self.training_steps += 1
+                    self._last_training_slice_steps = 1
                     if self.show_population_cars:
                         self._ensure_population_rollouts().step()
                     self._status = "single step"
@@ -203,14 +250,76 @@ class DrivingLearningGame:
                 "paused": self.paused,
                 "training_speed": self.steps_per_frame,
                 "training_speed_label": self.speed_label,
+                "requested_training_steps_per_frame": self.steps_per_frame,
+                "effective_training_steps_per_frame": (
+                    self._last_training_slice_steps
+                ),
+                "frame_training_steps": self._last_training_slice_steps,
+                "training_slice_capped": self._training_slice_capped,
+                "training_frame_budget_ms": self.training_frame_budget_ms,
+                "render_fps": self._render_fps,
                 "training_steps": self.training_steps,
                 "show_sensor_rays": self.show_sensor_rays,
                 "show_population_cars": self.show_population_cars,
                 "population_rollouts": rollouts,
                 "population_rollout_generation": rollout_generation,
+                "population_car_limit": self.population_car_limit,
+                "population_preview_limit": self.population_car_limit,
+                "population_preview_count": len(rollouts),
             }
         )
         return data
+
+    def _advance_training_slice(
+        self,
+        *,
+        starting_generations: int,
+        max_training_steps: int | None,
+        max_generations: int | None,
+    ) -> int:
+        """Advance a bounded interactive slice and return its exact step count.
+
+        The selected speed remains the requested upper bound. In a visible
+        window, expensive policies yield once the small wall-clock budget is
+        consumed so input and rendering stay responsive. Headless runs retain
+        the original exact ``steps_per_frame`` batching and full throughput.
+        This changes only where presentation frames occur; scored environment
+        transitions keep the same order and termination limits.
+        """
+
+        started_at = perf_counter() if self.render_enabled else 0.0
+        advanced = 0
+        self._training_slice_capped = False
+        for _ in range(self.steps_per_frame):
+            if (
+                max_training_steps is not None
+                and self.training_steps >= max_training_steps
+            ):
+                self.running = False
+                break
+            if (
+                max_generations is not None
+                and self.session.completed_generations - starting_generations
+                >= max_generations
+            ):
+                self.running = False
+                break
+
+            self.session.step()
+            self.training_steps += 1
+            advanced += 1
+
+            if (
+                self.render_enabled
+                and advanced < self.steps_per_frame
+                and (perf_counter() - started_at) * 1_000.0
+                >= self.training_frame_budget_ms
+            ):
+                self._training_slice_capped = True
+                break
+
+        self._last_training_slice_steps = advanced
+        return advanced
 
     def _race_telemetry(self) -> dict[str, Any]:
         assert self.race is not None
@@ -261,6 +370,8 @@ class DrivingLearningGame:
         starting_generations = self.session.completed_generations
         self.running = True
         while self.running:
+            self._last_training_slice_steps = 0
+            self._training_slice_capped = False
             self.handle_events()
             if self.race is not None:
                 # A race is intentionally real-time and never inherits the
@@ -268,31 +379,27 @@ class DrivingLearningGame:
                 if not self.race.finished:
                     self.race.step(self.controls_from_keyboard())
             elif not self.paused:
-                for _ in range(self.steps_per_frame):
-                    if (
-                        max_training_steps is not None
-                        and self.training_steps >= max_training_steps
-                    ):
-                        self.running = False
-                        break
-                    if (
-                        max_generations is not None
-                        and self.session.completed_generations - starting_generations
-                        >= max_generations
-                    ):
-                        self.running = False
-                        break
-                    self.session.step()
-                    self.training_steps += 1
+                advanced = self._advance_training_slice(
+                    starting_generations=starting_generations,
+                    max_training_steps=max_training_steps,
+                    max_generations=max_generations,
+                )
 
-                if self.show_population_cars and not self.paused:
+                if self.show_population_cars and advanced:
                     manager = self._ensure_population_rollouts()
                     manager.step()
 
             if self.render_enabled:
                 self.draw()
                 pygame.display.flip()
-                clock.tick(fps)
+                elapsed_ms = clock.tick(fps)
+                if elapsed_ms > 0:
+                    sample_fps = 1_000.0 / elapsed_ms
+                    self._render_fps = (
+                        sample_fps
+                        if self._render_fps <= 0.0
+                        else self._render_fps * 0.85 + sample_fps * 0.15
+                    )
             if (
                 self.race is None
                 and max_training_steps is not None

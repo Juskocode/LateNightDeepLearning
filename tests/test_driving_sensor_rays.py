@@ -101,6 +101,23 @@ class DrivingSensorRayTests(unittest.TestCase):
             first[0] = second[0]  # type: ignore[index]
         self.assertEqual(env.sensor_rays(), second)
 
+    def test_same_pose_reuses_rays_and_pose_changes_invalidate_the_cache(self):
+        env = DrivingEnv("harbor_loop", seed=9)
+
+        first = env.sensor_rays()
+        observation = env.observation()
+        second = env.sensor_rays()
+
+        self.assertIs(second, first)
+        self.assertEqual(
+            tuple(ray.normalized_distance for ray in second), observation[-5:]
+        )
+
+        env.vehicle.state.heading += 0.125
+        moved = env.sensor_rays()
+        self.assertIsNot(moved, first)
+        self.assertTrue(all(ray.origin == env.vehicle.state.position for ray in moved))
+
 
 if __name__ == "__main__":
     unittest.main()

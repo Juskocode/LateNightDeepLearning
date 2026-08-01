@@ -417,6 +417,7 @@ The 1,400×760 learning dashboard is fed only by live telemetry:
 | `]` or `.` | Increase simulated training steps per rendered frame |
 | `V` | Show or hide the five exact sensor rays supplied to the policy |
 | `M` | Show or hide isolated rollout cars for the current generation |
+| `C` | Cycle the live comparison limit through 2, 4, 8, and 12 cars |
 | `P` | Pause training and start/leave a one-lap race against the current generation champion |
 | `R` | Reset the current evaluation; start a rematch while racing |
 | `S` | Save the current learner checkpoint |
@@ -424,11 +425,21 @@ The 1,400×760 learning dashboard is fed only by live telemetry:
 
 With rays enabled, every line endpoint comes from the same immutable
 `SensorRay` snapshot used to build the final five observation values. `M` adds
-color-coded rollouts for up to twelve current-generation genomes. Those cars
-use cloned policies and private, identically configured environments; they are
-never scored and cannot change replay, gradients, fitness, or selection. They
-refresh automatically when the population evolves. Pass `--population-cars`
-to start with them visible or `--no-sensors` to start with rays hidden.
+color-coded rollouts for the selected number of current-generation genomes;
+`C` changes that limit without touching scored training. Those cars use cloned
+policies and private, identically configured environments; they are never
+scored and cannot change replay, gradients, fitness, or selection. They refresh
+automatically when the population evolves. Pass `--population-cars` to start
+with them visible, `--preview-cars N` to choose an initial limit of 2, 4, 8, or
+12, or `--no-sensors` to start with rays hidden.
+
+Visible training is time-sliced so a costly DQN update or `MAX` setting cannot
+starve input and rendering. The speed preset remains the requested step cap;
+the header shows the actual steps completed in the last frame and smoothed FPS
+when the CPU budget caps it. No transition is dropped or reordered, and
+headless training still runs the exact requested batches at full throughput.
+Immutable circuit-segment geometry and same-pose ray snapshots are reused
+across cars and panels instead of being recomputed every frame.
 
 The race always advances at a fixed 60 simulation steps per second, regardless
 of the accelerated training setting. Drive with arrows or `WASD` and brake with
@@ -530,13 +541,13 @@ python -m drivingGameRL.main \
 python -m drivingGameRL.main \
   --learn --algorithm genetic_dqn --population 4 --elite-count 1 \
   --evaluation-steps 600 --seed 19 --steps 1150 \
-  --population-cars \
+  --population-cars --preview-cars 8 \
   --screenshot assets/screenshots/driving-learning.png
 
 python -m drivingGameRL.main \
   --learn --algorithm genetic_dqn --population 4 --elite-count 1 \
   --evaluation-steps 600 --seed 19 \
-  --population-cars \
+  --population-cars --preview-cars 8 \
   --gif assets/gifs/driving-genetic-dqn.gif --no-save
 ```
 

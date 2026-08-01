@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
 
@@ -225,6 +226,95 @@ class DrivingLearningGameTests(unittest.TestCase):
         self.assertEqual(len(telemetry["population_rollouts"]), 1)
         self.assertEqual(telemetry["population_rollouts"][0]["sensor_rays"], [])
 
+    def test_c_cycles_preview_breadth_without_work_while_cars_are_hidden(self):
+        self.assertEqual(self.game.population_car_limit, 8)
+        self.assertIsNone(self.game.population_rollouts)
+
+        pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_c))
+        self.game.handle_events()
+
+        self.assertEqual(self.game.population_car_limit, 12)
+        self.assertIsNone(self.game.population_rollouts)
+        telemetry = self.game._training_telemetry()
+        self.assertEqual(telemetry["population_car_limit"], 12)
+        self.assertEqual(telemetry["population_rollouts"], [])
+
+        self.game.toggle_population_cars()
+        first_manager = self.game.population_rollouts
+        pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_c))
+        self.game.handle_events()
+
+        self.assertEqual(self.game.population_car_limit, 2)
+        self.assertIsNotNone(self.game.population_rollouts)
+        self.assertIsNot(self.game.population_rollouts, first_manager)
+
+    def test_disabled_generation_cars_do_no_preview_work(self):
+        self.game.toggle_population_cars()
+        manager = self.game.population_rollouts
+        self.assertIsNotNone(manager)
+        self.game.toggle_population_cars()
+
+        with patch.object(manager, "step", wraps=manager.step) as preview_step:
+            self.game.run(max_training_steps=4)
+            self.game._training_telemetry()
+
+        preview_step.assert_not_called()
+
+    def test_interactive_training_slice_yields_at_the_ui_budget(self):
+        self.game.render_enabled = True
+        self.game.training_frame_budget_ms = 10.0
+        try:
+            with patch(
+                "drivingGameRL.src.learning_game.perf_counter",
+                side_effect=(100.0, 100.011),
+            ):
+                advanced = self.game._advance_training_slice(
+                    starting_generations=0,
+                    max_training_steps=None,
+                    max_generations=None,
+                )
+        finally:
+            self.game.render_enabled = False
+
+        self.assertEqual(advanced, 1)
+        self.assertEqual(self.game.training_steps, 1)
+        telemetry = self.game._training_telemetry()
+        self.assertEqual(telemetry["requested_training_steps_per_frame"], 4)
+        self.assertEqual(telemetry["effective_training_steps_per_frame"], 1)
+        self.assertEqual(telemetry["frame_training_steps"], 1)
+        self.assertTrue(telemetry["training_slice_capped"])
+
+    def test_headless_training_slice_executes_the_exact_requested_batch(self):
+        with patch("drivingGameRL.src.learning_game.perf_counter") as timer:
+            advanced = self.game._advance_training_slice(
+                starting_generations=0,
+                max_training_steps=None,
+                max_generations=None,
+            )
+
+        self.assertEqual(advanced, 4)
+        self.assertEqual(self.game.training_steps, 4)
+        self.assertFalse(self.game._training_slice_capped)
+        timer.assert_not_called()
+
+    def test_frame_budget_and_preview_limit_reject_invalid_values(self):
+        for invalid in (True, 3, 8.0):
+            with self.subTest(population_car_limit=invalid):
+                with self.assertRaises(ValueError):
+                    DrivingLearningGame(
+                        self.session,
+                        render=False,
+                        population_car_limit=invalid,
+                    )
+        for invalid in (True, 0, -1, float("nan"), float("inf"), "12"):
+            with self.subTest(training_frame_budget_ms=invalid):
+                with self.assertRaises(ValueError):
+                    DrivingLearningGame(
+                        self.session,
+                        render=False,
+                        training_frame_budget_ms=invalid,
+                    )
+
     def test_paused_single_step_advances_enabled_generation_cars(self):
         self.game.toggle_population_cars()
         self.game.paused = True
@@ -252,6 +342,8 @@ class DrivingLearningGameTests(unittest.TestCase):
                 "--evaluation-steps",
                 "1200",
                 "--population-cars",
+                "--preview-cars",
+                "12",
                 "--no-sensors",
             ]
         )
@@ -261,6 +353,7 @@ class DrivingLearningGameTests(unittest.TestCase):
         self.assertEqual(args.elite_count, 3)
         self.assertEqual(args.evaluation_steps, 1200)
         self.assertTrue(args.population_cars)
+        self.assertEqual(args.preview_cars, 12)
         self.assertTrue(args.no_sensors)
 
 

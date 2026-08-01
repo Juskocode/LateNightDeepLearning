@@ -764,6 +764,7 @@ Learning mode adds these controls:
 | `]` or `.` | Increase simulation steps per rendered frame |
 | `V` | Show or hide the five exact policy sensor rays |
 | `M` | Show or hide isolated rollout cars for the current generation |
+| `C` | Cycle the comparison limit through 2, 4, 8, and 12 cars |
 | `P` | Enter or leave the fixed-60-Hz race against the frozen generation champion |
 | `R` | Reset the current evaluation; start a rematch while racing |
 | `S` | Save the current learner checkpoint |
@@ -774,12 +775,22 @@ Learning mode adds these controls:
 The five displayed rays are immutable snapshots from the same sampling method
 that supplies `ray_left` through `ray_right` to the network. Their endpoints are
 therefore measurements, not reconstructed decoration. The `M` comparison view
-clones up to twelve current-generation policies into separate identically seeded
-environments and advances those clones greedily at fixed simulation time. The
-scored training environment is still shown separately. Rollout actions never
-enter replay or fitness, and the set is rebuilt when the generation changes.
-Use `--population-cars` to begin with this view enabled or `--no-sensors` to
-begin with ray rendering disabled.
+clones the selected number of current-generation policies into separate,
+identically seeded environments and advances those clones greedily at fixed
+simulation time. The default limit is eight; `C` changes it at runtime without
+affecting the scored environment. Rollout actions never enter replay or fitness,
+and the set is rebuilt when the generation changes. Use `--population-cars` to
+begin with this view enabled, `--preview-cars N` to select an initial breadth of
+2, 4, 8, or 12, or `--no-sensors` to begin with ray rendering disabled.
+
+Interactive training uses a short wall-clock work slice before yielding to
+events and rendering. The selected speed is still the maximum requested steps
+per frame, while the header reports the effective frame step count and smoothed
+FPS if CPU cost reaches the slice. This changes presentation cadence only: the
+scored transition order and stopping budgets remain exact. Headless runs are
+not time-sliced and retain full throughput. Circuit projection geometry and
+same-pose immutable ray snapshots are cached, so additional preview cars reuse
+the expensive static calculations without sharing mutable environment state.
 
 ## Reproducible comparison protocol
 

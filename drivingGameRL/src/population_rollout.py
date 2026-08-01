@@ -87,7 +87,12 @@ class PopulationRolloutManager:
         if not force and generation == self._generation:
             return False
 
-        policies = self.session.population_policy_clones(max_cars=self.max_cars)
+        policies = self.session.population_policy_clones(
+            max_cars=self.max_cars,
+            reusable_policy_clones=tuple(
+                rollout.agent for rollout in self._rollouts
+            ),
+        )
         source_env = self.session.env
         # The training environment may use a generation/member-specific seed.
         # Sharing that value among these independent environments guarantees an
