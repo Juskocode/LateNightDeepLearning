@@ -176,6 +176,33 @@ class DrivingLearningVisualizationTests(unittest.TestCase):
         self.assertEqual(after["position"], before["position"])
         self.assertEqual(after["current_lap_time"], before["current_lap_time"])
 
+    def test_curriculum_view_marks_the_random_episode_origin_read_only(self):
+        env = DrivingEnv(
+            "canyon_maze", seed=29, random_start_curriculum=True
+        )
+        before = env.telemetry()
+        visualization = DrivingLearningVisualization(env, learning_telemetry(env))
+
+        surface = visualization.draw().copy()
+        viewport = pygame.Rect(30, 132, 732, 598)
+        point, _ = env.circuit.point_tangent_at(env.lap_origin_progress)
+        center = (
+            round(viewport.x + point.x * viewport.width / TRACK_VIEW_WIDTH),
+            round(viewport.y + point.y * viewport.height / TRACK_HEIGHT),
+        )
+        # The policy car begins directly on the marker and covers its center;
+        # include the gate endpoints and label around that car.
+        neighborhood = pygame.Rect(center[0] - 55, center[1] - 45, 110, 80)
+        neighborhood.clamp_ip(viewport)
+        yellow_pixels = sum(
+            surface.get_at((x, y))[:3] == COLORS["yellow"]
+            for x in range(neighborhood.left, neighborhood.right)
+            for y in range(neighborhood.top, neighborhood.bottom)
+        )
+
+        self.assertGreater(yellow_pixels, 2)
+        self.assertEqual(env.telemetry(), before)
+
     def test_ray_and_generation_car_toggles_change_only_opted_in_track_layers(self):
         rollouts = population_rollouts()
         disabled = {

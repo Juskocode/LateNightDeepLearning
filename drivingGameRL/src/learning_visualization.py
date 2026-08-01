@@ -771,6 +771,56 @@ class DrivingLearningVisualization:
             layer.fill((0, 0, 0, 0))
         return layer
 
+    def _draw_curriculum_origin(
+        self,
+        viewport: pygame.Rect,
+        env: DrivingEnv,
+        snapshot: Mapping[str, Any],
+    ) -> None:
+        """Mark the episode-relative finish line used by learning laps."""
+
+        if not _flag(snapshot.get("random_start_curriculum")):
+            return
+        progress = _finite(snapshot.get("lap_origin_progress")) % 1.0
+        point, tangent = env.circuit.point_tangent_at(progress)
+        normal_x, normal_y = -tangent.y, tangent.x
+        half_width = env.circuit.track_width * 0.42
+        scale_x = viewport.width / TRACK_VIEW_WIDTH
+        scale_y = viewport.height / TRACK_HEIGHT
+
+        def screen(world_x: float, world_y: float) -> tuple[int, int]:
+            return (
+                round(viewport.x + world_x * scale_x),
+                round(viewport.y + world_y * scale_y),
+            )
+
+        center = screen(point.x, point.y)
+        start = screen(
+            point.x - normal_x * half_width,
+            point.y - normal_y * half_width,
+        )
+        end = screen(
+            point.x + normal_x * half_width,
+            point.y + normal_y * half_width,
+        )
+        random_origin = str(snapshot.get("spawn_mode")) == "random_track"
+        color = COLORS["yellow"] if random_origin else COLORS["green"]
+        pygame.draw.line(self.surface, COLORS["background"], start, end, 6)
+        pygame.draw.line(self.surface, color, start, end, 3)
+        pygame.draw.circle(self.surface, COLORS["background"], center, 7)
+        pygame.draw.circle(self.surface, color, center, 5)
+        label = "RANDOM ORIGIN" if random_origin else "GRID ORIGIN"
+        text = self._render_text(label, size=8, color=color, bold=True)
+        label_rect = text.get_rect(midbottom=(center[0], center[1] - 9))
+        label_rect.clamp_ip(viewport)
+        pygame.draw.rect(
+            self.surface,
+            COLORS["background"],
+            label_rect.inflate(8, 5),
+            border_radius=4,
+        )
+        self.surface.blit(text, label_rect)
+
     def _draw_track(
         self,
         rect: pygame.Rect,
@@ -790,6 +840,12 @@ class DrivingLearningVisualization:
         )
         self.surface.blit(self._track_surface(env, viewport.size), viewport)
         data = _mapping(telemetry)
+        snapshot = data
+        if not any(key in snapshot for key in ("terrain", "speed", "laps")):
+            try:
+                snapshot = env.telemetry()
+            except (AttributeError, TypeError, ValueError):
+                snapshot = {}
         population = (
             self._population_rollouts(data)
             if include_population and _flag(data.get("show_population_cars"))
@@ -826,6 +882,7 @@ class DrivingLearningVisualization:
                     width=1,
                 )
             self.surface.blit(ray_layer, viewport.topleft)
+        self._draw_curriculum_origin(viewport, env, snapshot)
         if not cars:
             cars = ((None, COLORS["cyan"], "POLICY"),)
         all_cars = [*population, *cars]
@@ -838,18 +895,31 @@ class DrivingLearningVisualization:
                 round(viewport.y + y * scale_y),
             )
             self._draw_car(center, heading, color, label=label)
-        snapshot = data
-        if not any(key in snapshot for key in ("terrain", "speed", "laps")):
-            try:
-                snapshot = env.telemetry()
-            except (AttributeError, TypeError, ValueError):
-                snapshot = {}
         terrain = str(snapshot.get("terrain", "unknown")).replace("_", " ").upper()
-        footer = (
-            f"{env.circuit.name.upper()}   ·   {terrain}   ·   "
-            f"{_finite(snapshot.get('speed')):05.1f} U/S   ·   "
-            f"LAP {_integer(snapshot.get('laps')) + 1}"
-        )
+        if _flag(snapshot.get("random_start_curriculum")):
+            loop_progress = max(
+                0.0, min(1.0, _finite(snapshot.get("episode_lap_progress")))
+            )
+            spawn = (
+                "RANDOM ORIGIN"
+                if str(snapshot.get("spawn_mode")) == "random_track"
+                else "GRID ORIGIN"
+            )
+            curriculum = (
+                "80% GRID / 20% RANDOM"
+                if _flag(snapshot.get("curriculum_unlocked"))
+                else "RANDOM QUALIFIER"
+            )
+            footer = (
+                f"{env.circuit.name.upper()}   ·   LOOP {loop_progress * 100:05.1f}%"
+                f"   ·   {spawn}   ·   {curriculum}"
+            )
+        else:
+            footer = (
+                f"{env.circuit.name.upper()}   ·   {terrain}   ·   "
+                f"{_finite(snapshot.get('speed')):05.1f} U/S   ·   "
+                f"LAP {_integer(snapshot.get('laps')) + 1}"
+            )
         label_surface = self._render_text(
             footer, size=11, color=COLORS["text"], bold=True
         )
@@ -1251,6 +1321,12 @@ class DrivingLearningVisualization:
             "GENETIC": "weight evolution",
             "GA + DDQN": "hybrid learner",
         }.get(algorithm, "value learner")
+        if _flag(data.get("random_start_curriculum")):
+            algorithm_detail = (
+                "80% grid · 20% random"
+                if _flag(data.get("curriculum_unlocked"))
+                else "random-origin qualifier"
+            )
         generation = _integer(data.get("generation", data.get("generation_index", 0)))
         member = _integer(data.get("member", data.get("member_index", 0)))
         population_size = _integer(

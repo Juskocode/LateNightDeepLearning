@@ -86,6 +86,44 @@ class PopulationRolloutManagerTests(unittest.TestCase):
         self.assertEqual(len({item["heading"] for item in snapshots}), 1)
         self.assertTrue(all(item["steps"] == 0 for item in snapshots))
 
+    def test_preview_copies_curriculum_and_exposes_the_shared_random_origin(self):
+        session = _tiny_session()
+        manager = PopulationRolloutManager(session)
+
+        snapshots = manager.telemetry(include_rays=False)
+
+        self.assertTrue(
+            all(env.random_start_curriculum for env in manager.environments)
+        )
+        self.assertEqual({item["spawn_mode"] for item in snapshots}, {"random_track"})
+        self.assertEqual(len({item["spawn_progress"] for item in snapshots}), 1)
+        self.assertEqual(len({item["lap_origin_progress"] for item in snapshots}), 1)
+        self.assertEqual(
+            {item["curriculum_unlocked"] for item in snapshots}, {False}
+        )
+
+        session.env.load_curriculum_state({"unlocked": True})
+        session.env.reset(seed=1)
+        manager.refresh(force=True)
+        unlocked = manager.telemetry(include_rays=False)
+
+        self.assertEqual({item["spawn_mode"] for item in unlocked}, {"start_line"})
+        self.assertEqual(
+            {item["curriculum_unlocked"] for item in unlocked}, {True}
+        )
+
+    def test_preview_resets_advance_instead_of_replaying_one_spawn_forever(self):
+        session = _tiny_session(evaluation_steps=1)
+        manager = PopulationRolloutManager(session)
+        first_progress = manager.telemetry(include_rays=False)[0]["spawn_progress"]
+
+        manager.step()
+        snapshots = manager.telemetry(include_rays=False)
+
+        self.assertTrue(all(item["episodes"] == 1 for item in snapshots))
+        self.assertEqual(len({item["spawn_progress"] for item in snapshots}), 1)
+        self.assertNotEqual(snapshots[0]["spawn_progress"], first_progress)
+
     def test_policy_clones_do_not_share_parameter_storage(self):
         session = _tiny_session()
         manager = PopulationRolloutManager(session)

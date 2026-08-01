@@ -316,6 +316,7 @@ class PopulationTrainer:
                 circuit,
                 seed=self._evaluation_seed(0, 0),
                 max_steps=max(self.config.evaluation_steps, 1),
+                random_start_curriculum=True,
             )
 
         initial_observation = self.env.reset(seed=self._evaluation_seed(0, 0))
@@ -335,6 +336,12 @@ class PopulationTrainer:
         self._evaluation_losses: list[float] = []
         self._last_reward = 0.0
         self._last_info: dict[str, object] = {}
+        # Every member in one generation receives the same seeded spawn.  A
+        # successful random-origin lap is latched until the generation ends,
+        # preventing later members from receiving an easier 80%-start-line
+        # distribution than the policies evaluated before them.
+        self._generation_curriculum_ready = bool(self.env.curriculum_ready)
+        self._pending_curriculum_unlock = False
 
         self._current_champion: ChampionSnapshot | None = None
         self._current_champion_agent: DrivingDQNAgent | None = None
@@ -440,12 +447,16 @@ class PopulationTrainer:
             self._current_index = 0
             self._current_champion = None
             self._current_champion_agent = None
+            self._pending_curriculum_unlock = False
         elif self.current_member is None:
             self._current_index = 0
         reset_seed = (
-            self._evaluation_seed(self.generation, self._current_index)
+            self._generation_evaluation_seed(self.generation)
             if seed is None
             else seed
+        )
+        self.env.load_curriculum_state(
+            {"unlocked": self._generation_curriculum_ready}
         )
         observation = self.env.reset(seed=reset_seed)
         self._set_evaluation_start(observation)
@@ -468,6 +479,8 @@ class PopulationTrainer:
         self._evaluation_return += float(env_result.reward)
         self._last_reward = float(env_result.reward)
         self._last_info = dict(env_result.info)
+        if bool(env_result.info.get("curriculum_lap_completed", False)):
+            self._pending_curriculum_unlock = True
 
         budget_reached = self._evaluation_steps >= self.config.evaluation_steps
         done = bool(env_result.terminated or env_result.truncated or budget_reached)
@@ -683,6 +696,14 @@ class PopulationTrainer:
         self._current_index = 0
         self._current_champion = None
         self._current_champion_agent = None
+        self._generation_curriculum_ready = (
+            self._generation_curriculum_ready
+            or self._pending_curriculum_unlock
+        )
+        self._pending_curriculum_unlock = False
+        self.env.load_curriculum_state(
+            {"unlocked": self._generation_curriculum_ready}
+        )
         self._start_member(0)
         return record
 
@@ -760,6 +781,14 @@ class PopulationTrainer:
             "checkpoint_version": self.CHECKPOINT_VERSION,
             "evolution_config": self.config.to_dict(),
             "dqn_config": self.dqn_config.to_dict(),
+            # The curriculum is environment state rather than policy state.
+            # Persist it explicitly so a resumed population does not forget
+            # that it already demonstrated a complete lap from a random pose.
+            "environment_curriculum": {
+                **self.env.curriculum_state(),
+                "generation_ready": self._generation_curriculum_ready,
+                "pending_unlock": self._pending_curriculum_unlock,
+            },
             "generation": self.generation,
             "next_member_id": self._next_member_id,
             "rng_state": deepcopy(self._rng.bit_generator.state),
@@ -853,6 +882,19 @@ class PopulationTrainer:
         self._current_champion = None
         self._current_champion_agent = None
         self._refresh_champions()
+        curriculum = dict(state.get("environment_curriculum", {}))
+        self._generation_curriculum_ready = bool(
+            curriculum.get(
+                "generation_ready",
+                curriculum.get("unlocked", curriculum.get("ready", False)),
+            )
+        )
+        self._pending_curriculum_unlock = bool(
+            curriculum.get("pending_unlock", False)
+        )
+        self.env.load_curriculum_state(
+            {"unlocked": self._generation_curriculum_ready}
+        )
         unfinished = next(
             (
                 index
@@ -865,7 +907,9 @@ class PopulationTrainer:
         if unfinished < len(self.population):
             self._start_member(unfinished)
         else:
-            observation = self.env.reset(seed=self._evaluation_seed(self.generation, 0))
+            observation = self.env.reset(
+                seed=self._generation_evaluation_seed(self.generation)
+            )
             self._set_evaluation_start(observation)
 
     def save(self, path: str | Path) -> Path:
@@ -924,9 +968,19 @@ class PopulationTrainer:
             % self._SEED_LIMIT
         )
 
+    def _generation_evaluation_seed(self, generation: int) -> int:
+        """One common scenario seed keeps fitness comparable within a generation."""
+
+        return self._evaluation_seed(generation, 0)
+
     def _start_member(self, index: int) -> None:
         self._current_index = index
-        observation = self.env.reset(seed=self._evaluation_seed(self.generation, index))
+        self.env.load_curriculum_state(
+            {"unlocked": self._generation_curriculum_ready}
+        )
+        observation = self.env.reset(
+            seed=self._generation_evaluation_seed(self.generation)
+        )
         self._set_evaluation_start(observation)
 
     def _set_evaluation_start(self, observation: tuple[float, ...]) -> None:
@@ -954,7 +1008,13 @@ class PopulationTrainer:
             total_reward=float(self._evaluation_return),
             steps=self._evaluation_steps,
             laps=int(info.get("laps", self.env.laps)),
-            progress=float(info.get("progress", 0.0)),
+            # Random-origin episodes report absolute circuit position as
+            # ``progress`` and distance travelled from their own origin as
+            # ``episode_lap_progress``. Fitness summaries must use the latter so a
+            # late-track spawn is not mistaken for a nearly completed loop.
+            progress=float(
+                info.get("episode_lap_progress", info.get("progress", 0.0))
+            ),
             collisions=int(self.env.collisions),
             terminated=bool(env_result.terminated),
             truncated=bool(env_result.truncated or budget_reached),

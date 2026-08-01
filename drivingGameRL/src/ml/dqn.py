@@ -373,20 +373,22 @@ class DrivingDQNAgent:
         return output
 
     def load(self, path: str | Path, *, load_optimizer: bool = True) -> None:
-        state = self._read_checkpoint(path)
+        state = self.read_checkpoint(path)
         self.load_state_dict(state, load_optimizer=load_optimizer)
 
     @classmethod
     def from_checkpoint(
         cls, path: str | Path, *, load_optimizer: bool = True
     ) -> "DrivingDQNAgent":
-        state = cls._read_checkpoint(path)
+        state = cls.read_checkpoint(path)
         agent = cls(DQNConfig.from_dict(state["config"]))
         agent.load_state_dict(state, load_optimizer=load_optimizer)
         return agent
 
     @staticmethod
-    def _read_checkpoint(path: str | Path) -> dict[str, Any]:
+    def read_checkpoint(path: str | Path) -> dict[str, Any]:
+        """Read a validated checkpoint payload for higher-level runtimes."""
+
         checkpoint = Path(path).expanduser().resolve()
         if not checkpoint.is_file():
             raise FileNotFoundError(f"Driving DQN checkpoint not found: {checkpoint}")
@@ -394,6 +396,10 @@ class DrivingDQNAgent:
             return torch.load(checkpoint, map_location="cpu", weights_only=True)
         except TypeError:  # pragma: no cover - compatibility with older Torch
             return torch.load(checkpoint, map_location="cpu")
+
+    # Compatibility for callers written before the checkpoint reader became a
+    # public part of the agent API.
+    _read_checkpoint = read_checkpoint
 
     def _observation(self, observation: Sequence[float] | np.ndarray) -> np.ndarray:
         array = np.asarray(observation, dtype=np.float32)

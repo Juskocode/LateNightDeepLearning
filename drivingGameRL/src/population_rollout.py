@@ -97,7 +97,12 @@ class PopulationRolloutManager:
         # The training environment may use a generation/member-specific seed.
         # Sharing that value among these independent environments guarantees an
         # identical comparison without sharing any mutable simulation object.
-        rollout_seed = source_env.seed
+        rollout_seed = (
+            source_env.seed
+            if source_env.seed is not None
+            else int(getattr(self.session.config, "seed", 0))
+        )
+        curriculum_state = source_env.curriculum_state()
         rollouts: list[_PolicyRollout] = []
         for index, (member_id, agent) in enumerate(policies):
             env = DrivingEnv(
@@ -106,8 +111,13 @@ class PopulationRolloutManager:
                 seed=rollout_seed,
                 fixed_dt=source_env.fixed_dt,
                 max_steps=source_env.max_steps,
+                random_start_curriculum=source_env.random_start_curriculum,
             )
-            observation = env.observation()
+            # The constructor starts a fresh curriculum. Copy only its tiny
+            # readiness latch, then replay the shared seed so every displayed
+            # genome receives the same scenario as its peers.
+            env.load_curriculum_state(curriculum_state)
+            observation = env.reset(seed=rollout_seed)
             q_values = agent.q_values(observation)
             rollouts.append(
                 _PolicyRollout(
@@ -142,7 +152,9 @@ class PopulationRolloutManager:
                 if result.terminated or result.truncated:
                     # Restart only this car.  Other cars retain their position,
                     # lap clock, and episode state.
-                    rollout.observation = rollout.env.reset(seed=rollout.env.seed)
+                    # Keep consuming the private seeded RNG sequence. Reseeding
+                    # here would replay one identical spawn forever.
+                    rollout.observation = rollout.env.reset()
                     rollout.episodes += 1
                 q_values = rollout.agent.q_values(rollout.observation)
                 rollout.action = int(np.argmax(q_values))
@@ -166,9 +178,23 @@ class PopulationRolloutManager:
                 "heading_degrees": float(env_snapshot["heading_degrees"]),
                 "speed": float(env_snapshot["speed"]),
                 "progress": float(env_snapshot["progress"]),
+                "episode_lap_progress": float(
+                    env_snapshot["episode_lap_progress"]
+                ),
                 "laps": int(env_snapshot["laps"]),
                 "steps": int(env_snapshot["steps"]),
                 "episodes": rollout.episodes,
+                "random_start_curriculum": bool(
+                    env_snapshot["random_start_curriculum"]
+                ),
+                "curriculum_unlocked": bool(
+                    env_snapshot["curriculum_unlocked"]
+                ),
+                "spawn_mode": str(env_snapshot["spawn_mode"]),
+                "spawn_progress": float(env_snapshot["spawn_progress"]),
+                "lap_origin_progress": float(
+                    env_snapshot["lap_origin_progress"]
+                ),
                 "action": rollout.action,
                 "q_values": list(rollout.q_values),
                 "observation": list(rollout.observation),

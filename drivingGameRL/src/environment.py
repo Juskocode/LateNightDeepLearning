@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from bisect import bisect_right
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import IntEnum
 import math
@@ -94,6 +95,7 @@ class DrivingEnv:
     BEST_LAP_EPSILON = 1e-9
     SENSOR_MAX_DISTANCE = 150.0
     SENSOR_SAMPLE_STEP = 6.0
+    NORMAL_START_PROBABILITY = 0.80
     SENSOR_RELATIVE_ANGLES = (
         -math.pi / 2,
         -math.pi / 4,
@@ -125,17 +127,27 @@ class DrivingEnv:
         seed: int | None = None,
         fixed_dt: float = 1.0 / 60.0,
         max_steps: int = 60 * 180,
+        random_start_curriculum: bool = False,
     ):
         if not 0.0 < fixed_dt <= 0.1:
             raise ValueError("fixed_dt must be in the (0, 0.1] interval")
         if not isinstance(max_steps, int) or max_steps <= 0:
             raise ValueError("max_steps must be a positive integer")
+        if not isinstance(random_start_curriculum, bool):
+            raise ValueError("random_start_curriculum must be a boolean")
         self.circuit = get_circuit(circuit) if isinstance(circuit, str) else circuit
         self.vehicle = Vehicle(build)
         self.fixed_dt = fixed_dt
         self.max_steps = max_steps
         self.random = random.Random(seed)
         self.seed = seed
+        self.random_start_curriculum = random_start_curriculum
+        self._curriculum_unlocked = False
+        self._spawn_mode = "start_line"
+        self._spawn_progress = 0.0
+        self._lap_origin_progress = 0.0
+        self._episode_lap_progress = 0.0
+        self._last_curriculum_lap_completed = False
         self.steps = 0
         self.laps = 0
         self.collisions = 0
@@ -164,7 +176,18 @@ class DrivingEnv:
         if seed is not None:
             self.seed = seed
             self.random.seed(seed)
-        position, heading = self.circuit.start_pose()
+        use_start_line = not self.random_start_curriculum or (
+            self._curriculum_unlocked
+            and self.random.random() < self.NORMAL_START_PROBABILITY
+        )
+        if use_start_line:
+            position, heading = self.circuit.start_pose()
+            self._spawn_mode = "start_line"
+        else:
+            sampled_progress = self.random.random()
+            position, tangent = self.circuit.point_tangent_at(sampled_progress)
+            heading = math.atan2(tangent.y, tangent.x)
+            self._spawn_mode = "random_track"
         self.vehicle.reset(position, heading)
         self.steps = 0
         self.laps = 0
@@ -177,9 +200,64 @@ class DrivingEnv:
         self._lap_candidate_armed = True
         self.last_projection = self.circuit.project(position)
         self.previous_progress = self.last_projection.progress
+        self._spawn_progress = self.last_projection.progress
+        self._lap_origin_progress = self.last_projection.progress
+        self._episode_lap_progress = 0.0
+        self._last_curriculum_lap_completed = False
         self.last_reward_terms = {}
         self._reset_lap_recording()
         return self.observation()
+
+    @property
+    def curriculum_unlocked(self) -> bool:
+        """Whether a curriculum car has already proved it can finish a loop."""
+
+        return self._curriculum_unlocked
+
+    @property
+    def curriculum_ready(self) -> bool:
+        """Compatibility alias for :attr:`curriculum_unlocked`."""
+
+        return self._curriculum_unlocked
+
+    @property
+    def normal_start_probability(self) -> float:
+        """Chance of a start-line spawn after unlocking the curriculum."""
+
+        return self.NORMAL_START_PROBABILITY
+
+    @property
+    def spawn_mode(self) -> str:
+        return self._spawn_mode
+
+    @property
+    def spawn_progress(self) -> float:
+        return self._spawn_progress
+
+    @property
+    def lap_origin_progress(self) -> float:
+        return self._lap_origin_progress
+
+    def curriculum_state(self) -> dict[str, bool]:
+        """Return the small persistent state needed by checkpoints/clones."""
+
+        return {"unlocked": self._curriculum_unlocked}
+
+    def load_curriculum_state(self, state: Mapping[str, object]) -> None:
+        """Restore curriculum progress without changing the current episode.
+
+        An empty mapping is accepted for checkpoints written before the
+        curriculum existed.  Seeding and resetting deliberately do not clear
+        this flag; callers can explicitly load ``{}`` when they need a fresh
+        curriculum.
+        """
+
+        if not isinstance(state, Mapping):
+            raise ValueError("curriculum state must be a mapping")
+        value = state.get("unlocked", state.get("ready", False))
+        if not isinstance(value, bool):
+            raise ValueError("curriculum unlocked state must be a boolean")
+        self._curriculum_unlocked = value
 
     @property
     def best_lap_record(self) -> LapRecord | None:
@@ -215,14 +293,20 @@ class DrivingEnv:
 
         Component changes use ``wait_for_start=True`` so a mid-lap upgrade
         cannot turn the remaining fraction of the circuit into a best time.
+        Here "start" means this episode's lap origin: normally the official
+        line, or the sampled centerline pose in the learning curriculum.
         """
 
         self.current_lap_time = 0.0
         self._lap_progress = 0.0
+        self._episode_lap_progress = 0.0
         self._next_lap_checkpoint = 0
         projection = self.circuit.project(self.vehicle.state.position)
-        exactly_on_start = min(projection.progress, 1.0 - projection.progress) <= 1e-9
-        self._lap_candidate_armed = not wait_for_start or exactly_on_start
+        distance_from_origin = abs(projection.progress - self._lap_origin_progress)
+        exactly_on_origin = min(
+            distance_from_origin, 1.0 - distance_from_origin
+        ) <= 1e-9
+        self._lap_candidate_armed = not wait_for_start or exactly_on_origin
         self.previous_progress = projection.progress
         self.last_projection = projection
         self._reset_lap_recording()
@@ -412,7 +496,14 @@ class DrivingEnv:
             delta_progress -= 1.0
 
         valid_forward_progress = 0.0 < delta_progress <= self.MAX_LAP_PROGRESS_STEP
-        forward_start_crossed = valid_forward_progress and raw_delta_progress < -0.5
+        relative_previous = (
+            self.previous_progress - self._lap_origin_progress
+        ) % 1.0
+        relative_after = (after.progress - self._lap_origin_progress) % 1.0
+        forward_lap_origin_crossed = (
+            valid_forward_progress
+            and relative_after + 1e-12 < relative_previous
+        )
         progress_discontinuity = abs(delta_progress) > self.MAX_LAP_PROGRESS_STEP
         if self._lap_candidate_armed and progress_discontinuity:
             # A fixed-step car cannot legitimately traverse this much of the
@@ -425,7 +516,7 @@ class DrivingEnv:
                 self._lap_progress = clamp(
                     self._lap_progress + delta_progress, 0.0, 1.0
                 )
-            if valid_forward_progress and not forward_start_crossed:
+            if valid_forward_progress and not forward_lap_origin_crossed:
                 checkpoint = (
                     self.LAP_CHECKPOINTS[self._next_lap_checkpoint]
                     if self._next_lap_checkpoint < len(self.LAP_CHECKPOINTS)
@@ -433,12 +524,12 @@ class DrivingEnv:
                 )
                 if (
                     checkpoint is not None
-                    and self.previous_progress < checkpoint <= after.progress
+                    and relative_previous < checkpoint <= relative_after
                 ):
                     self._next_lap_checkpoint += 1
 
         lap_completed = (
-            forward_start_crossed
+            forward_lap_origin_crossed
             and self._lap_candidate_armed
             and self._next_lap_checkpoint == len(self.LAP_CHECKPOINTS)
             and self._lap_progress >= 1.0 - 1e-9
@@ -448,7 +539,7 @@ class DrivingEnv:
             self.laps += 1
             self.last_lap_time = self.current_lap_time
             previous_best = self.best_lap_record
-            if (
+            if self._spawn_mode == "start_line" and (
                 previous_best is None
                 or self.last_lap_time < previous_best.duration - self.BEST_LAP_EPSILON
             ):
@@ -461,9 +552,9 @@ class DrivingEnv:
             self._lap_progress = 0.0
             self._next_lap_checkpoint = 0
             self._reset_lap_recording()
-        elif forward_start_crossed:
-            # Crossing the line without all ordered gates rejects shortcuts
-            # and starts a clean candidate for the following full lap.
+        elif forward_lap_origin_crossed:
+            # Crossing this episode's origin without all ordered gates rejects
+            # shortcuts and starts a clean candidate for the following loop.
             self.current_lap_time = 0.0
             self._lap_progress = 0.0
             self._next_lap_checkpoint = 0
@@ -472,6 +563,13 @@ class DrivingEnv:
         else:
             if self._lap_candidate_armed:
                 self._record_lap_pose()
+
+        curriculum_lap_completed = self.random_start_curriculum and lap_completed
+        episode_lap_progress = 1.0 if lap_completed else self._lap_progress
+        self._episode_lap_progress = episode_lap_progress
+        if curriculum_lap_completed:
+            self._curriculum_unlocked = True
+        self._last_curriculum_lap_completed = curriculum_lap_completed
 
         reward_progress = (
             delta_progress if abs(delta_progress) <= self.MAX_LAP_PROGRESS_STEP else 0.0
@@ -499,22 +597,34 @@ class DrivingEnv:
             "terrain": active_terrain.kind.value,
             "on_road": on_road,
             "progress": after.progress,
+            "episode_lap_progress": episode_lap_progress,
             "laps": self.laps,
             "lap_completed": lap_completed,
             "current_lap_time": self.current_lap_time,
             "last_lap_time": self.last_lap_time,
             "best_lap_time": self.best_lap_time,
             "lap_candidate_valid": self._lap_candidate_armed,
+            "lap_origin_progress": self._lap_origin_progress,
+            "random_start_curriculum": self.random_start_curriculum,
+            "curriculum_unlocked": self._curriculum_unlocked,
+            "curriculum_ready": self._curriculum_unlocked,
+            "curriculum_lap_completed": curriculum_lap_completed,
+            "normal_start_probability": self.NORMAL_START_PROBABILITY,
+            "spawn_mode": self._spawn_mode,
+            "spawn_progress": self._spawn_progress,
             "collided": collided,
             "collision_started": collision_started,
             "impact_speed": impact_speed,
             "reward_terms": reward_terms.copy(),
             "telemetry": telemetry,
         }
-        return StepResult(self.observation(), reward, False, truncated, info)
+        return StepResult(
+            self.observation(), reward, curriculum_lap_completed, truncated, info
+        )
 
     def change_circuit(self, name: str) -> tuple[float, ...]:
         self.circuit = get_circuit(name)
+        self._curriculum_unlocked = False
         return self.reset()
 
     def telemetry(self) -> dict[str, object]:
@@ -533,6 +643,15 @@ class DrivingEnv:
             "last_lap_time": self.last_lap_time,
             "best_lap_time": self.best_lap_time,
             "lap_candidate_valid": self._lap_candidate_armed,
+            "episode_lap_progress": self._episode_lap_progress,
+            "lap_origin_progress": self._lap_origin_progress,
+            "random_start_curriculum": self.random_start_curriculum,
+            "curriculum_unlocked": self._curriculum_unlocked,
+            "curriculum_ready": self._curriculum_unlocked,
+            "curriculum_lap_completed": self._last_curriculum_lap_completed,
+            "normal_start_probability": self.NORMAL_START_PROBABILITY,
+            "spawn_mode": self._spawn_mode,
+            "spawn_progress": self._spawn_progress,
             "ghost_available": self.best_lap_record is not None,
             "ghost_recording_samples": len(self._current_lap_trajectory),
             "best_trajectory_samples": len(self.best_lap_trajectory),

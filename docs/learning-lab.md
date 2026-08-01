@@ -478,6 +478,43 @@ observations, rewards, progress, nor particles. `G` toggles both the ghost and
 racing line without disabling trajectory recording. The `--no-ghost` CLI option
 starts with this overlay hidden.
 
+### Random-origin driving curriculum
+
+Learning sessions opt into a start curriculum that manual driving and champion
+races do not use. Before qualification, every reset samples a seeded uniform
+progress coordinate, places the car on the centerline, aligns it with the local
+forward tangent, and gives it zero velocity. This removes a strong shortcut:
+memorizing only the turns immediately after the permanent start line.
+
+Lap validation rotates with the sampled episode origin. The car must pass the
+relative 25%, 50%, and 75% gates in order and then cross that origin in the
+forward direction. Reverse crossings, origin oscillation, and implausible
+projection jumps retain the same rejection rules as normal laps. A valid loop
+earns the `+20` lap reward, sets `curriculum_lap_completed`, and terminates that
+learning evaluation. Random-origin times are deliberately excluded from the
+normal-grid best-lap record because their trajectories begin at a different
+place and would make the manual ghost misleading.
+
+That first valid random-origin loop unlocks the continuing distribution:
+
+```text
+before qualification: 100% random origin
+after qualification:    80% normal grid + 20% random origin
+```
+
+The reset draws and origin are deterministic for a seed. Standalone DQN and
+Double-DQN checkpoints persist the unlock and environment RNG stream, while
+population checkpoints persist the generation-level curriculum state. In a
+genetic generation, all members receive the same seeded scenario. A successful
+member's unlock is deferred until the next generation so every genome in the
+current ranking faces equal conditions.
+
+The dashboard draws the active **RANDOM ORIGIN** or **GRID ORIGIN** gate and
+reports `episode_lap_progress` from 0 to 1. Preview cars copy that same
+curriculum state into isolated environments. The permanent observation value
+at index 6 remains absolute circuit `lap_progress`; this is intentionally
+distinct from origin-relative episode completion.
+
 ### Observation: 12 normalized values
 
 | Index | Label | Meaning |
@@ -488,7 +525,7 @@ starts with this overlay hidden.
 | 3 | heading error | Track-relative heading error divided by pi |
 | 4 | track offset | Signed centerline offset divided by collision radius |
 | 5 | terrain grip | Grip coefficient of the current terrain |
-| 6 | lap progress | Normalized progress around the circuit |
+| 6 | lap progress | Absolute normalized coordinate around the circuit |
 | 7–11 | five range rays | Normalized clearance at -90°, -45°, 0°, +45°, +90° |
 
 Each ray samples every six simulation units up to a range of 150 and reports
@@ -522,12 +559,14 @@ collision = -min(5, 0.06 * impact_speed) on contact start; otherwise 0
 lap       = +20 after one valid gated forward circuit; otherwise 0
 ```
 
-The `info` dictionary exposes the active terrain, on-road flag, progress,
-completed laps, `lap_completed`, current/last/best lap time, persistent-contact
-`collided`, one-shot `collision_started`, impact speed, every reward term, and
-vehicle telemetry. Episodes do not currently terminate from damage or collision.
-They truncate at the configured step limit, which defaults to 10,800 steps
-(three minutes at 60 Hz).
+The `info` dictionary exposes the active terrain, on-road flag, absolute
+`progress`, origin-relative `episode_lap_progress`, spawn mode and origin,
+curriculum readiness, completed laps, `lap_completed`, current/last/best lap
+time, persistent-contact `collided`, one-shot `collision_started`, impact speed,
+every reward term, and vehicle telemetry. Episodes do not terminate from damage
+or collision. Curriculum learning episodes terminate on a valid loop; all modes
+truncate at their configured step limit, which defaults to 10,800 steps (three
+minutes at 60 Hz).
 
 ### Driving value network and replay
 
@@ -640,7 +679,7 @@ synthesize training state.
 
 | Tab | What it answers |
 |---|---|
-| Overview | Which member is driving, what it observes and chooses, and how current/best/mean fitness changes across the population and generations |
+| Overview | Which member is driving, its episode-origin gate and relative loop progress, curriculum state, what it observes and chooses, and how current/best/mean fitness changes across the population and generations |
 | Network | Which real layers and connections produced the current Q-values; colors and intensity come from current activations and weights |
 | Memory | How full replay is, whether action selection explored, and what loss, TD error, gradient steps, action counts, and target synchronization are doing |
 
@@ -776,9 +815,10 @@ The five displayed rays are immutable snapshots from the same sampling method
 that supplies `ray_left` through `ray_right` to the network. Their endpoints are
 therefore measurements, not reconstructed decoration. The `M` comparison view
 clones the selected number of current-generation policies into separate,
-identically seeded environments and advances those clones greedily at fixed
-simulation time. The default limit is eight; `C` changes it at runtime without
-affecting the scored environment. Rollout actions never enter replay or fitness,
+identically seeded, curriculum-matched environments and advances those clones
+greedily at fixed simulation time. The default limit is eight; `C` changes it at
+runtime without affecting the scored environment. Rollout actions never enter
+replay or fitness,
 and the set is rebuilt when the generation changes. Use `--population-cars` to
 begin with this view enabled, `--preview-cars N` to select an initial breadth of
 2, 4, 8, or 12, or `--no-sensors` to begin with ray rendering disabled.

@@ -4,7 +4,7 @@ Playable arcade environments for watching reinforcement learning from the inside
 
 - **Pacman** supports manual play plus real DQN and Double-DQN training with a four-tab live observatory.
 - **Snake** compares six deep and tabular value-learning methods with held-out seed evaluation, curriculum randomization, and live generalization metrics.
-- **Driving Lab** combines deterministic top-down vehicle physics with DQN, Double DQN, genetic neuroevolution, and a hybrid genetic-DQN population lab. Its live dashboard exposes the real network, replay memory, and generation fitness, and `P` starts a one-lap race against the current champion.
+- **Driving Lab** combines deterministic top-down vehicle physics with DQN, Double DQN, genetic neuroevolution, and a hybrid genetic-DQN population lab. A random-origin lap curriculum reduces start-line memorization; the live dashboard exposes its true origin gate alongside the real network, replay memory, and generation fitness, and `P` starts a one-lap race against the current champion.
 
 ![Pacman Double-DQN observatory cycling through the game, vision, metrics, and neural-network views](assets/gifs/pacman-dqn-observatory.gif)
 
@@ -372,6 +372,23 @@ member and are not inherited by children, so ancestry transfers network weights
 rather than stale transitions. Pure `genetic` mode is a useful control because
 it has the same population operators without replay, targets, or TD learning.
 
+Every learning algorithm starts with the same anti-memorization curriculum:
+
+1. Before qualification, every evaluation spawns at a seeded random point on
+   the track centerline, facing the local forward tangent.
+2. The 25%, 50%, and 75% safety gates rotate with that episode's origin. A full
+   ordered loop back to the origin earns the existing `+20` lap reward and ends
+   the evaluation; crossing the permanent grid line is not a shortcut.
+3. After the learner proves one random-origin loop, resets use the normal start
+   line 80% of the time and another random origin 20% of the time.
+
+For genetic runs, every member in one generation receives the same seeded
+scenario. A qualification is latched until the generation boundary, so later
+members are not ranked on an easier distribution. Manual driving and the `P`
+champion race remain on the normal grid, and random-origin completions never
+replace the normal-start best-lap ghost. Checkpoints preserve both curriculum
+readiness and deterministic spawn continuation.
+
 ```bash
 # Standard and Double-DQN episode learners
 python -m drivingGameRL.main --learn --algorithm dqn
@@ -404,7 +421,7 @@ The 1,400×760 learning dashboard is fed only by live telemetry:
 
 | Tab | Live evidence |
 |---|---|
-| Overview | Current car and circuit, generation/member progress, population fitness, best/mean history, observations, selected action, and Q-values |
+| Overview | Current car and circuit, episode-origin gate and relative loop progress, curriculum state, generation/member progress, population fitness, best/mean history, observations, selected action, and Q-values |
 | Network | The current network's actual architecture, activations, parameter count, and sampled connection weights |
 | Memory | Replay occupancy, epsilon, loss, TD error, gradient updates, action use, target synchronization, and recent learning state |
 
@@ -427,11 +444,18 @@ With rays enabled, every line endpoint comes from the same immutable
 `SensorRay` snapshot used to build the final five observation values. `M` adds
 color-coded rollouts for the selected number of current-generation genomes;
 `C` changes that limit without touching scored training. Those cars use cloned
-policies and private, identically configured environments; they are never
-scored and cannot change replay, gradients, fitness, or selection. They refresh
+policies and private, identically configured environments, including the same
+curriculum readiness and seeded origin. They are never scored and cannot change
+replay, gradients, fitness, or selection. They refresh
 automatically when the population evolves. Pass `--population-cars` to start
 with them visible, `--preview-cars N` to choose an initial limit of 2, 4, 8, or
 12, or `--no-sensors` to start with rays hidden.
+
+The yellow **RANDOM ORIGIN** gate on the track is the finish target for the
+current qualifying episode. The footer reports origin-relative
+`episode_lap_progress` and changes to **80% GRID / 20% RANDOM** after unlock.
+The network's `lap_progress` observation remains the absolute circuit coordinate,
+so telemetry never overloads one field with two meanings.
 
 Visible training is time-sliced so a costly DQN update or `MAX` setting cannot
 starve input and rendering. The speed preset remains the requested step cap;

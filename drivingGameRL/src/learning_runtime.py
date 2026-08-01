@@ -10,10 +10,13 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass, replace
 import math
+import os
 from pathlib import Path
+import tempfile
 from typing import Any, Literal, Sequence
 
 import numpy as np
+import torch
 
 from .environment import DrivingAction, DrivingEnv, StepResult
 from .ml import DQNConfig, DrivingDQNAgent
@@ -116,6 +119,7 @@ class DrivingLearningSession:
             build=self.build,
             seed=self.config.seed,
             max_steps=self.config.evaluation_steps,
+            random_start_curriculum=True,
         )
         self.observation = self.env.observation()
         self.generation = 1
@@ -151,6 +155,7 @@ class DrivingLearningSession:
             build=self.build,
             seed=self.config.seed,
             max_steps=self.config.evaluation_steps,
+            random_start_curriculum=True,
         )
         self._population_trainer = PopulationTrainer(
             evolution,
@@ -490,7 +495,27 @@ class DrivingLearningSession:
         if self.is_population and hasattr(self._population_trainer, "save"):
             saved = self._population_trainer.save(output)
         else:
-            saved = self.agent.save(output)
+            # Keep the file compatible with ``DrivingDQNAgent.load`` by adding
+            # session metadata to the ordinary agent payload.  The agent
+            # intentionally ignores unknown top-level keys.
+            output.parent.mkdir(parents=True, exist_ok=True)
+            payload = self.agent.state_dict()
+            payload["environment_curriculum"] = self.env.curriculum_state()
+            # Resuming must continue the deterministic spawn stream. Saving
+            # only the unlock latch would make every process restart replay
+            # the same first 80/20 draw and random origin.
+            payload["environment_rng_state"] = self.env.random.getstate()
+            descriptor, temporary_name = tempfile.mkstemp(
+                prefix=f".{output.name}.", suffix=".tmp", dir=output.parent
+            )
+            os.close(descriptor)
+            temporary = Path(temporary_name)
+            try:
+                torch.save(payload, temporary)
+                os.replace(temporary, output)
+            finally:
+                temporary.unlink(missing_ok=True)
+            saved = output
         self._checkpoint_path = Path(saved)
         self._last_event = "checkpoint_saved"
         return Path(saved)
@@ -503,7 +528,21 @@ class DrivingLearningSession:
             self.agent = self._population_trainer.current_agent
             self.observation = self._population_trainer.observation
         else:
-            self.agent.load(checkpoint)
+            state = self.agent.read_checkpoint(checkpoint)
+            self.agent.load_state_dict(state)
+            self.env.load_curriculum_state(state.get("environment_curriculum", {}))
+            rng_state = state.get("environment_rng_state")
+            if rng_state is None:
+                # Backward-compatible checkpoints predate the environment RNG
+                # payload, so retain their former deterministic seed behavior.
+                self.observation = self.env.reset(seed=self.config.seed)
+            else:
+                self.env.random.setstate(rng_state)
+                # The constructor created one stale episode before the state
+                # was read. Consume the saved stream once to begin the exact
+                # next episode an uninterrupted session would have seen.
+                self.observation = self.env.reset()
+            self.episode_return = 0.0
             # A standalone agent checkpoint has no episode scoreboard. Until a
             # new complete evaluation is available, its loaded policy is the
             # honest best-available opponent for the P race.
