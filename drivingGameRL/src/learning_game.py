@@ -415,8 +415,11 @@ class DrivingLearningGame:
                 self.running = False
 
     def close(self) -> None:
-        if self.render_enabled:
-            pygame.display.quit()
+        try:
+            self.session.close()
+        finally:
+            if self.render_enabled:
+                pygame.display.quit()
 
 
 __all__ = ("DrivingLearningGame",)

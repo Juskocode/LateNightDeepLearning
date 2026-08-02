@@ -17,10 +17,15 @@ from drivingGameRL.src.ml import DQNConfig
 from drivingGameRL.src.population_rollout import PopulationRolloutManager
 
 
-def _tiny_session(*, population_size: int = 4, evaluation_steps: int = 8):
+def _tiny_session(
+    *,
+    population_size: int = 4,
+    evaluation_steps: int = 8,
+    algorithm: str = "genetic_dqn",
+):
     return DrivingLearningSession(
         LearningRuntimeConfig(
-            algorithm="genetic_dqn",
+            algorithm=algorithm,
             circuit="harbor_loop",
             seed=41,
             evaluation_steps=evaluation_steps,
@@ -58,13 +63,14 @@ def _assert_nested_equal(test: unittest.TestCase, before, after) -> None:
 
 
 class PopulationRolloutManagerTests(unittest.TestCase):
-    def test_clones_current_member_ids_with_a_hard_display_bound(self):
+    def test_bounds_real_scored_members_in_population_order(self):
         session = _tiny_session(population_size=4)
         manager = PopulationRolloutManager(session, max_cars=3)
 
         snapshots = manager.telemetry(include_rays=False)
 
         self.assertEqual(manager.count, 3)
+        self.assertTrue(manager.uses_scored_population)
         self.assertEqual(manager.generation, session.current_generation)
         self.assertEqual([item["index"] for item in snapshots], [0, 1, 2])
         self.assertEqual(
@@ -76,17 +82,22 @@ class PopulationRolloutManagerTests(unittest.TestCase):
             PopulationRolloutManager.HARD_MAX_CARS,
         )
 
-    def test_every_car_has_an_independent_environment_and_same_start(self):
-        manager = PopulationRolloutManager(_tiny_session())
+    def test_every_scored_car_has_an_independent_environment_and_same_start(self):
+        session = _tiny_session()
+        manager = PopulationRolloutManager(session)
 
         snapshots = manager.telemetry()
 
+        self.assertEqual(
+            manager.environments,
+            session._population_trainer.member_environments,
+        )
         self.assertEqual(len({id(env) for env in manager.environments}), manager.count)
         self.assertEqual(len({item["position"] for item in snapshots}), 1)
         self.assertEqual(len({item["heading"] for item in snapshots}), 1)
         self.assertTrue(all(item["steps"] == 0 for item in snapshots))
 
-    def test_preview_copies_curriculum_and_exposes_the_shared_random_origin(self):
+    def test_scored_population_exposes_the_shared_random_origin(self):
         session = _tiny_session()
         manager = PopulationRolloutManager(session)
 
@@ -102,33 +113,36 @@ class PopulationRolloutManagerTests(unittest.TestCase):
             {item["curriculum_unlocked"] for item in snapshots}, {False}
         )
 
-        session.env.load_curriculum_state({"unlocked": True})
-        session.env.reset(seed=1)
-        manager.refresh(force=True)
-        unlocked = manager.telemetry(include_rays=False)
-
-        self.assertEqual({item["spawn_mode"] for item in unlocked}, {"start_line"})
-        self.assertEqual(
-            {item["curriculum_unlocked"] for item in unlocked}, {True}
-        )
-
-    def test_preview_resets_advance_instead_of_replaying_one_spawn_forever(self):
-        session = _tiny_session(evaluation_steps=1)
+    def test_manager_step_does_not_double_advance_scored_cars(self):
+        session = _tiny_session(evaluation_steps=4)
         manager = PopulationRolloutManager(session)
-        first_progress = manager.telemetry(include_rays=False)[0]["spawn_progress"]
+        session.step()
+        before = tuple(env.steps for env in manager.environments)
 
-        manager.step()
+        manager.step(3)
+
+        self.assertEqual(tuple(env.steps for env in manager.environments), before)
+
+    def test_one_session_tick_advances_every_scored_car(self):
+        session = _tiny_session(population_size=4, evaluation_steps=4)
+        manager = PopulationRolloutManager(session)
+
+        session.step()
         snapshots = manager.telemetry(include_rays=False)
 
-        self.assertTrue(all(item["episodes"] == 1 for item in snapshots))
-        self.assertEqual(len({item["spawn_progress"] for item in snapshots}), 1)
-        self.assertNotEqual(snapshots[0]["spawn_progress"], first_progress)
+        self.assertEqual({item["steps"] for item in snapshots}, {1})
+        self.assertEqual({item["status"] for item in snapshots}, {"evaluating"})
+        self.assertTrue(all(item["scored"] for item in snapshots))
+        self.assertEqual(
+            session._population_trainer.active_member_indices,
+            (0, 1, 2, 3),
+        )
 
-    def test_policy_clones_do_not_share_parameter_storage(self):
-        session = _tiny_session()
+    def test_standalone_policy_clone_does_not_share_parameter_storage(self):
+        session = _tiny_session(algorithm="double_dqn")
         manager = PopulationRolloutManager(session)
         rollout_agent = manager._rollouts[0].agent
-        source_agent = session._population_trainer.population[0].agent
+        source_agent = session.agent
         source_before = [
             parameter.detach().clone()
             for parameter in source_agent.online_network.parameters()
@@ -146,13 +160,11 @@ class PopulationRolloutManagerTests(unittest.TestCase):
             )
         )
 
-    def test_refresh_reuses_isolated_policy_shells_and_restores_live_weights(self):
-        session = _tiny_session()
+    def test_standalone_refresh_reuses_isolated_policy_shell(self):
+        session = _tiny_session(algorithm="double_dqn")
         manager = PopulationRolloutManager(session)
         original_agents = tuple(rollout.agent for rollout in manager._rollouts)
-        source_agents = tuple(
-            member.agent for member in session._population_trainer.population
-        )
+        source_agents = (session.agent,)
 
         with torch.no_grad():
             next(original_agents[0].online_network.parameters()).add_(10.0)
@@ -185,17 +197,20 @@ class PopulationRolloutManagerTests(unittest.TestCase):
             )
 
     def test_sensor_rays_are_the_real_observation_distances(self):
-        manager = PopulationRolloutManager(_tiny_session())
-        manager.step(3)
+        session = _tiny_session()
+        manager = PopulationRolloutManager(session)
+        session.step()
 
         car = manager.telemetry(include_rays=True)[0]
-        rollout = manager._rollouts[0]
+        member = session._population_trainer.population[0]
 
         self.assertEqual(len(car["sensor_rays"]), 5)
         self.assertIs(car["rays"], car["sensor_rays"])
-        self.assertEqual(
+        np.testing.assert_allclose(
             [ray["normalized_distance"] for ray in car["sensor_rays"]],
             car["observation"][-5:],
+            rtol=0.0,
+            atol=1e-7,
         )
         for ray in car["sensor_rays"]:
             origin_x, origin_y = ray["origin"]
@@ -205,7 +220,7 @@ class PopulationRolloutManagerTests(unittest.TestCase):
             self.assertAlmostEqual(
                 ray["distance"], ray["normalized_distance"] * 150.0
             )
-        expected_q_values = rollout.agent.q_values(car["observation"])
+        expected_q_values = member.agent.q_values(car["observation"])
         np.testing.assert_allclose(car["q_values"], expected_q_values)
         self.assertEqual(car["action"], int(np.argmax(expected_q_values)))
 
@@ -220,14 +235,9 @@ class PopulationRolloutManagerTests(unittest.TestCase):
 
         self.assertEqual(manager.generation, session.current_generation)
         self.assertEqual(manager.count, 3)
-        self.assertTrue(
-            all(
-                previous is not current
-                for previous, current in zip(
-                    original_environments, manager.environments
-                )
-            )
-        )
+        # Environments are long-lived worker contexts; evolution resets them in
+        # place instead of allocating a fresh physics world every generation.
+        self.assertEqual(original_environments, manager.environments)
         self.assertTrue(
             all(
                 item["generation"] == session.current_generation
@@ -235,7 +245,7 @@ class PopulationRolloutManagerTests(unittest.TestCase):
             )
         )
 
-    def test_stepping_rollouts_leaves_trainer_state_bit_identical(self):
+    def test_manager_step_leaves_scored_trainer_state_bit_identical(self):
         session = _tiny_session(evaluation_steps=3)
         trainer = session._population_trainer
         training_env_before = deepcopy(session.env.telemetry())
@@ -249,7 +259,7 @@ class PopulationRolloutManagerTests(unittest.TestCase):
         self.assertEqual(training_env_before, session.env.telemetry())
         self.assertEqual(len(trainer.population[0].agent.replay), 0)
         self.assertEqual(trainer.population[0].agent.gradient_steps, 0)
-        self.assertTrue(all(item["episodes"] == 3 for item in manager.telemetry()))
+        self.assertTrue(all(item["steps"] == 0 for item in manager.telemetry()))
 
 
 if __name__ == "__main__":

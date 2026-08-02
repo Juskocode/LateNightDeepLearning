@@ -355,14 +355,24 @@ class DrivingLearningVisualization:
     def _header(self, data: Mapping[str, Any], *, race: bool = False) -> None:
         pygame.draw.rect(self.surface, COLORS["panel"], (0, 0, self.WIDTH, 76))
         pygame.draw.line(self.surface, COLORS["edge"], (0, 75), (self.WIDTH, 75), 1)
-        title = (
-            "HUMAN VS GENERATION CHAMPION" if race else "EVOLUTIONARY DQN OBSERVATORY"
+        workers = max(1, _integer(data.get("parallel_workers"), 1))
+        population_size = max(1, _integer(data.get("population_size"), 1))
+        parallel_population = not race and population_size > 1 and workers > 1
+        title = "HUMAN VS GENERATION CHAMPION" if race else (
+            "PARALLEL EVOLUTIONARY DQN OBSERVATORY"
+            if parallel_population
+            else "EVOLUTIONARY DQN OBSERVATORY"
         )
         self._text(title, (22, 14), size=22, color=COLORS["cyan"], bold=True)
         subtitle = (
             "Same circuit · deterministic simulation · one fair race"
             if race
-            else "Live policy, population, replay memory, and neural activity"
+            else (
+                f"Synchronous generation · {workers} worker threads · "
+                "stable deterministic merge"
+                if parallel_population
+                else "Live policy, population, replay memory, and neural activity"
+            )
         )
         self._text(subtitle, (23, 44), size=12, color=COLORS["muted"])
         if race:
@@ -883,7 +893,7 @@ class DrivingLearningVisualization:
                 )
             self.surface.blit(ray_layer, viewport.topleft)
         self._draw_curriculum_origin(viewport, env, snapshot)
-        if not cars:
+        if not cars and not population:
             cars = ((None, COLORS["cyan"], "POLICY"),)
         all_cars = [*population, *cars]
         scale_x = viewport.width / TRACK_VIEW_WIDTH
@@ -978,6 +988,8 @@ class DrivingLearningVisualization:
                 )
                 raw_fitness = item.get("fitness", item.get("score"))
                 if raw_fitness is None:
+                    raw_fitness = item.get("evaluation_return")
+                if raw_fitness is None:
                     continue
                 fitness = _finite(raw_fitness)
             else:
@@ -990,8 +1002,13 @@ class DrivingLearningVisualization:
         return sorted(rows, key=lambda row: (-row[1], row[0]))
 
     def _population_panel(self, rect: pygame.Rect, data: Mapping[str, Any]) -> None:
-        self._panel(rect, "POPULATION RANKING", accent=COLORS["yellow"])
-        rows = self._population_rows(data)[:7]
+        title = (
+            "LIVE POPULATION RETURN"
+            if _sequence(data.get("active_member_indices"))
+            else "POPULATION RANKING"
+        )
+        self._panel(rect, title, accent=COLORS["yellow"])
+        rows = self._population_rows(data)[:8]
         current = _integer(data.get("member", data.get("member_index", -1)), -1)
         values = [value for _, value in rows]
         low, high = min(values, default=0.0), max(values, default=1.0)
@@ -1302,7 +1319,20 @@ class DrivingLearningVisualization:
             )
 
     def _overview(self, env: DrivingEnv, data: Mapping[str, Any]) -> None:
-        self._draw_track(pygame.Rect(20, 94, 752, 646), env, telemetry=data)
+        scored_generation_visible = _flag(data.get("show_population_cars")) and any(
+            _flag(_mapping(item).get("scored"))
+            for item in _sequence(data.get("population_rollouts"))
+        )
+        self._draw_track(
+            pygame.Rect(20, 94, 752, 646),
+            env,
+            title=(
+                "SCORED GENERATION ON TRACK"
+                if scored_generation_visible
+                else "CURRENT POLICY ON TRACK"
+            ),
+            telemetry=data,
+        )
         x, top, width, gap = 792, 94, 588, 8
         card_width = (width - gap * 3) // 4
         algorithm = (
@@ -1332,6 +1362,18 @@ class DrivingLearningVisualization:
         population_size = _integer(
             data.get("population_size", len(self._population_rows(data)))
         )
+        active_members = _sequence(data.get("active_member_indices"))
+        active_count = len(active_members)
+        if not active_members:
+            active_count = max(0, _integer(data.get("last_tick_member_count"), 0))
+        workers = max(1, _integer(data.get("parallel_workers"), 1))
+        if population_size > 1:
+            generation_detail = (
+                f"{active_count} cars/tick · {workers} "
+                f"{'thread' if workers == 1 else 'threads'}"
+            )
+        else:
+            generation_detail = f"member {member + 1}/{max(1, population_size)}"
         fitness = _finite(data.get("current_fitness", data.get("fitness")))
         epsilon = _finite(data.get("epsilon"))
         cards = (
@@ -1339,7 +1381,7 @@ class DrivingLearningVisualization:
             (
                 "GENERATION",
                 f"{generation:04d}",
-                f"member {member + 1}/{max(1, population_size)}",
+                generation_detail,
                 COLORS["yellow"],
             ),
             (

@@ -372,6 +372,17 @@ member and are not inherited by children, so ancestry transfers network weights
 rather than stale transitions. Pure `genetic` mode is a useful control because
 it has the same population operators without replay, targets, or TD learning.
 
+Population evaluation is synchronous and concurrent. One trainer tick submits
+one fixed simulation step for every unfinished member to a bounded thread pool;
+each member owns a private environment, car, policy, replay buffer, and optimizer.
+The coordinator waits at a tick barrier and merges results in stable member
+order before ranking or evolution, so thread completion timing cannot change
+selection. `--workers` selects the pool size, `--workers 1` is the exact
+sequential fallback, and the automatic default is capped by both population size
+and available CPUs. Worker count is runtime-only and does not affect checkpoint
+compatibility. A worker exception makes the trainer fail-stop, preventing a
+partially executed tick from being resumed or saved as a valid checkpoint.
+
 Every learning algorithm starts with the same anti-memorization curriculum:
 
 1. Before qualification, every evaluation spawns at a seeded random point on
@@ -396,11 +407,11 @@ python -m drivingGameRL.main --learn --algorithm double_dqn
 
 # Weight-only neuroevolution
 python -m drivingGameRL.main --learn --algorithm genetic \
-  --population 12 --elite-count 2 --evaluation-steps 1800
+  --population 12 --elite-count 2 --evaluation-steps 1800 --workers 8
 
 # Hybrid population-based Double DQN
 late-night-driving-rl --algorithm genetic_dqn \
-  --population 12 --elite-count 2 --evaluation-steps 1800
+  --population 12 --elite-count 2 --evaluation-steps 1800 --workers 8
 
 # Bounded experiments without a window
 python -m drivingGameRL.main --learn --algorithm double_dqn \
@@ -421,7 +432,7 @@ The 1,400×760 learning dashboard is fed only by live telemetry:
 
 | Tab | Live evidence |
 |---|---|
-| Overview | Current car and circuit, episode-origin gate and relative loop progress, curriculum state, generation/member progress, population fitness, best/mean history, observations, selected action, and Q-values |
+| Overview | Real scored cars and circuit, exact rays, episode-origin gates and relative loop progress, generation-wide cars-per-tick and worker count, population fitness, best/mean history, observations, selected actions, and Q-values |
 | Network | The current network's actual architecture, activations, parameter count, and sampled connection weights |
 | Memory | Replay occupancy, epsilon, loss, TD error, gradient updates, action use, target synchronization, and recent learning state |
 
@@ -433,7 +444,7 @@ The 1,400×760 learning dashboard is fed only by live telemetry:
 | `[` or `,` | Reduce simulated training steps per rendered frame |
 | `]` or `.` | Increase simulated training steps per rendered frame |
 | `V` | Show or hide the five exact sensor rays supplied to the policy |
-| `M` | Show or hide isolated rollout cars for the current generation |
+| `M` | Show or hide the real scored cars running in the current generation |
 | `C` | Cycle the live comparison limit through 2, 4, 8, and 12 cars |
 | `P` | Pause training and start/leave a one-lap race against the current generation champion |
 | `R` | Reset the current evaluation; start a rematch while racing |
@@ -441,14 +452,13 @@ The 1,400×760 learning dashboard is fed only by live telemetry:
 | `Esc` | Quit |
 
 With rays enabled, every line endpoint comes from the same immutable
-`SensorRay` snapshot used to build the final five observation values. `M` adds
-color-coded rollouts for the selected number of current-generation genomes;
-`C` changes that limit without touching scored training. Those cars use cloned
-policies and private, identically configured environments, including the same
-curriculum readiness and seeded origin. They are never scored and cannot change
-replay, gradients, fitness, or selection. They refresh
-automatically when the population evolves. Pass `--population-cars` to start
-with them visible, `--preview-cars N` to choose an initial limit of 2, 4, 8, or
+`SensorRay` snapshot used to build the final five observation values. In a
+population run, `M` renders the selected real scored members from the most recent
+completed lockstep tick: their poses, actions, observations, returns, and rays
+are telemetry snapshots, not independently simulated previews. `C` changes only
+the number drawn. Standalone DQN modes retain isolated comparison clones because
+there is no population to display. Pass `--population-cars` to start with the
+population visible, `--preview-cars N` to choose an initial limit of 2, 4, 8, or
 12, or `--no-sensors` to start with rays hidden.
 
 The yellow **RANDOM ORIGIN** gate on the track is the finish target for the
@@ -458,10 +468,13 @@ The network's `lap_progress` observation remains the absolute circuit coordinate
 so telemetry never overloads one field with two meanings.
 
 Visible training is time-sliced so a costly DQN update or `MAX` setting cannot
-starve input and rendering. The speed preset remains the requested step cap;
-the header shows the actual steps completed in the last frame and smoothed FPS
-when the CPU budget caps it. No transition is dropped or reordered, and
-headless training still runs the exact requested batches at full throughput.
+starve input and rendering. For populations, one displayed training step is one
+synchronous tick across every unfinished member, so it may represent up to
+`population_size` environment decisions. The overview reports cars per tick and
+worker threads; the header still shows actual trainer ticks completed in the
+last frame and smoothed FPS when the CPU budget caps it. No transition is dropped
+or reordered, and headless training still runs the exact requested batches at
+full throughput.
 Immutable circuit-segment geometry and same-pose ray snapshots are reused
 across cars and panels instead of being recomputed every frame.
 
@@ -564,13 +577,13 @@ python -m drivingGameRL.main \
 
 python -m drivingGameRL.main \
   --learn --algorithm genetic_dqn --population 4 --elite-count 1 \
-  --evaluation-steps 600 --seed 19 --steps 1150 \
+  --evaluation-steps 600 --workers 4 --seed 19 --steps 1150 \
   --population-cars --preview-cars 8 \
   --screenshot assets/screenshots/driving-learning.png
 
 python -m drivingGameRL.main \
   --learn --algorithm genetic_dqn --population 4 --elite-count 1 \
-  --evaluation-steps 600 --seed 19 \
+  --evaluation-steps 600 --workers 4 --seed 19 \
   --population-cars --preview-cars 8 \
   --gif assets/gifs/driving-genetic-dqn.gif --no-save
 ```

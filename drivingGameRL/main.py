@@ -25,7 +25,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Run without a window (autopilot in manual mode)",
     )
     parser.add_argument(
-        "--steps", type=int, help="Stop after this many fixed simulation steps"
+        "--steps",
+        type=int,
+        help=(
+            "Stop after this many fixed simulation steps; population learning "
+            "counts synchronous generation ticks"
+        ),
     )
     parser.add_argument(
         "--screenshot", type=Path, help="Save the final rendered frame as PNG"
@@ -93,6 +98,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Fixed simulation-step budget per policy",
     )
     learning.add_argument(
+        "--workers",
+        type=int,
+        help=(
+            "Population evaluation threads (default: auto, capped by population "
+            "size and available CPUs)"
+        ),
+    )
+    learning.add_argument(
         "--generations",
         type=int,
         help="Stop after this many completed generations/episodes",
@@ -139,7 +152,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--population-cars",
         "--show-population-cars",
         action="store_true",
-        help="Start with isolated same-generation rollout cars visible",
+        help="Start with real scored generation cars visible",
     )
     learning.add_argument(
         "--preview-cars",
@@ -161,6 +174,8 @@ def _run_learning(args: argparse.Namespace, parser: argparse.ArgumentParser) -> 
         parser.error("--tournament-size must be in [1, population]")
     if args.evaluation_steps <= 0:
         parser.error("--evaluation-steps must be positive")
+    if args.workers is not None and args.workers <= 0:
+        parser.error("--workers must be positive")
     if args.generations is not None and args.generations <= 0:
         parser.error("--generations must be positive")
 
@@ -180,6 +195,7 @@ def _run_learning(args: argparse.Namespace, parser: argparse.ArgumentParser) -> 
         blend_alpha=args.blend_alpha,
         mutation_rate=args.mutation_rate,
         mutation_std=args.mutation_std,
+        parallel_workers=args.workers,
     )
     session = DrivingLearningSession(
         runtime,

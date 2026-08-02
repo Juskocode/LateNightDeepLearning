@@ -176,6 +176,31 @@ class DrivingLearningVisualizationTests(unittest.TestCase):
         self.assertEqual(after["position"], before["position"])
         self.assertEqual(after["current_lap_time"], before["current_lap_time"])
 
+    def test_parallel_generation_status_is_visible_and_read_only(self):
+        before = self.env.telemetry()
+        sequential = self.visualization.draw(
+            telemetry={
+                **self.telemetry,
+                "parallel_workers": 1,
+                "active_member_indices": [0],
+                "last_tick_member_count": 1,
+            }
+        ).copy()
+        parallel = self.visualization.draw(
+            telemetry={
+                **self.telemetry,
+                "parallel_workers": 6,
+                "active_member_indices": list(range(8)),
+                "last_tick_member_count": 8,
+            }
+        ).copy()
+
+        self.assertNotEqual(
+            pygame.image.tostring(parallel, "RGB"),
+            pygame.image.tostring(sequential, "RGB"),
+        )
+        self.assertEqual(self.env.telemetry(), before)
+
     def test_curriculum_view_marks_the_random_episode_origin_read_only(self):
         env = DrivingEnv(
             "canyon_maze", seed=29, random_start_curriculum=True

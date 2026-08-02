@@ -20,6 +20,7 @@ from drivingGameRL.src.learning_runtime import (
     LearningRuntimeConfig,
 )
 from drivingGameRL.src.ml import DQNConfig
+from drivingGameRL.src.population_rollout import PopulationRolloutManager
 from drivingGameRL.src.vehicle import DriverControls
 
 
@@ -43,6 +44,10 @@ class LearningRuntimeConfigTests(unittest.TestCase):
             LearningRuntimeConfig(population_size=2, elite_count=2)
         with self.assertRaises(ValueError):
             LearningRuntimeConfig(mutation_rate=1.1)
+        for invalid in (True, 0, -1, 2.5):
+            with self.subTest(parallel_workers=invalid):
+                with self.assertRaises(ValueError):
+                    LearningRuntimeConfig(parallel_workers=invalid)
 
 
 class DrivingLearningSessionTests(unittest.TestCase):
@@ -70,7 +75,7 @@ class DrivingLearningSessionTests(unittest.TestCase):
         self.assertEqual(telemetry["network"]["architecture"], [12, 8, 5])
         self.assertEqual(telemetry["replay_size"], 2)
 
-    def test_pure_genetic_population_evolves_after_every_member(self):
+    def test_pure_genetic_population_evolves_after_one_lockstep_tick(self):
         session = DrivingLearningSession(
             LearningRuntimeConfig(
                 algorithm="genetic",
@@ -83,13 +88,13 @@ class DrivingLearningSessionTests(unittest.TestCase):
             dqn_config=tiny_dqn(seed=5),
         )
 
-        first = session.step()
-        second = session.step()
+        result = session.step()
         telemetry = session.telemetry()
 
-        self.assertTrue(first.member_completed)
-        self.assertTrue(second.generation_completed)
-        self.assertTrue(second.evolved)
+        self.assertTrue(result.member_completed)
+        self.assertTrue(result.generation_completed)
+        self.assertTrue(result.evolved)
+        self.assertEqual(len(result.member_results), 2)
         self.assertEqual(session.completed_generations, 1)
         self.assertEqual(len(telemetry["population"]), 2)
         self.assertEqual(len(telemetry["generation_history"]), 1)
@@ -108,11 +113,48 @@ class DrivingLearningSessionTests(unittest.TestCase):
         )
 
         session.step()
-        session.step()
+        completed = session.step()
 
-        completed_member = session._population_trainer.population[0]
-        self.assertIsNotNone(completed_member.result)
-        self.assertGreater(completed_member.agent.gradient_steps, 0)
+        self.assertEqual(len(completed.member_results), 2)
+        self.assertTrue(
+            all(result.training_updates > 0 for result in completed.member_results)
+        )
+
+    def test_population_session_exposes_parallel_workers_and_real_scored_cars(self):
+        session = DrivingLearningSession(
+            LearningRuntimeConfig(
+                algorithm="genetic",
+                evaluation_steps=4,
+                population_size=4,
+                elite_count=1,
+                tournament_size=2,
+                parallel_workers=2,
+                seed=19,
+            ),
+            dqn_config=tiny_dqn(seed=19),
+        )
+        self.addCleanup(session.close)
+
+        session.step()
+        telemetry = session.telemetry()
+        cars = session.scored_population_telemetry(include_rays=True)
+
+        self.assertEqual(
+            telemetry["parallel_workers"],
+            min(2, max(1, os.cpu_count() or 1), 4, 32),
+        )
+        self.assertEqual(telemetry["active_member_indices"], [0, 1, 2, 3])
+        self.assertEqual(
+            {item["status"] for item in telemetry["population"]}, {"evaluating"}
+        )
+        self.assertEqual(len(cars), 4)
+        self.assertEqual({item["steps"] for item in cars}, {1})
+        self.assertTrue(all(item["source"] == "training" for item in cars))
+        self.assertTrue(all(len(item["sensor_rays"]) == 5 for item in cars))
+        self.assertEqual(
+            tuple(id(env) for env in session._population_trainer.member_environments),
+            tuple(id(env) for env in PopulationRolloutManager(session).environments),
+        )
 
     def test_loaded_dqn_is_the_best_available_race_policy(self):
         config = LearningRuntimeConfig(
@@ -315,6 +357,12 @@ class DrivingLearningGameTests(unittest.TestCase):
                         training_frame_budget_ms=invalid,
                     )
 
+    def test_close_releases_session_resources(self):
+        with patch.object(self.session, "close", wraps=self.session.close) as close:
+            self.game.close()
+
+        close.assert_called_once_with()
+
     def test_paused_single_step_advances_enabled_generation_cars(self):
         self.game.toggle_population_cars()
         self.game.paused = True
@@ -341,6 +389,8 @@ class DrivingLearningGameTests(unittest.TestCase):
                 "3",
                 "--evaluation-steps",
                 "1200",
+                "--workers",
+                "6",
                 "--population-cars",
                 "--preview-cars",
                 "12",
@@ -352,6 +402,7 @@ class DrivingLearningGameTests(unittest.TestCase):
         self.assertEqual(args.population, 14)
         self.assertEqual(args.elite_count, 3)
         self.assertEqual(args.evaluation_steps, 1200)
+        self.assertEqual(args.workers, 6)
         self.assertTrue(args.population_cars)
         self.assertEqual(args.preview_cars, 12)
         self.assertTrue(args.no_sensors)

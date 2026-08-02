@@ -160,19 +160,23 @@ class DrivingRandomSpawnRuntimeTests(unittest.TestCase):
         self.assertFalse(custom.env.random_start_curriculum)
         self.assertIs(custom.env, normal_start_env)
 
-    def test_population_members_share_one_seeded_spawn_scenario(self):
+    def test_population_members_share_one_seeded_spawn_and_advance_together(self):
         trainer = PopulationTrainer(
             _evolution(seed=31), _dqn(31), auto_evolve=False
         )
-        first_position = trainer.env.vehicle.state.position
+        environments = trainer.member_environments
+        positions = tuple(env.vehicle.state.position for env in environments)
 
         trainer.step()
-        trainer.step()
-        trainer.step()
 
-        self.assertEqual(trainer.current_member_index, 1)
-        self.assertEqual(trainer.env.vehicle.state.position, first_position)
-        self.assertEqual(trainer.env.telemetry()["spawn_mode"], "random_track")
+        self.assertEqual(len({id(env) for env in environments}), 2)
+        self.assertEqual(positions[0], positions[1])
+        self.assertEqual({env.steps for env in environments}, {1})
+        self.assertEqual(trainer.active_member_indices, (0, 1))
+        self.assertEqual(
+            {env.telemetry()["spawn_mode"] for env in environments},
+            {"random_track"},
+        )
 
     def test_population_unlock_is_deferred_until_generation_boundary(self):
         trainer = PopulationTrainer(
@@ -203,20 +207,20 @@ class DrivingRandomSpawnRuntimeTests(unittest.TestCase):
             },
         )
 
-        with patch.object(trainer.env, "step", return_value=completed):
-            first = trainer.step()
+        first_env, second_env = trainer.member_environments
+        with (
+            patch.object(first_env, "step", return_value=completed),
+            patch.object(second_env, "step", return_value=ordinary_end),
+        ):
+            result = trainer.step()
 
-        self.assertTrue(first.member_completed)
-        self.assertEqual(first.result.progress, 1.0)
+        self.assertTrue(result.member_completed)
+        self.assertTrue(result.generation_completed)
+        self.assertEqual(result.member_results[0].progress, 1.0)
         self.assertTrue(trainer._pending_curriculum_unlock)
         self.assertFalse(trainer.env.curriculum_ready)
         self.assertEqual(trainer.env.telemetry()["spawn_mode"], "random_track")
-
-        with patch.object(trainer.env, "step", return_value=ordinary_end):
-            second = trainer.step()
-
-        self.assertTrue(second.generation_completed)
-        self.assertFalse(second.evolved)
+        self.assertFalse(result.evolved)
         self.assertFalse(trainer.env.curriculum_ready)
 
         trainer.evolve()
@@ -227,7 +231,8 @@ class DrivingRandomSpawnRuntimeTests(unittest.TestCase):
     def test_population_checkpoint_preserves_curriculum_readiness(self):
         config = _evolution(seed=43)
         trainer = PopulationTrainer(config, _dqn(43), auto_evolve=False)
-        trainer.env.load_curriculum_state({"unlocked": True})
+        for env in trainer.member_environments:
+            env.load_curriculum_state({"unlocked": True})
         trainer._generation_curriculum_ready = True
 
         with tempfile.TemporaryDirectory() as directory:

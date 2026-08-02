@@ -6,22 +6,24 @@ is the return earned by a greedy policy.  ``genetic_dqn`` evaluates the same
 chromosomes with epsilon-greedy actions and applies replay-based TD updates
 before selection, combining within-lifetime and across-generation learning.
 
-Evaluation is deliberately sequential.  That makes one visible
-``DrivingEnv`` the source of truth for the renderer, keeps memory bounded, and
-makes a seeded run reproducible without parallel-worker timing effects.
+Every member owns an isolated ``DrivingEnv`` and evaluation context.  Active
+members advance one lockstep tick through a bounded thread pool; results are
+merged by population index on the coordinator thread.  Seeded runs therefore
+remain reproducible even when worker completion order changes.
 """
 
 from __future__ import annotations
 
 from collections import deque
 from collections.abc import Callable, Mapping
+from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field, replace
 import math
 import os
 from pathlib import Path
 import tempfile
-from typing import Any, Literal
+from typing import Any, Literal, NoReturn
 
 import numpy as np
 import torch
@@ -254,7 +256,12 @@ class ChampionSnapshot:
 
 @dataclass(frozen=True, slots=True)
 class PopulationStep:
-    """What happened during one fixed environment step."""
+    """What happened during one lockstep population tick.
+
+    The original scalar fields describe a deterministic representative member
+    (the focal member, or the lowest-index completion when another car ends
+    first). ``member_results`` reports every member completed by the same tick.
+    """
 
     generation: int
     member_id: int
@@ -271,10 +278,39 @@ class PopulationStep:
     result: EvaluationResult | None
     generation_record: GenerationRecord | None
     info: dict[str, object]
+    member_results: tuple[EvaluationResult, ...] = ()
+    active_member_indices: tuple[int, ...] = ()
+
+
+@dataclass(slots=True)
+class _EvaluationRuntime:
+    """Mutable state owned by exactly one population member."""
+
+    env: DrivingEnv
+    observation: np.ndarray
+    total_reward: float = 0.0
+    steps: int = 0
+    losses: list[float] = field(default_factory=list)
+    last_reward: float = 0.0
+    last_info: dict[str, object] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class _MemberAdvance:
+    """Worker-produced transition merged later by the coordinator thread."""
+
+    index: int
+    state: np.ndarray
+    action: int
+    env_result: StepResult
+    next_state: np.ndarray
+    budget_reached: bool
+    done: bool
+    loss: float | None
 
 
 class PopulationTrainer:
-    """Sequential genetic and hybrid-DQN population session over ``DrivingEnv``."""
+    """Lockstep, multithreaded genetic population session over ``DrivingEnv``."""
 
     CHECKPOINT_VERSION = 1
     GENOME_SAMPLE_LIMIT = 2_048
@@ -289,6 +325,7 @@ class PopulationTrainer:
         env: DrivingEnv | None = None,
         env_factory: Callable[[int], DrivingEnv] | None = None,
         auto_evolve: bool = True,
+        parallel_workers: int | None = None,
     ) -> None:
         if env is not None and env_factory is not None:
             raise ValueError("provide env or env_factory, not both")
@@ -300,6 +337,27 @@ class PopulationTrainer:
                 f"{self.dqn_config.action_size}"
             )
         self.auto_evolve = bool(auto_evolve)
+        if parallel_workers is not None and (
+            isinstance(parallel_workers, bool)
+            or not isinstance(parallel_workers, int)
+            or parallel_workers <= 0
+        ):
+            raise ValueError("parallel_workers must be a positive integer or None")
+        cpu_workers = max(1, os.cpu_count() or 1)
+        requested_workers = (
+            cpu_workers if parallel_workers is None else parallel_workers
+        )
+        self.requested_parallel_workers = parallel_workers
+        self.parallel_workers = min(
+            self.config.population_size,
+            requested_workers,
+            32,
+        )
+        self._executor: ThreadPoolExecutor | None = None
+        self._closed = False
+        self._worker_failure: BaseException | None = None
+        self._environment_decisions = 0
+        self._last_tick_member_count = 0
         self._rng = np.random.default_rng(self.config.seed)
         self._next_member_id = 0
         self.generation = 0
@@ -307,19 +365,48 @@ class PopulationTrainer:
             maxlen=self.config.history_capacity
         )
 
+        initial_seed = self._generation_evaluation_seed(0)
         if env is not None:
-            self.env = env
+            if type(env) is not DrivingEnv:
+                raise TypeError(
+                    "env must be an exact DrivingEnv; use env_factory for custom "
+                    "DrivingEnv subclasses so every member gets identical semantics"
+                )
+            first_env = env
         elif env_factory is not None:
-            self.env = env_factory(self._evaluation_seed(0, 0))
+            first_env = env_factory(initial_seed)
         else:
-            self.env = DrivingEnv(
+            first_env = DrivingEnv(
                 circuit,
-                seed=self._evaluation_seed(0, 0),
+                seed=initial_seed,
                 max_steps=max(self.config.evaluation_steps, 1),
                 random_start_curriculum=True,
             )
+        if not isinstance(first_env, DrivingEnv):
+            raise TypeError("env_factory must return DrivingEnv instances")
 
-        initial_observation = self.env.reset(seed=self._evaluation_seed(0, 0))
+        member_envs = [first_env]
+        for _ in range(1, self.config.population_size):
+            if env_factory is not None:
+                member_env = env_factory(initial_seed)
+                if not isinstance(member_env, DrivingEnv):
+                    raise TypeError("env_factory must return DrivingEnv instances")
+            else:
+                member_env = self._clone_environment(first_env, seed=initial_seed)
+            member_envs.append(member_env)
+        if any(type(member_env) is not type(first_env) for member_env in member_envs):
+            raise TypeError("env_factory must return one consistent DrivingEnv type")
+        if len({id(member_env) for member_env in member_envs}) != len(member_envs):
+            raise ValueError(
+                "each population member requires an independent environment"
+            )
+        self._member_envs = member_envs
+        self.env = first_env
+
+        # Constructors already establish one valid observation. Avoid an extra
+        # reset for member zero: custom factories must see identical reset counts
+        # across every member before the shared generation runtime begins.
+        initial_observation = self.env.observation()
         if len(initial_observation) != self.dqn_config.observation_size:
             raise ValueError(
                 "DrivingEnv observation size does not match DQNConfig: "
@@ -330,6 +417,7 @@ class PopulationTrainer:
             self._new_random_member() for _ in range(self.config.population_size)
         ]
         self._current_index = 0
+        self._member_runtimes: list[_EvaluationRuntime] = []
         self._observation = np.asarray(initial_observation, dtype=np.float32)
         self._evaluation_return = 0.0
         self._evaluation_steps = 0
@@ -351,7 +439,7 @@ class PopulationTrainer:
         # loses the most recently established generation champion.
         self._race_champion: ChampionSnapshot | None = None
         self._race_champion_agent: DrivingDQNAgent | None = None
-        self._start_member(0)
+        self._start_generation_runtime()
 
     @property
     def algorithm(self) -> EvolutionAlgorithm:
@@ -378,6 +466,56 @@ class PopulationTrainer:
     @property
     def observation(self) -> tuple[float, ...]:
         return tuple(float(value) for value in self._observation)
+
+    @property
+    def member_environments(self) -> tuple[DrivingEnv, ...]:
+        """Training-owned environments in stable population order.
+
+        Callers may inspect these environments for rendering, but must not
+        step or reset them; the trainer is their sole mutation owner.
+        """
+
+        return tuple(self._member_envs)
+
+    @property
+    def member_observations(self) -> tuple[tuple[float, ...], ...]:
+        """Latest policy observation for every member in population order."""
+
+        return tuple(
+            tuple(float(value) for value in runtime.observation)
+            for runtime in self._member_runtimes
+        )
+
+    @property
+    def active_member_indices(self) -> tuple[int, ...]:
+        """Unevaluated population indices advanced by the next lockstep tick."""
+
+        return tuple(
+            index
+            for index, member in enumerate(self.population)
+            if not member.evaluated
+        )
+
+    @property
+    def member_runtime(self) -> tuple[dict[str, object], ...]:
+        """Cheap aligned status rows for renderers and runtime facades."""
+
+        active = set(self.active_member_indices)
+        return tuple(
+            {
+                "index": index,
+                "member_id": member.member_id,
+                "status": "active" if index in active else "evaluated",
+                "evaluation_step": runtime.steps,
+                "evaluation_return": runtime.total_reward,
+                "last_reward": runtime.last_reward,
+                "action": member.agent.last_action,
+                "result": member.result,
+            }
+            for index, (member, runtime) in enumerate(
+                zip(self.population, self._member_runtimes)
+            )
+        )
 
     @property
     def generation_complete(self) -> bool:
@@ -432,8 +570,9 @@ class PopulationTrainer:
     def reset(
         self, *, seed: int | None = None, restart_generation: bool = False
     ) -> tuple[float, ...]:
-        """Restart one evaluation, optionally discarding this generation's scores."""
+        """Restart every unfinished context on one shared scenario seed."""
 
+        self._require_usable()
         if seed is not None:
             if (
                 isinstance(seed, bool)
@@ -444,94 +583,95 @@ class PopulationTrainer:
         if restart_generation:
             for member in self.population:
                 member.result = None
-            self._current_index = 0
             self._current_champion = None
             self._current_champion_agent = None
             self._pending_curriculum_unlock = False
-        elif self.current_member is None:
-            self._current_index = 0
         reset_seed = (
-            self._generation_evaluation_seed(self.generation)
-            if seed is None
-            else seed
+            self._generation_evaluation_seed(self.generation) if seed is None else seed
         )
-        self.env.load_curriculum_state(
-            {"unlocked": self._generation_curriculum_ready}
-        )
-        observation = self.env.reset(seed=reset_seed)
-        self._set_evaluation_start(observation)
+        self._start_generation_runtime(seed=reset_seed, keep_evaluated=True)
         return self.observation
 
     def step(self) -> PopulationStep:
-        """Advance the visible member by one physics frame and learn if hybrid."""
+        """Advance every active member by one concurrent, lockstep physics frame."""
 
-        member = self.current_member
-        if member is None or self.generation_complete:
+        self._require_usable()
+        active_indices = self.active_member_indices
+        if not active_indices:
             raise RuntimeError("generation is complete; call evolve() before stepping")
-        member_index = self._current_index
+        member_index = (
+            self._current_index
+            if self._current_index in active_indices
+            else active_indices[0]
+        )
         generation = self.generation
-        state = self._observation.copy()
-        explore = self.config.algorithm == "genetic_dqn"
-        action = member.agent.select_action(state, explore=explore)
-        env_result = self.env.step(action)
-        next_state = np.asarray(env_result.observation, dtype=np.float32)
-        self._evaluation_steps += 1
-        self._evaluation_return += float(env_result.reward)
-        self._last_reward = float(env_result.reward)
-        self._last_info = dict(env_result.info)
-        if bool(env_result.info.get("curriculum_lap_completed", False)):
-            self._pending_curriculum_unlock = True
+        advances = self._advance_active_members(active_indices)
+        self._last_tick_member_count = len(advances)
+        self._environment_decisions += len(advances)
+        advances_by_index = {advance.index: advance for advance in advances}
+        completed_results: list[EvaluationResult] = []
+        focal_result: EvaluationResult | None = None
+        for advance in advances:
+            runtime = self._member_runtimes[advance.index]
+            runtime.observation = advance.next_state
+            runtime.steps += 1
+            runtime.total_reward += float(advance.env_result.reward)
+            runtime.last_reward = float(advance.env_result.reward)
+            runtime.last_info = dict(advance.env_result.info)
+            if advance.loss is not None and math.isfinite(advance.loss):
+                runtime.losses.append(advance.loss)
+            if bool(advance.env_result.info.get("curriculum_lap_completed", False)):
+                self._pending_curriculum_unlock = True
+            if advance.done:
+                result = self._finish_member(advance.index, advance)
+                completed_results.append(result)
+                if advance.index == member_index:
+                    focal_result = result
 
-        budget_reached = self._evaluation_steps >= self.config.evaluation_steps
-        done = bool(env_result.terminated or env_result.truncated or budget_reached)
-        if self.config.algorithm == "genetic_dqn":
-            loss = member.agent.observe(
-                state,
-                action,
-                env_result.reward,
-                next_state,
-                done,
-            )
-            if loss is not None and math.isfinite(float(loss)):
-                self._evaluation_losses.append(float(loss))
-
-        result: EvaluationResult | None = None
         generation_record: GenerationRecord | None = None
-        generation_completed = False
+        generation_completed = self.generation_complete
         evolved = False
-        self._observation = next_state
-        if done:
-            result = self._finish_member(
-                member,
-                env_result,
-                budget_reached=budget_reached,
+        report_index = member_index
+        report_result = focal_result
+        if report_result is None and completed_results:
+            completed_ids = {result.member_id for result in completed_results}
+            report_index = next(
+                index
+                for index in active_indices
+                if self.population[index].member_id in completed_ids
             )
-            generation_completed = self.generation_complete
-            if generation_completed:
-                if self.auto_evolve:
-                    generation_record = self.evolve()
-                    evolved = True
-                else:
-                    self._current_index = len(self.population)
-            else:
-                self._start_member(member_index + 1)
+            report_result = self.population[report_index].result
+        report_member = self.population[report_index]
+        report_advance = advances_by_index[report_index]
+        if generation_completed and self.auto_evolve:
+            generation_record = self.evolve()
+            evolved = True
+        elif generation_completed:
+            self._sync_focal_aliases(member_index)
+            self._current_index = len(self.population)
+        else:
+            self._sync_focal_aliases(self.active_member_indices[0])
 
         return PopulationStep(
             generation=generation,
-            member_id=member.member_id,
-            member_index=member_index,
-            observation=tuple(float(value) for value in state),
-            action=action,
-            reward=float(env_result.reward),
-            next_observation=tuple(float(value) for value in next_state),
-            terminated=bool(env_result.terminated),
-            truncated=bool(env_result.truncated or budget_reached),
-            member_completed=result is not None,
+            member_id=report_member.member_id,
+            member_index=report_index,
+            observation=tuple(float(value) for value in report_advance.state),
+            action=report_advance.action,
+            reward=float(report_advance.env_result.reward),
+            next_observation=tuple(float(value) for value in report_advance.next_state),
+            terminated=bool(report_advance.env_result.terminated),
+            truncated=bool(
+                report_advance.env_result.truncated or report_advance.budget_reached
+            ),
+            member_completed=report_result is not None,
             generation_completed=generation_completed,
             evolved=evolved,
-            result=result,
+            result=report_result,
             generation_record=generation_record,
-            info=dict(env_result.info),
+            info=dict(report_advance.env_result.info),
+            member_results=tuple(completed_results),
+            active_member_indices=active_indices,
         )
 
     def tournament_select(
@@ -632,6 +772,7 @@ class PopulationTrainer:
     def evolve(self) -> GenerationRecord:
         """Retain exact elites, create mutated children, and begin the next generation."""
 
+        self._require_usable()
         if not self.generation_complete:
             raise RuntimeError(
                 "every population member must be evaluated before evolve()"
@@ -697,14 +838,10 @@ class PopulationTrainer:
         self._current_champion = None
         self._current_champion_agent = None
         self._generation_curriculum_ready = (
-            self._generation_curriculum_ready
-            or self._pending_curriculum_unlock
+            self._generation_curriculum_ready or self._pending_curriculum_unlock
         )
         self._pending_curriculum_unlock = False
-        self.env.load_curriculum_state(
-            {"unlocked": self._generation_curriculum_ready}
-        )
-        self._start_member(0)
+        self._start_generation_runtime()
         return record
 
     def network_snapshot(self, *, champion: bool = False) -> dict[str, Any]:
@@ -724,11 +861,43 @@ class PopulationTrainer:
         learning = None if member is None else member.agent.telemetry(self._observation)
         replay_size = sum(len(item.agent.replay) for item in self.population)
         replay_capacity = sum(item.agent.replay.capacity for item in self.population)
+        population = []
+        active_indices = self.active_member_indices
+        active_set = set(active_indices)
+        for index, (item, runtime) in enumerate(
+            zip(self.population, self._member_runtimes)
+        ):
+            summary = item.summary()
+            summary.update(
+                {
+                    "index": index,
+                    "status": "active" if index in active_set else "evaluated",
+                    "evaluation_step": runtime.steps,
+                    "evaluation_return": runtime.total_reward,
+                    "last_reward": runtime.last_reward,
+                    "action": item.agent.last_action,
+                    "observation": [float(value) for value in runtime.observation],
+                    "curriculum_qualified": runtime.env.curriculum_ready,
+                    "curriculum_generation_ready": (self._generation_curriculum_ready),
+                }
+            )
+            population.append(summary)
         return {
             "algorithm": self.config.algorithm,
             "dqn_algorithm": self.dqn_config.algorithm,
             "generation": self.generation,
             "population_size": len(self.population),
+            "parallel_workers": self.parallel_workers,
+            "requested_parallel_workers": self.requested_parallel_workers,
+            "worker_failed": self._worker_failure is not None,
+            "worker_failure_type": (
+                None
+                if self._worker_failure is None
+                else type(self._worker_failure).__name__
+            ),
+            "environment_decisions": self._environment_decisions,
+            "last_tick_member_count": self._last_tick_member_count,
+            "active_member_indices": list(active_indices),
             "evaluated_members": len(evaluated),
             "current_member_index": self.current_member_index,
             "current_member_id": None if member is None else member.member_id,
@@ -738,7 +907,7 @@ class PopulationTrainer:
             / self.config.evaluation_steps,
             "evaluation_return": self._evaluation_return,
             "last_reward": self._last_reward,
-            "population": [item.summary() for item in self.population],
+            "population": population,
             "fitness": {
                 "best": None if not len(fitnesses) else float(fitnesses.max()),
                 "mean": None if not len(fitnesses) else float(fitnesses.mean()),
@@ -771,12 +940,17 @@ class PopulationTrainer:
                 "capacity": replay_capacity,
                 "fill_ratio": replay_size / replay_capacity if replay_capacity else 0.0,
             },
+            "curriculum": {
+                "generation_ready": self._generation_curriculum_ready,
+                "pending_unlock": self._pending_curriculum_unlock,
+            },
             "environment": self.env.telemetry(),
         }
 
     def state_dict(self) -> dict[str, Any]:
         """Compact checkpoint state; replay transitions are intentionally excluded."""
 
+        self._require_usable()
         return {
             "checkpoint_version": self.CHECKPOINT_VERSION,
             "evolution_config": self.config.to_dict(),
@@ -785,12 +959,13 @@ class PopulationTrainer:
             # Persist it explicitly so a resumed population does not forget
             # that it already demonstrated a complete lap from a random pose.
             "environment_curriculum": {
-                **self.env.curriculum_state(),
+                "unlocked": self._generation_curriculum_ready,
                 "generation_ready": self._generation_curriculum_ready,
                 "pending_unlock": self._pending_curriculum_unlock,
             },
             "generation": self.generation,
             "next_member_id": self._next_member_id,
+            "environment_decisions": self._environment_decisions,
             "rng_state": deepcopy(self._rng.bit_generator.state),
             "population": [
                 {
@@ -816,6 +991,7 @@ class PopulationTrainer:
     def load_state_dict(self, state: Mapping[str, Any]) -> None:
         """Restore a population and restart its first unfinished evaluation."""
 
+        self._require_usable()
         if int(state.get("checkpoint_version", -1)) != self.CHECKPOINT_VERSION:
             raise ValueError("unsupported population checkpoint version")
         saved_evolution = EvolutionConfig.from_dict(state["evolution_config"])
@@ -868,6 +1044,17 @@ class PopulationTrainer:
         self.population = population
         self.generation = int(state["generation"])
         self._next_member_id = int(state["next_member_id"])
+        self._environment_decisions = int(
+            state.get(
+                "environment_decisions",
+                sum(
+                    member.result.steps
+                    for member in population
+                    if member.result is not None
+                ),
+            )
+        )
+        self._last_tick_member_count = 0
         self._rng.bit_generator.state = deepcopy(state["rng_state"])
         self.history = deque(
             (GenerationRecord.from_dict(item) for item in state.get("history", ())),
@@ -889,30 +1076,14 @@ class PopulationTrainer:
                 curriculum.get("unlocked", curriculum.get("ready", False)),
             )
         )
-        self._pending_curriculum_unlock = bool(
-            curriculum.get("pending_unlock", False)
-        )
-        self.env.load_curriculum_state(
-            {"unlocked": self._generation_curriculum_ready}
-        )
-        unfinished = next(
-            (
-                index
-                for index, member in enumerate(self.population)
-                if not member.evaluated
-            ),
-            len(self.population),
-        )
-        self._current_index = unfinished
-        if unfinished < len(self.population):
-            self._start_member(unfinished)
-        else:
-            observation = self.env.reset(
-                seed=self._generation_evaluation_seed(self.generation)
-            )
-            self._set_evaluation_start(observation)
+        self._pending_curriculum_unlock = bool(curriculum.get("pending_unlock", False))
+        # Version-one checkpoints never stored partial environment contexts.
+        # Keep that portable contract: retain completed results and restart all
+        # unfinished members from the generation's one common scenario seed.
+        self._start_generation_runtime(keep_evaluated=True)
 
     def save(self, path: str | Path) -> Path:
+        self._require_usable()
         output = Path(path).expanduser().resolve()
         output.parent.mkdir(parents=True, exist_ok=True)
         descriptor, temporary_name = tempfile.mkstemp(
@@ -928,6 +1099,7 @@ class PopulationTrainer:
         return output
 
     def load(self, path: str | Path) -> None:
+        self._require_usable()
         checkpoint = Path(path).expanduser().resolve()
         if not checkpoint.is_file():
             raise FileNotFoundError(f"population checkpoint not found: {checkpoint}")
@@ -936,6 +1108,29 @@ class PopulationTrainer:
         except TypeError:  # pragma: no cover - compatibility with older Torch
             state = torch.load(checkpoint, map_location="cpu")
         self.load_state_dict(state)
+
+    def close(self) -> None:
+        """Release persistent evaluation threads; safe to call repeatedly."""
+
+        if self._closed:
+            return
+        self._closed = True
+        executor = self._executor
+        self._executor = None
+        if executor is not None:
+            executor.shutdown(wait=True, cancel_futures=False)
+
+    def __enter__(self) -> "PopulationTrainer":
+        self._require_usable()
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
+
+    def __del__(self) -> None:  # pragma: no cover - defensive interpreter cleanup
+        executor = getattr(self, "_executor", None)
+        if executor is not None:
+            executor.shutdown(wait=False, cancel_futures=True)
 
     def _new_random_member(self) -> PopulationMember:
         member_id = self._take_member_id()
@@ -973,57 +1168,203 @@ class PopulationTrainer:
 
         return self._evaluation_seed(generation, 0)
 
-    def _start_member(self, index: int) -> None:
-        self._current_index = index
-        self.env.load_curriculum_state(
-            {"unlocked": self._generation_curriculum_ready}
-        )
-        observation = self.env.reset(
-            seed=self._generation_evaluation_seed(self.generation)
-        )
-        self._set_evaluation_start(observation)
+    @staticmethod
+    def _clone_environment(source: DrivingEnv, *, seed: int) -> DrivingEnv:
+        """Create one isolated simulation with the source environment's setup."""
 
-    def _set_evaluation_start(self, observation: tuple[float, ...]) -> None:
-        self._observation = np.asarray(observation, dtype=np.float32)
-        self._evaluation_return = 0.0
-        self._evaluation_steps = 0
-        self._evaluation_losses = []
-        self._last_reward = 0.0
-        self._last_info = {}
+        clone = DrivingEnv(
+            source.circuit,
+            build=source.vehicle.build,
+            seed=seed,
+            fixed_dt=source.fixed_dt,
+            max_steps=source.max_steps,
+            random_start_curriculum=source.random_start_curriculum,
+        )
+        clone.load_curriculum_state(source.curriculum_state())
+        return clone
+
+    def _start_generation_runtime(
+        self,
+        *,
+        seed: int | None = None,
+        keep_evaluated: bool = False,
+    ) -> None:
+        """Reset independent contexts to one reproducible generation scenario."""
+
+        if not keep_evaluated:
+            for member in self.population:
+                member.result = None
+        scenario_seed = (
+            self._generation_evaluation_seed(self.generation) if seed is None else seed
+        )
+        runtimes: list[_EvaluationRuntime] = []
+        for member_env in self._member_envs:
+            member_env.load_curriculum_state(
+                {"unlocked": self._generation_curriculum_ready}
+            )
+            observation = member_env.reset(seed=scenario_seed)
+            if len(observation) != self.dqn_config.observation_size:
+                raise ValueError(
+                    "DrivingEnv observation size does not match DQNConfig: "
+                    f"{len(observation)} != {self.dqn_config.observation_size}"
+                )
+            runtimes.append(
+                _EvaluationRuntime(
+                    env=member_env,
+                    observation=np.asarray(observation, dtype=np.float32),
+                )
+            )
+        self._member_runtimes = runtimes
+        active = self.active_member_indices
+        focal_index = active[0] if active else 0
+        self._sync_focal_aliases(focal_index)
+        if not active:
+            self._current_index = len(self.population)
+
+    def _sync_focal_aliases(self, index: int) -> None:
+        """Keep legacy scalar accessors aligned with a deterministic member."""
+
+        runtime = self._member_runtimes[index]
+        self._current_index = index
+        self.env = runtime.env
+        self._observation = runtime.observation
+        self._evaluation_return = runtime.total_reward
+        self._evaluation_steps = runtime.steps
+        self._evaluation_losses = runtime.losses
+        self._last_reward = runtime.last_reward
+        self._last_info = runtime.last_info
+
+    def _advance_active_members(
+        self, active_indices: tuple[int, ...]
+    ) -> tuple[_MemberAdvance, ...]:
+        """Run isolated member ticks concurrently and collect in stable order."""
+
+        if self.parallel_workers == 1 or len(active_indices) == 1:
+            advances: list[_MemberAdvance] = []
+            try:
+                for index in active_indices:
+                    advances.append(self._advance_member(index))
+            except BaseException as error:
+                self._fail_after_worker_error(error)
+            return tuple(advances)
+        if self._executor is None:
+            self._executor = ThreadPoolExecutor(
+                max_workers=self.parallel_workers,
+                thread_name_prefix="driving-population",
+            )
+        try:
+            futures = {
+                index: self._executor.submit(self._advance_member, index)
+                for index in active_indices
+            }
+        except BaseException as error:
+            self._fail_after_worker_error(error)
+        advances: list[_MemberAdvance] = []
+        first_error: BaseException | None = None
+        for index in active_indices:
+            try:
+                advances.append(futures[index].result())
+            except BaseException as error:  # wait for every in-flight context
+                if first_error is None:
+                    first_error = error
+        if first_error is not None:
+            self._fail_after_worker_error(first_error)
+        return tuple(advances)
+
+    def _fail_after_worker_error(self, error: BaseException) -> NoReturn:
+        """Permanently stop after a partially executed population tick.
+
+        A successful sibling may already have mutated its private environment
+        or learner. Because the coordinator has not committed any runtime rows,
+        continuing or saving that mixed state would be dishonest. Waiting for
+        every submitted task and making the trainer fail-stop preserves the
+        all-or-nothing tick contract.
+        """
+
+        self._worker_failure = error
+        self._closed = True
+        executor = self._executor
+        self._executor = None
+        if executor is not None:
+            executor.shutdown(wait=True, cancel_futures=False)
+        if not isinstance(error, Exception):
+            # Preserve process-level interrupts such as Ctrl-C after making the
+            # partially executed tick impossible to resume.
+            raise error
+        raise RuntimeError(
+            "population member evaluation failed; trainer is closed"
+        ) from error
+
+    def _require_usable(self) -> None:
+        if self._worker_failure is not None:
+            raise RuntimeError(
+                "population trainer cannot continue after a worker failure"
+            ) from self._worker_failure
+        if self._closed:
+            raise RuntimeError("population trainer is closed")
+
+    def _advance_member(self, index: int) -> _MemberAdvance:
+        """Advance one member; this method touches no other member context."""
+
+        member = self.population[index]
+        runtime = self._member_runtimes[index]
+        state = runtime.observation.copy()
+        explore = self.config.algorithm == "genetic_dqn"
+        action = member.agent.select_action(state, explore=explore)
+        env_result = runtime.env.step(action)
+        next_state = np.asarray(env_result.observation, dtype=np.float32)
+        budget_reached = runtime.steps + 1 >= self.config.evaluation_steps
+        done = bool(env_result.terminated or env_result.truncated or budget_reached)
+        loss: float | None = None
+        if self.config.algorithm == "genetic_dqn":
+            observed_loss = member.agent.observe(
+                state,
+                action,
+                env_result.reward,
+                next_state,
+                done,
+            )
+            if observed_loss is not None and math.isfinite(float(observed_loss)):
+                loss = float(observed_loss)
+        return _MemberAdvance(
+            index=index,
+            state=state,
+            action=action,
+            env_result=env_result,
+            next_state=next_state,
+            budget_reached=budget_reached,
+            done=done,
+            loss=loss,
+        )
 
     def _finish_member(
         self,
-        member: PopulationMember,
-        env_result: StepResult,
-        *,
-        budget_reached: bool,
+        index: int,
+        advance: _MemberAdvance,
     ) -> EvaluationResult:
+        member = self.population[index]
+        runtime = self._member_runtimes[index]
+        env_result = advance.env_result
         info = env_result.info
         result = EvaluationResult(
             generation=self.generation,
             member_id=member.member_id,
             # The environment reward already combines progress, road holding,
             # speed, collisions, and lap completion without double counting.
-            fitness=float(self._evaluation_return),
-            total_reward=float(self._evaluation_return),
-            steps=self._evaluation_steps,
-            laps=int(info.get("laps", self.env.laps)),
+            fitness=float(runtime.total_reward),
+            total_reward=float(runtime.total_reward),
+            steps=runtime.steps,
+            laps=int(info.get("laps", runtime.env.laps)),
             # Random-origin episodes report absolute circuit position as
             # ``progress`` and distance travelled from their own origin as
             # ``episode_lap_progress``. Fitness summaries must use the latter so a
             # late-track spawn is not mistaken for a nearly completed loop.
-            progress=float(
-                info.get("episode_lap_progress", info.get("progress", 0.0))
-            ),
-            collisions=int(self.env.collisions),
+            progress=float(info.get("episode_lap_progress", info.get("progress", 0.0))),
+            collisions=int(runtime.env.collisions),
             terminated=bool(env_result.terminated),
-            truncated=bool(env_result.truncated or budget_reached),
-            mean_loss=(
-                float(np.mean(self._evaluation_losses))
-                if self._evaluation_losses
-                else 0.0
-            ),
-            training_updates=len(self._evaluation_losses),
+            truncated=bool(env_result.truncated or advance.budget_reached),
+            mean_loss=(float(np.mean(runtime.losses)) if runtime.losses else 0.0),
+            training_updates=len(runtime.losses),
         )
         member.result = result
         self._consider_champion(member)

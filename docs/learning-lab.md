@@ -615,9 +615,16 @@ budget, and its fitness is exactly its accumulated shaped environment reward:
 fitness_i = sum(t=0..T-1) reward_i,t
 ```
 
-Population evaluation is sequential and seeded. This keeps the visible car equal
-to the policy currently earning fitness and avoids worker-timing nondeterminism.
-After every member has been evaluated, the next generation is built as follows:
+Population evaluation is seeded, synchronous, and concurrent. One trainer tick
+submits one fixed simulation step for every unfinished member to a bounded thread
+pool. Each task mutates only its member's private environment and learner; the
+coordinator waits for the whole tick and merges results in stable member order.
+Consequently, OS completion timing cannot change reward accumulation, ranking,
+or selection. `--workers 1` follows the same path sequentially, while the default
+worker count is capped by the population and available CPUs. After every member
+has completed its budget, the next generation is built as follows. If any member
+task fails, the pool waits for its siblings and the trainer becomes fail-stop;
+it cannot resume or save the partially executed tick.
 
 1. Rank the population by fitness, with stable member IDs breaking ties.
 2. Copy the configured number of elites without crossover or mutation.
@@ -679,7 +686,7 @@ synthesize training state.
 
 | Tab | What it answers |
 |---|---|
-| Overview | Which member is driving, its episode-origin gate and relative loop progress, curriculum state, what it observes and chooses, and how current/best/mean fitness changes across the population and generations |
+| Overview | Which real scored members are driving in parallel, their episode origins, observations, choices and rays, cars per tick and worker count, and how current/best/mean fitness changes across generations |
 | Network | Which real layers and connections produced the current Q-values; colors and intensity come from current activations and weights |
 | Memory | How full replay is, whether action selection explored, and what loss, TD error, gradient steps, action counts, and target synchronization are doing |
 
@@ -749,11 +756,11 @@ python -m drivingGameRL.main --learn --algorithm double_dqn
 
 # Pure neural-weight evolution
 python -m drivingGameRL.main --learn --algorithm genetic \
-  --population 12 --elite-count 2 --evaluation-steps 1800
+  --population 12 --elite-count 2 --evaluation-steps 1800 --workers 8
 
 # Hybrid population-based Double DQN (editable-install launcher)
 late-night-driving-rl --algorithm genetic_dqn \
-  --population 12 --elite-count 2 --evaluation-steps 1800
+  --population 12 --elite-count 2 --evaluation-steps 1800 --workers 8
 
 # Bounded headless comparisons
 python -m drivingGameRL.main --learn --algorithm double_dqn \
@@ -802,7 +809,7 @@ Learning mode adds these controls:
 | `[` or `,` | Reduce simulation steps per rendered frame |
 | `]` or `.` | Increase simulation steps per rendered frame |
 | `V` | Show or hide the five exact policy sensor rays |
-| `M` | Show or hide isolated rollout cars for the current generation |
+| `M` | Show or hide real scored cars for the current generation |
 | `C` | Cycle the comparison limit through 2, 4, 8, and 12 cars |
 | `P` | Enter or leave the fixed-60-Hz race against the frozen generation champion |
 | `R` | Reset the current evaluation; start a rematch while racing |
@@ -813,24 +820,24 @@ Learning mode adds these controls:
 
 The five displayed rays are immutable snapshots from the same sampling method
 that supplies `ray_left` through `ray_right` to the network. Their endpoints are
-therefore measurements, not reconstructed decoration. The `M` comparison view
-clones the selected number of current-generation policies into separate,
-identically seeded, curriculum-matched environments and advances those clones
-greedily at fixed simulation time. The default limit is eight; `C` changes it at
-runtime without affecting the scored environment. Rollout actions never enter
-replay or fitness,
-and the set is rebuilt when the generation changes. Use `--population-cars` to
-begin with this view enabled, `--preview-cars N` to select an initial breadth of
-2, 4, 8, or 12, or `--no-sensors` to begin with ray rendering disabled.
+therefore measurements, not reconstructed decoration. For population methods,
+the `M` view consumes read-only snapshots of the actual scored member
+environments after the synchronous barrier. It does not clone, advance, or train
+anything a second time. The default limit is eight; `C` changes only how many
+members are drawn. Standalone DQN keeps isolated, non-scoring comparison clones
+because it has no real population. Use `--population-cars` to begin with this
+view enabled, `--preview-cars N` to select an initial breadth of 2, 4, 8, or 12,
+or `--no-sensors` to begin with ray rendering disabled.
 
 Interactive training uses a short wall-clock work slice before yielding to
-events and rendering. The selected speed is still the maximum requested steps
-per frame, while the header reports the effective frame step count and smoothed
-FPS if CPU cost reaches the slice. This changes presentation cadence only: the
-scored transition order and stopping budgets remain exact. Headless runs are
-not time-sliced and retain full throughput. Circuit projection geometry and
-same-pose immutable ray snapshots are cached, so additional preview cars reuse
-the expensive static calculations without sharing mutable environment state.
+events and rendering. The selected speed is still the maximum requested trainer
+ticks per frame. In population modes, one tick advances every unfinished member
+once, and telemetry separately reports the resulting environment-decision count.
+The header reports effective frame ticks and smoothed FPS if CPU cost reaches the
+slice. This changes presentation cadence only: scored transition order and
+stopping budgets remain exact. Headless runs are not time-sliced and retain full
+throughput. Circuit projection geometry and same-pose immutable ray snapshots
+are cached across panels without sharing mutable environment state.
 
 ## Reproducible comparison protocol
 

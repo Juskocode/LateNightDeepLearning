@@ -44,6 +44,7 @@ class LearningRuntimeConfig:
     blend_alpha: float = 0.20
     mutation_rate: float = 0.08
     mutation_std: float = 0.055
+    parallel_workers: int | None = None
 
     def __post_init__(self) -> None:
         if self.algorithm not in ("dqn", "double_dqn", "genetic", "genetic_dqn"):
@@ -79,6 +80,12 @@ class LearningRuntimeConfig:
             value = float(getattr(self, name))
             if not math.isfinite(value) or value < 0.0:
                 raise ValueError(f"{name} must be finite and non-negative")
+        if self.parallel_workers is not None and (
+            isinstance(self.parallel_workers, bool)
+            or not isinstance(self.parallel_workers, int)
+            or self.parallel_workers <= 0
+        ):
+            raise ValueError("parallel_workers must be a positive integer or None")
 
 
 class DrivingLearningSession:
@@ -161,6 +168,7 @@ class DrivingLearningSession:
             evolution,
             dqn_config=dqn_config,
             env=population_env,
+            parallel_workers=self.config.parallel_workers,
         )
         self.env = self._population_trainer.env
         self.agent = self._population_trainer.current_agent
@@ -262,7 +270,7 @@ class DrivingLearningSession:
                 self._last_event = "generation_evolved"
             elif result.generation_completed:
                 self._last_event = "generation_complete"
-            elif result.member_completed:
+            elif result.member_completed or result.member_results:
                 self._last_event = "member_complete"
             else:
                 self._last_event = "population_step"
@@ -327,6 +335,30 @@ class DrivingLearningSession:
             return champion.clone(seed=self.config.seed + 99_991)
         return self._champion.clone(seed=self.config.seed + 99_991)
 
+    def scored_population_telemetry(
+        self,
+        *,
+        include_rays: bool = True,
+        max_cars: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return real scored car states after the population step barrier.
+
+        Genetic modes expose every training environment in stable population
+        order. Standalone DQN has no concurrent population and returns an empty
+        list. The optional bound is presentation-only; all members continue to
+        train regardless of how many are rendered.
+        """
+
+        if not self.is_population:
+            return []
+        from .population_rollout import scored_population_telemetry
+
+        return scored_population_telemetry(
+            self,
+            max_cars=max_cars,
+            include_rays=include_rays,
+        )
+
     def telemetry(self) -> dict[str, Any]:
         """Merge environment, learning, replay, and real-network state."""
 
@@ -339,25 +371,36 @@ class DrivingLearningSession:
             fitness = raw.get("fitness") or {}
             population = []
             current_index = raw.get("current_member_index")
+            active_indices = {
+                int(index) for index in raw.get("active_member_indices", ())
+            }
             for index, member in enumerate(raw.get("population", ())):
                 result = member.get("result") or {}
                 member_fitness = member.get("fitness")
+                runtime_status = member.get("status")
+                if runtime_status == "active":
+                    runtime_status = "evaluating"
                 population.append(
                     {
                         "index": index,
                         "member_id": member.get("member_id", index),
                         "fitness": member_fitness,
                         "status": (
-                            "evaluating"
-                            if index == current_index
-                            else "evaluated"
-                            if member.get("evaluated")
-                            else "queued"
+                            runtime_status
+                            or (
+                                "evaluating"
+                                if index in active_indices
+                                else "evaluated"
+                                if member.get("evaluated")
+                                else "queued"
+                            )
                         ),
                         "elite": False,
                         "laps": result.get("laps", 0),
                         "collisions": result.get("collisions", 0),
                         "parents": member.get("parent_ids", ()),
+                        "evaluation_step": member.get("evaluation_step", 0),
+                        "evaluation_return": member.get("evaluation_return", 0.0),
                     }
                 )
             history = [
@@ -563,6 +606,12 @@ class DrivingLearningSession:
         self.observation = tuple(float(value) for value in observation)
         self._last_event = "evaluation_reset"
         return self.observation
+
+    def close(self) -> None:
+        """Release persistent population workers; standalone DQN owns none."""
+
+        if self._population_trainer is not None:
+            self._population_trainer.close()
 
 
 class ChampionRace:
