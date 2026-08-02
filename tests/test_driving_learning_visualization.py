@@ -3,6 +3,7 @@ import os
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
 
@@ -14,7 +15,9 @@ from drivingGameRL.src.learning_visualization import (
     COLORS,
     DrivingLearningVisualization,
     LEARNING_WINDOW_SIZE,
+    MAX_RENDERED_SENSOR_RAYS,
     POPULATION_CAR_COLORS,
+    POPULATION_TRAIL_LENGTH,
     TEXT_SURFACE_CACHE_LIMIT,
 )
 from drivingGameRL.src.rendering import TRACK_VIEW_WIDTH, WINDOW_HEIGHT as TRACK_HEIGHT
@@ -104,8 +107,12 @@ def learning_telemetry(env: DrivingEnv) -> dict[str, object]:
 def rollout_rays(
     position: tuple[float, float], heading: float
 ) -> list[dict[str, object]]:
-    distances = (48.0, 72.0, 108.0, 84.0, 60.0)
-    angles = (-math.pi / 2, -math.pi / 4, 0.0, math.pi / 4, math.pi / 2)
+    angles = DrivingEnv.SENSOR_RELATIVE_ANGLES
+    middle = max(1.0, (len(angles) - 1) / 2)
+    distances = tuple(
+        48.0 + 60.0 * (1.0 - abs(index - middle) / middle)
+        for index in range(len(angles))
+    )
     return [
         {
             "origin": position,
@@ -202,9 +209,7 @@ class DrivingLearningVisualizationTests(unittest.TestCase):
         self.assertEqual(self.env.telemetry(), before)
 
     def test_curriculum_view_marks_the_random_episode_origin_read_only(self):
-        env = DrivingEnv(
-            "canyon_maze", seed=29, random_start_curriculum=True
-        )
+        env = DrivingEnv("canyon_maze", seed=29, random_start_curriculum=True)
         before = env.telemetry()
         visualization = DrivingLearningVisualization(env, learning_telemetry(env))
 
@@ -332,6 +337,195 @@ class DrivingLearningVisualizationTests(unittest.TestCase):
         after = self.env.telemetry()
         self.assertEqual(after["steps"], before["steps"])
         self.assertEqual(after["position"], before["position"])
+
+    def test_overlapped_scored_cars_get_truthful_halos_callouts_and_legend(self):
+        shared_position = (365.0, 315.0)
+        rollouts = [
+            {
+                "member_id": member,
+                "index": member,
+                "generation": 12,
+                "position": shared_position,
+                "heading": 0.1 * member,
+                "status": "evaluating",
+                "action": member % 5,
+                "steps": 4,
+                "rays": rollout_rays(shared_position, 0.1 * member),
+            }
+            for member in range(4)
+        ]
+        telemetry = {
+            **self.telemetry,
+            "show_population_cars": True,
+            "show_sensor_rays": True,
+            "population_rollout_generation": 12,
+            "population_rollouts": rollouts,
+        }
+        before = self.env.telemetry()
+
+        surface = self.visualization.draw(telemetry=telemetry).copy()
+
+        self.assertEqual(
+            {rollout["position"] for rollout in rollouts}, {shared_position}
+        )
+        self.assertEqual(set(self.visualization._population_hitboxes), set(range(4)))
+        self.assertEqual(self.visualization.selected_population_member, 0)
+        for member in range(4):
+            color = POPULATION_CAR_COLORS[member]
+            matching = sum(
+                surface.get_at((x, y))[:3] == color
+                for x in range(30, 762, 2)
+                for y in range(132, 730, 2)
+            )
+            self.assertGreater(matching, 8, f"member {member} identity is hidden")
+        self.assertEqual(self.env.telemetry(), before)
+
+    def test_clicking_member_legend_selects_and_highlights_real_member(self):
+        telemetry = {
+            **self.telemetry,
+            "show_population_cars": True,
+            "show_sensor_rays": True,
+            "population_rollout_generation": 12,
+            "population_rollouts": population_rollouts(),
+        }
+        initial = self.visualization.draw(telemetry=telemetry).copy()
+        member_two_legend = self.visualization._population_hitboxes[2][-1]
+
+        consumed = self.visualization.handle_event(
+            pygame.event.Event(
+                pygame.MOUSEBUTTONDOWN,
+                button=1,
+                pos=member_two_legend.center,
+            )
+        )
+        selected = self.visualization.draw(telemetry=telemetry).copy()
+
+        self.assertTrue(consumed)
+        self.assertEqual(self.visualization.selected_population_member, 2)
+        self.assertEqual(self.visualization.consume_action_requests(), ())
+        self.assertNotEqual(
+            pygame.image.tostring(initial, "RGB"),
+            pygame.image.tostring(selected, "RGB"),
+        )
+
+    def test_member_trails_contain_only_real_bounded_positions(self):
+        before = self.env.telemetry()
+        positions = ((230.0, 250.0), (255.0, 265.0), (285.0, 290.0))
+        final_surface = None
+        final_telemetry = None
+        for step, position in enumerate(positions):
+            final_telemetry = {
+                **self.telemetry,
+                "show_population_cars": True,
+                "population_rollout_generation": 12,
+                "population_rollouts": [
+                    {
+                        "member_id": 2,
+                        "index": 2,
+                        "generation": 12,
+                        "position": position,
+                        "heading": 0.2,
+                        "steps": step,
+                        "action": 1,
+                    }
+                ],
+            }
+            final_surface = self.visualization.draw(telemetry=final_telemetry).copy()
+
+        trail = self.visualization._population_trails[(12, 2)]
+        self.assertEqual(tuple(trail), positions)
+        fresh = DrivingLearningVisualization(self.env).draw(telemetry=final_telemetry)
+        self.assertNotEqual(
+            pygame.image.tostring(final_surface, "RGB"),
+            pygame.image.tostring(fresh, "RGB"),
+        )
+
+        for step in range(POPULATION_TRAIL_LENGTH + 12):
+            payload = {
+                "generation": 12,
+                "population_rollouts": [
+                    {
+                        "member_id": 2,
+                        "index": 2,
+                        "generation": 12,
+                        "position": (300.0 + step, 300.0),
+                        "steps": step + 3,
+                    }
+                ],
+            }
+            self.visualization._update_population_trails(
+                self.visualization._population_rollouts(payload)
+            )
+        self.assertEqual(
+            len(self.visualization._population_trails[(12, 2)]),
+            POPULATION_TRAIL_LENGTH,
+        )
+        self.assertEqual(self.env.telemetry(), before)
+
+    def test_clickable_training_controls_queue_stable_action_requests(self):
+        telemetry = {
+            **self.telemetry,
+            "paused": False,
+            "show_population_cars": True,
+            "show_sensor_rays": True,
+            "training_speed_label": "8x",
+            "training_ticks_per_second": 154.0,
+            "environment_decisions_per_second": 1_234.0,
+            "render_fps": 60.0,
+        }
+        before = self.env.telemetry()
+        self.visualization.draw(telemetry=telemetry)
+        expected = (
+            "toggle_pause",
+            "speed_down",
+            "speed_up",
+            "toggle_population_cars",
+            "toggle_sensor_rays",
+        )
+
+        for action in expected:
+            self.assertIn(action, self.visualization.control_rects)
+            self.assertTrue(
+                self.visualization.handle_event(
+                    pygame.event.Event(
+                        pygame.MOUSEBUTTONDOWN,
+                        button=1,
+                        pos=self.visualization.control_rects[action].center,
+                    )
+                )
+            )
+
+        self.assertEqual(self.visualization.consume_action_requests(), expected)
+        self.assertEqual(self.visualization.consume_action_requests(), ())
+        rendered_labels = {key[0] for key in self.visualization._text_surfaces}
+        self.assertIn("154 TICK/S · 1.2K DEC/S · 60 FPS", rendered_labels)
+        self.assertEqual(self.env.telemetry(), before)
+
+    def test_ray_layer_draws_dynamic_sensor_counts_without_fixed_count_truncation(self):
+        position = (320.0, 300.0)
+        rays = []
+        for index in range(13):
+            angle = -math.pi / 2 + index * math.pi / 12
+            rays.append(
+                {
+                    "origin": position,
+                    "endpoint": (
+                        position[0] + math.cos(angle) * 100.0,
+                        position[1] + math.sin(angle) * 100.0,
+                    ),
+                    "normalized_distance": 2.0 / 3.0,
+                    "distance": 100.0,
+                    "max_distance": 150.0,
+                }
+            )
+        layer = pygame.Surface((420, 320), pygame.SRCALPHA)
+        viewport = pygame.Rect(0, 0, 420, 320)
+
+        with patch("pygame.draw.line", wraps=pygame.draw.line) as draw_line:
+            self.visualization._draw_ray_set(layer, viewport, rays)
+
+        self.assertEqual(draw_line.call_count, len(rays))
+        self.assertGreater(MAX_RENDERED_SENSOR_RAYS, len(rays))
 
     def test_keyboard_and_click_navigation_select_every_tab(self):
         self.assertEqual(self.visualization.active_tab, "OVERVIEW")
@@ -473,14 +667,14 @@ class DrivingLearningVisualizationTests(unittest.TestCase):
 
         rays = self.visualization._environment_rays(self.env, explicit_pose)
 
-        self.assertEqual(len(rays), 5)
+        self.assertEqual(len(rays), len(self.env.SENSOR_RELATIVE_ANGLES))
         for ray in rays:
             self.assertEqual(ray["origin"], explicit_pose["position"])
 
     def test_exact_sensor_api_takes_precedence_over_observation_fallback(self):
         expected = self.env.sensor_rays()
         observation = list(self.env.observation())
-        observation[-5:] = [0.0] * 5
+        observation[-len(expected) :] = [0.0] * len(expected)
         telemetry = {
             **self.telemetry,
             "observation": observation,

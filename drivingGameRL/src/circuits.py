@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 import math
+
+import numpy as np
 
 from .math2d import Vec2, clamp
 from .terrain import Terrain, TerrainKind, terrain
@@ -72,6 +75,15 @@ class Circuit:
         tuple[Vec2, Vec2, float, Vec2, float], ...
     ] = field(init=False, repr=False, compare=False)
     _total_length: float = field(init=False, repr=False, compare=False)
+    _segment_starts_array: np.ndarray = field(
+        init=False, repr=False, compare=False
+    )
+    _segment_vectors_array: np.ndarray = field(
+        init=False, repr=False, compare=False
+    )
+    _segment_lengths_squared_array: np.ndarray = field(
+        init=False, repr=False, compare=False
+    )
 
     def __post_init__(self) -> None:
         if len(self.points) < 3:
@@ -111,6 +123,29 @@ class Circuit:
         object.__setattr__(self, "_segment_lengths", lengths)
         object.__setattr__(self, "_projection_segments", tuple(projection_segments))
         object.__setattr__(self, "_total_length", traversed)
+        starts_array = np.asarray(
+            [(point.x, point.y) for point in self.points], dtype=np.float64
+        )
+        vectors_array = np.asarray(
+            [
+                (
+                    self.points[(index + 1) % len(self.points)].x - point.x,
+                    self.points[(index + 1) % len(self.points)].y - point.y,
+                )
+                for index, point in enumerate(self.points)
+            ],
+            dtype=np.float64,
+        )
+        lengths_squared_array = np.einsum(
+            "ij,ij->i", vectors_array, vectors_array
+        )
+        for array in (starts_array, vectors_array, lengths_squared_array):
+            array.setflags(write=False)
+        object.__setattr__(self, "_segment_starts_array", starts_array)
+        object.__setattr__(self, "_segment_vectors_array", vectors_array)
+        object.__setattr__(
+            self, "_segment_lengths_squared_array", lengths_squared_array
+        )
         if not isinstance(self.runoff, TerrainKind):
             raise ValueError("Circuit runoff must be a TerrainKind")
         if any(not isinstance(sector, SurfaceSector) for sector in self.sectors):
@@ -190,6 +225,44 @@ class Circuit:
             progress=(progress_distance / self._total_length) % 1.0,
             segment_index=index,
         )
+
+    def distances_to_centerline(
+        self, positions: Sequence[Vec2]
+    ) -> tuple[float, ...]:
+        """Return exact projection distances for a batch of world positions.
+
+        Sensor fans ask the same distance-only question hundreds of times per
+        simulation tick. Broadcasting those samples across the immutable
+        centerline segments avoids Python object churn while retaining the
+        exact line-segment geometry used by :meth:`project`.
+        """
+
+        points = tuple(positions)
+        if not points:
+            return ()
+        if not all(
+            isinstance(point, Vec2)
+            and math.isfinite(point.x)
+            and math.isfinite(point.y)
+            for point in points
+        ):
+            raise ValueError("Projected positions must be finite Vec2 values")
+        values = np.asarray(
+            [(point.x, point.y) for point in points], dtype=np.float64
+        )
+        deltas = values[:, None, :] - self._segment_starts_array[None, :, :]
+        along = np.einsum(
+            "nsi,si->ns", deltas, self._segment_vectors_array
+        ) / self._segment_lengths_squared_array[None, :]
+        np.clip(along, 0.0, 1.0, out=along)
+        nearest = (
+            self._segment_starts_array[None, :, :]
+            + along[:, :, None] * self._segment_vectors_array[None, :, :]
+        )
+        offsets = values[:, None, :] - nearest
+        squared = np.einsum("nsi,nsi->ns", offsets, offsets)
+        distances = np.sqrt(np.min(squared, axis=1))
+        return tuple(float(value) for value in distances)
 
     def road_kind_at_progress(self, progress: float) -> TerrainKind:
         for sector in self.sectors:

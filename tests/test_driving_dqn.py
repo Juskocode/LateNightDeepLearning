@@ -33,9 +33,9 @@ class DQNConfigTests(unittest.TestCase):
     def test_defaults_match_the_driving_environment_contract(self):
         config = DQNConfig()
 
-        self.assertEqual(config.observation_size, 12)
+        self.assertEqual(config.observation_size, 16)
         self.assertEqual(config.action_size, 5)
-        self.assertEqual(config.input_size, 12)
+        self.assertEqual(config.input_size, 16)
         self.assertEqual(config.output_size, 5)
         self.assertEqual(DQNConfig.from_dict(config.to_dict()), config)
 
@@ -122,7 +122,7 @@ class DrivingDQNAgentTests(unittest.TestCase):
     def test_seed_controls_initial_weights_and_exploration(self):
         first = DrivingDQNAgent(tiny_config(epsilon_start=1.0, epsilon_end=1.0))
         second = DrivingDQNAgent(tiny_config(epsilon_start=1.0, epsilon_end=1.0))
-        state = np.linspace(-1.0, 1.0, 12, dtype=np.float32)
+        state = np.linspace(-1.0, 1.0, 16, dtype=np.float32)
 
         np.testing.assert_array_equal(first.q_values(state), second.q_values(state))
         self.assertEqual(
@@ -143,7 +143,7 @@ class DrivingDQNAgentTests(unittest.TestCase):
 
     def test_observe_runs_a_finite_real_td_update(self):
         agent = DrivingDQNAgent(tiny_config(learning_rate=0.01))
-        state = np.zeros(12, dtype=np.float32)
+        state = np.zeros(16, dtype=np.float32)
         before = agent.q_values(state)
 
         self.assertIsNone(agent.observe(state, 0, 3.0, state, True))
@@ -169,14 +169,14 @@ class DrivingDQNAgentTests(unittest.TestCase):
                 agent.target_network.layers[-1].bias.copy_(
                     torch.tensor([9.0, 2.0, 3.0, 4.0, 1.0])
                 )
-        states = torch.zeros(2, 12)
+        states = torch.zeros(2, 16)
 
         self.assertEqual(dqn._bootstrap_values(states).tolist(), [9.0, 9.0])
         self.assertEqual(double._bootstrap_values(states).tolist(), [2.0, 2.0])
 
     def test_target_network_syncs_on_the_configured_gradient_step(self):
         agent = DrivingDQNAgent(tiny_config(target_sync_interval=1))
-        state = np.zeros(12, dtype=np.float32)
+        state = np.zeros(16, dtype=np.float32)
         agent.observe(state, 0, 2.0, state, True)
         agent.observe(state, 0, 2.0, state, True)
 
@@ -189,7 +189,7 @@ class DrivingDQNAgentTests(unittest.TestCase):
     def test_population_clone_is_equal_but_tensor_independent(self):
         parent = DrivingDQNAgent(tiny_config(seed=3))
         child = parent.clone(seed=9)
-        state = np.zeros(12, dtype=np.float32)
+        state = np.zeros(16, dtype=np.float32)
 
         np.testing.assert_array_equal(parent.q_values(state), child.q_values(state))
         self.assertEqual(child.environment_steps, 0)
@@ -205,7 +205,7 @@ class DrivingDQNAgentTests(unittest.TestCase):
 
     def test_telemetry_and_network_snapshot_expose_live_learning_state(self):
         agent = DrivingDQNAgent(tiny_config())
-        state = np.zeros(12, dtype=np.float32)
+        state = np.zeros(16, dtype=np.float32)
         action = agent.select_action(state, explore=False)
 
         telemetry = agent.telemetry(state)
@@ -219,7 +219,7 @@ class DrivingDQNAgentTests(unittest.TestCase):
 
     def test_atomic_checkpoint_round_trip_restores_policy_and_counters(self):
         agent = DrivingDQNAgent(tiny_config(seed=22))
-        state = np.arange(12, dtype=np.float32) / 12.0
+        state = np.arange(16, dtype=np.float32) / 16.0
         agent.select_action(state)
         agent.observe(state, 2, 1.0, state, False)
         with tempfile.TemporaryDirectory() as directory:
@@ -240,6 +240,46 @@ class DrivingDQNAgentTests(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             incompatible.load_state_dict(source.state_dict())
+
+    def test_legacy_five_ray_checkpoint_expands_without_changing_predictions(self):
+        legacy = DrivingDQNAgent(tiny_config(observation_size=12, seed=41))
+        legacy_state = np.linspace(-0.8, 0.9, 12, dtype=np.float32)
+        legacy.observe(legacy_state, 1, 0.7, legacy_state, False)
+        legacy.observe(legacy_state, 3, -0.2, legacy_state, False)
+        checkpoint = legacy.state_dict()
+
+        expanded_state = np.full(16, 0.37, dtype=np.float32)
+        expanded_state[:7] = legacy_state[:7]
+        for old_ray, new_ray in enumerate((0, 2, 4, 6, 8)):
+            expanded_state[7 + new_ray] = legacy_state[7 + old_ray]
+
+        restored = DrivingDQNAgent(tiny_config(observation_size=16, seed=41))
+        restored.load_state_dict(checkpoint)
+
+        np.testing.assert_allclose(
+            restored.q_values(expanded_state),
+            legacy.q_values(legacy_state),
+            rtol=0.0,
+            atol=1e-7,
+        )
+        first_layer = restored.online_network.layers[0].weight.detach()
+        self.assertTrue(torch.count_nonzero(first_layer[:, (8, 10, 12, 14)]) == 0)
+        # Adam moment tensors are expanded too, so resumed training remains
+        # valid instead of failing on its first optimizer update.
+        restored.observe(expanded_state, 1, 0.3, expanded_state, False)
+        loss = restored.observe(expanded_state, 1, 0.3, expanded_state, False)
+        self.assertIsNotNone(loss)
+        self.assertTrue(np.isfinite(loss))
+
+    def test_from_checkpoint_automatically_upgrades_legacy_observation_contract(self):
+        legacy = DrivingDQNAgent(tiny_config(observation_size=12, seed=42))
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "legacy-five-rays.pth"
+            legacy.save(path)
+            restored = DrivingDQNAgent.from_checkpoint(path)
+
+        self.assertEqual(restored.config.observation_size, 16)
+        self.assertEqual(restored.online_network.architecture[0], 16)
 
 
 if __name__ == "__main__":

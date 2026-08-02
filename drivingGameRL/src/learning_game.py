@@ -24,6 +24,8 @@ class DrivingLearningGame:
     SPEED_PRESETS = (1, 4, 16, 64, 256)
     POPULATION_CAR_PRESETS = (2, 4, 8, 12)
     DEFAULT_TRAINING_FRAME_BUDGET_MS = 12.0
+    MAX_INTERACTIVE_BATCH_TICKS = 8
+    SPEED_BUDGET_MULTIPLIERS = (1.0, 1.0, 1.0, 1.5, 3.0)
 
     def __init__(
         self,
@@ -33,7 +35,7 @@ class DrivingLearningGame:
         learning_speed: int = 16,
         checkpoint_path: str | Path | None = None,
         show_sensor_rays: bool = True,
-        show_population_cars: bool = False,
+        show_population_cars: bool | None = None,
         population_car_limit: int = 8,
         training_frame_budget_ms: float = DEFAULT_TRAINING_FRAME_BUDGET_MS,
     ):
@@ -75,13 +77,22 @@ class DrivingLearningGame:
         self.running = True
         self.race: ChampionRace | None = None
         self.show_sensor_rays = bool(show_sensor_rays)
-        self.show_population_cars = bool(show_population_cars)
+        self.show_population_cars = (
+            bool(session.is_population)
+            if show_population_cars is None
+            else bool(show_population_cars)
+        )
         self.population_car_limit = int(population_car_limit)
         self.training_frame_budget_ms = float(training_frame_budget_ms)
         self.population_rollouts: Any | None = None
         self.training_steps = 0
         self._last_training_slice_steps = 0
         self._training_slice_capped = False
+        self._training_slice_ms = 0.0
+        self._training_ticks_per_second = 0.0
+        self._environment_decisions_per_second = 0.0
+        self._estimated_training_tick_ms = self.training_frame_budget_ms
+        self._frame_time_ms = 0.0
         self._render_fps = 0.0
         self._status = "training"
         self._last_telemetry: dict[str, Any] = {}
@@ -104,6 +115,15 @@ class DrivingLearningGame:
         )
         self._status = f"training speed {self.speed_label}"
         return self.steps_per_frame
+
+    @property
+    def effective_training_frame_budget_ms(self) -> float:
+        """Responsive wall-time budget scaled for accelerated presets."""
+
+        return (
+            self.training_frame_budget_ms
+            * self.SPEED_BUDGET_MULTIPLIERS[self.speed_index]
+        )
 
     def change_population_car_limit(self, direction: int) -> int:
         """Cycle the visual rollout breadth without touching scored training."""
@@ -235,6 +255,29 @@ class DrivingLearningGame:
                     self.save_screenshot("driving-learning-screenshot.png")
                     continue
             self.dashboard.handle_event(event)
+            consume = getattr(self.dashboard, "consume_action_requests", None)
+            if consume is not None:
+                for action in consume():
+                    self._apply_dashboard_action(str(action))
+
+    def _apply_dashboard_action(self, action: str) -> None:
+        """Apply one mouse-accessible dashboard command."""
+
+        if action == "toggle_pause":
+            if self.race is None:
+                self.paused = not self.paused
+                self._status = "paused" if self.paused else "training"
+        elif action == "speed_down":
+            if self.race is None:
+                self.change_speed(-1)
+        elif action == "speed_up":
+            if self.race is None:
+                self.change_speed(1)
+        elif action == "toggle_population_cars":
+            if self.race is None:
+                self.toggle_population_cars()
+        elif action == "toggle_sensor_rays":
+            self.toggle_sensor_rays()
 
     def _training_telemetry(self) -> dict[str, Any]:
         data = self.session.telemetry()
@@ -257,6 +300,15 @@ class DrivingLearningGame:
                 "frame_training_steps": self._last_training_slice_steps,
                 "training_slice_capped": self._training_slice_capped,
                 "training_frame_budget_ms": self.training_frame_budget_ms,
+                "effective_training_frame_budget_ms": (
+                    self.effective_training_frame_budget_ms
+                ),
+                "training_slice_ms": self._training_slice_ms,
+                "training_ticks_per_second": self._training_ticks_per_second,
+                "environment_decisions_per_second": (
+                    self._environment_decisions_per_second
+                ),
+                "frame_time_ms": self._frame_time_ms,
                 "render_fps": self._render_fps,
                 "training_steps": self.training_steps,
                 "show_sensor_rays": self.show_sensor_rays,
@@ -287,10 +339,11 @@ class DrivingLearningGame:
         transitions keep the same order and termination limits.
         """
 
-        started_at = perf_counter() if self.render_enabled else 0.0
+        started_at = perf_counter()
+        starting_decisions = self.session.environment_decisions
         advanced = 0
         self._training_slice_capped = False
-        for _ in range(self.steps_per_frame):
+        while advanced < self.steps_per_frame:
             if (
                 max_training_steps is not None
                 and self.training_steps >= max_training_steps
@@ -305,20 +358,82 @@ class DrivingLearningGame:
                 self.running = False
                 break
 
-            self.session.step()
-            self.training_steps += 1
-            advanced += 1
+            remaining = self.steps_per_frame - advanced
+            if max_training_steps is not None:
+                remaining = min(
+                    remaining,
+                    max_training_steps - self.training_steps,
+                )
+            if self.render_enabled:
+                elapsed_ms = (perf_counter() - started_at) * 1_000.0
+                budget_left = max(
+                    0.0,
+                    self.effective_training_frame_budget_ms - elapsed_ms,
+                )
+                estimated_tick_ms = max(self._estimated_training_tick_ms, 0.05)
+                chunk = max(1, int(budget_left / estimated_tick_ms))
+                chunk = min(chunk, self.MAX_INTERACTIVE_BATCH_TICKS, remaining)
+            else:
+                chunk = remaining
+
+            chunk_started = perf_counter()
+            results = self.session.step_many(
+                chunk,
+                stop_after_generation=max_generations is not None,
+            )
+            chunk_elapsed_ms = max(
+                (perf_counter() - chunk_started) * 1_000.0,
+                1e-9,
+            )
+            completed = len(results)
+            if completed <= 0:
+                break
+            sample_tick_ms = chunk_elapsed_ms / completed
+            self._estimated_training_tick_ms = (
+                sample_tick_ms
+                if self._estimated_training_tick_ms <= 0.0
+                else self._estimated_training_tick_ms * 0.70
+                + sample_tick_ms * 0.30
+            )
+            self.training_steps += completed
+            advanced += completed
 
             if (
                 self.render_enabled
                 and advanced < self.steps_per_frame
                 and (perf_counter() - started_at) * 1_000.0
-                >= self.training_frame_budget_ms
+                >= self.effective_training_frame_budget_ms
             ):
                 self._training_slice_capped = True
                 break
 
+            if (
+                max_generations is not None
+                and self.session.completed_generations - starting_generations
+                >= max_generations
+            ):
+                self.running = False
+                break
+
         self._last_training_slice_steps = advanced
+        elapsed = max(perf_counter() - started_at, 1e-12)
+        decisions = self.session.environment_decisions - starting_decisions
+        self._training_slice_ms = elapsed * 1_000.0
+        tick_sample = advanced / elapsed
+        decision_sample = decisions / elapsed
+        smoothing = 0.20
+        self._training_ticks_per_second = (
+            tick_sample
+            if self._training_ticks_per_second <= 0.0
+            else self._training_ticks_per_second * (1.0 - smoothing)
+            + tick_sample * smoothing
+        )
+        self._environment_decisions_per_second = (
+            decision_sample
+            if self._environment_decisions_per_second <= 0.0
+            else self._environment_decisions_per_second * (1.0 - smoothing)
+            + decision_sample * smoothing
+        )
         return advanced
 
     def _race_telemetry(self) -> dict[str, Any]:
@@ -394,6 +509,7 @@ class DrivingLearningGame:
                 pygame.display.flip()
                 elapsed_ms = clock.tick(fps)
                 if elapsed_ms > 0:
+                    self._frame_time_ms = float(elapsed_ms)
                     sample_fps = 1_000.0 / elapsed_ms
                     self._render_fps = (
                         sample_fps

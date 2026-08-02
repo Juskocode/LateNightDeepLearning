@@ -95,12 +95,20 @@ class DrivingEnv:
     BEST_LAP_EPSILON = 1e-9
     SENSOR_MAX_DISTANCE = 150.0
     SENSOR_SAMPLE_STEP = 6.0
+    SENSOR_REFINEMENT_STEPS = 4
+    STAGNATION_GRACE_STEPS = 90
+    STAGNATION_LIMIT_STEPS = 240
+    STAGNATION_PROGRESS_DISTANCE = 0.04
     NORMAL_START_PROBABILITY = 0.80
     SENSOR_RELATIVE_ANGLES = (
         -math.pi / 2,
+        -3 * math.pi / 8,
         -math.pi / 4,
+        -math.pi / 8,
         0.0,
+        math.pi / 8,
         math.pi / 4,
+        3 * math.pi / 8,
         math.pi / 2,
     )
 
@@ -113,9 +121,13 @@ class DrivingEnv:
         "terrain_grip",
         "lap_progress",
         "ray_left",
+        "ray_left_wide",
         "ray_left_forward",
+        "ray_left_near",
         "ray_forward",
+        "ray_right_near",
         "ray_right_forward",
+        "ray_right_wide",
         "ray_right",
     )
 
@@ -162,6 +174,7 @@ class DrivingEnv:
         self._collision_contact = False
         self._lap_progress = 0.0
         self.previous_progress = 0.0
+        self._stagnation_steps = 0
         self.last_projection: TrackProjection | None = None
         self.last_reward_terms: dict[str, float] = {}
         # Observation, telemetry, and rendering often request the same rays in
@@ -200,6 +213,7 @@ class DrivingEnv:
         self._lap_candidate_armed = True
         self.last_projection = self.circuit.project(position)
         self.previous_progress = self.last_projection.progress
+        self._stagnation_steps = 0
         self._spawn_progress = self.last_projection.progress
         self._lap_origin_progress = self.last_projection.progress
         self._episode_lap_progress = 0.0
@@ -379,7 +393,7 @@ class DrivingEnv:
     def sensor_rays(
         self, max_distance: float = SENSOR_MAX_DISTANCE
     ) -> tuple[SensorRay, ...]:
-        """Return the five policy sensor rays in observation-label order.
+        """Return the nine policy sensor rays in observation-label order.
 
         The tuple and its :class:`SensorRay` entries are immutable snapshots.
         Rendering can therefore consume the same distances as the policy
@@ -404,45 +418,101 @@ class DrivingEnv:
             heading,
             maximum,
             float(self.SENSOR_SAMPLE_STEP),
+            int(self.SENSOR_REFINEMENT_STEPS),
             float(self.circuit.collision_radius),
         )
         if cache_key == self._sensor_ray_cache_key:
             return self._sensor_ray_cache
-        rays = tuple(
-            self._sensor_ray(heading + relative_angle, maximum)
-            for relative_angle in self.SENSOR_RELATIVE_ANGLES
+        rays = self._sensor_ray_fan(
+            tuple(
+                heading + relative_angle
+                for relative_angle in self.SENSOR_RELATIVE_ANGLES
+            ),
+            maximum,
         )
         self._sensor_ray_cache_key = cache_key
         self._sensor_ray_cache = rays
         return rays
 
     def _sensor_ray(self, angle: float, max_distance: float) -> SensorRay:
+        return self._sensor_ray_fan((angle,), max_distance)[0]
+
+    def _sensor_ray_fan(
+        self, angles: tuple[float, ...], max_distance: float
+    ) -> tuple[SensorRay, ...]:
+        """Batch all coarse samples and contact refinements for one ray fan."""
+
         origin = self.vehicle.state.position
-        direction = Vec2.from_angle(angle)
-        distance = self.SENSOR_SAMPLE_STEP
-        while distance <= max_distance:
-            sample = origin + direction * distance
-            if self.circuit.project(sample).distance >= self.circuit.collision_radius:
-                return SensorRay(
+        directions = tuple(Vec2.from_angle(angle) for angle in angles)
+        sample_distances = [
+            self.SENSOR_SAMPLE_STEP * index
+            for index in range(
+                1, int(max_distance // self.SENSOR_SAMPLE_STEP) + 1
+            )
+        ]
+        if not sample_distances or sample_distances[-1] < max_distance - 1e-12:
+            sample_distances.append(max_distance)
+        samples = tuple(
+            origin + direction * distance
+            for direction in directions
+            for distance in sample_distances
+        )
+        centerline_distances = self.circuit.distances_to_centerline(samples)
+        samples_per_ray = len(sample_distances)
+        hit_intervals: dict[int, tuple[float, float]] = {}
+        for ray_index in range(len(angles)):
+            start = ray_index * samples_per_ray
+            readings = centerline_distances[start : start + samples_per_ray]
+            for sample_index, clearance in enumerate(readings):
+                if clearance >= self.circuit.collision_radius:
+                    low = (
+                        0.0
+                        if sample_index == 0
+                        else sample_distances[sample_index - 1]
+                    )
+                    hit_intervals[ray_index] = (low, sample_distances[sample_index])
+                    break
+
+        for _ in range(self.SENSOR_REFINEMENT_STEPS):
+            if not hit_intervals:
+                break
+            ray_indices = tuple(hit_intervals)
+            midpoints = tuple(
+                (hit_intervals[index][0] + hit_intervals[index][1]) * 0.5
+                for index in ray_indices
+            )
+            refinement_samples = tuple(
+                origin + directions[index] * midpoint
+                for index, midpoint in zip(ray_indices, midpoints)
+            )
+            refinements = self.circuit.distances_to_centerline(refinement_samples)
+            for index, midpoint, clearance in zip(
+                ray_indices, midpoints, refinements
+            ):
+                low, high = hit_intervals[index]
+                if clearance >= self.circuit.collision_radius:
+                    high = midpoint
+                else:
+                    low = midpoint
+                hit_intervals[index] = (low, high)
+
+        rays: list[SensorRay] = []
+        for index, (angle, direction) in enumerate(zip(angles, directions)):
+            interval = hit_intervals.get(index)
+            hit = interval is not None
+            distance = interval[1] if interval is not None else max_distance
+            rays.append(
+                SensorRay(
                     angle=angle,
                     max_distance=max_distance,
                     distance=distance,
                     normalized_distance=distance / max_distance,
                     origin=origin,
-                    endpoint=sample,
-                    hit=True,
+                    endpoint=origin + direction * distance,
+                    hit=hit,
                 )
-            distance += self.SENSOR_SAMPLE_STEP
-        endpoint = origin + direction * max_distance
-        return SensorRay(
-            angle=angle,
-            max_distance=max_distance,
-            distance=max_distance,
-            normalized_distance=1.0,
-            origin=origin,
-            endpoint=endpoint,
-            hit=False,
-        )
+            )
+        return tuple(rays)
 
     def _ray_distance(
         self, angle: float, max_distance: float = SENSOR_MAX_DISTANCE
@@ -575,23 +645,84 @@ class DrivingEnv:
             delta_progress if abs(delta_progress) <= self.MAX_LAP_PROGRESS_STEP else 0.0
         )
         forward_distance = reward_progress * self.circuit.length
+        if forward_distance >= self.STAGNATION_PROGRESS_DISTANCE:
+            self._stagnation_steps = 0
+        else:
+            self._stagnation_steps += 1
+
         on_road = after.distance <= self.circuit.track_width * 0.5
+        max_speed = max(1.0, self.vehicle.build.max_speed)
+        forward_speed_ratio = clamp(
+            max(0.0, telemetry.longitudinal_speed) / max_speed, 0.0, 1.0
+        )
+        reverse_speed_ratio = clamp(
+            max(0.0, -telemetry.longitudinal_speed) / max_speed, 0.0, 1.0
+        )
+        track_heading = math.atan2(after.tangent.y, after.tangent.x)
+        heading_alignment = math.cos(
+            wrap_angle(self.vehicle.state.heading - track_heading)
+        )
+        forward_alignment = max(0.0, heading_alignment)
+        road_half_width = max(1.0, self.circuit.track_width * 0.5)
+        offset_ratio = clamp(after.distance / road_half_width, 0.0, 2.0)
+        center_factor = clamp(1.0 - offset_ratio, 0.0, 1.0)
+
+        rays = self.sensor_rays()
+        middle = len(rays) // 2
+        forward_clearance = min(
+            ray.normalized_distance for ray in rays[middle - 1 : middle + 2]
+        )
+        clearance_hazard = clamp((0.38 - forward_clearance) / 0.38, 0.0, 1.0)
+        productive_speed = (
+            forward_speed_ratio
+            * forward_alignment
+            * center_factor
+            * forward_clearance
+        )
+        stagnation_excess = max(
+            0, self._stagnation_steps - self.STAGNATION_GRACE_STEPS
+        )
         reward_terms = {
-            "progress": forward_distance * 0.12,
-            "road": 0.025 if on_road else -0.08,
-            "speed": 0.018
-            * max(0.0, telemetry.longitudinal_speed)
-            / self.vehicle.build.max_speed,
-            "reverse": -0.05 if telemetry.longitudinal_speed < -2.0 else 0.0,
-            "collision": (-min(5.0, impact_speed * 0.06) if collision_started else 0.0),
-            "lap": 20.0 if lap_completed else 0.0,
+            # Normalized center-line progress is the dominant dense signal and
+            # is symmetric: reversing removes exactly as much fitness as the
+            # same forward displacement earns.
+            "progress": reward_progress * 300.0,
+            # Speed is useful only while aligned, centered, and looking into
+            # clear track. Standing still can never farm this term.
+            "pace": 0.045 * productive_speed,
+            "road": 0.0 if on_road else -0.12,
+            "alignment": -0.05
+            * forward_speed_ratio
+            * (1.0 - forward_alignment),
+            "track_offset": -0.04 * forward_speed_ratio * offset_ratio**2,
+            "slip": -0.04 * abs(telemetry.lateral_speed) / max_speed,
+            "clearance": -0.14
+            * forward_speed_ratio
+            * clearance_hazard**2,
+            "reverse": -0.16 * reverse_speed_ratio,
+            "barrier_contact": -0.10 if collided else 0.0,
+            "collision": (
+                -2.0 - min(6.0, impact_speed * 0.08)
+                if collision_started
+                else 0.0
+            ),
+            "stagnation": -min(0.12, stagnation_excess * 0.002),
+            "lap": 75.0 if lap_completed else 0.0,
         }
         reward = sum(reward_terms.values())
         self.last_reward_terms = reward_terms
         self.steps += 1
         self.previous_progress = after.progress
         self.last_projection = after
-        truncated = self.steps >= self.max_steps
+        stagnated = self._stagnation_steps >= self.STAGNATION_LIMIT_STEPS
+        truncated = self.steps >= self.max_steps or stagnated
+        truncation_reason = (
+            "stagnation"
+            if stagnated
+            else "step_limit"
+            if self.steps >= self.max_steps
+            else None
+        )
         info: dict[str, object] = {
             "circuit": self.circuit.slug,
             "terrain": active_terrain.kind.value,
@@ -615,6 +746,11 @@ class DrivingEnv:
             "collided": collided,
             "collision_started": collision_started,
             "impact_speed": impact_speed,
+            "heading_alignment": heading_alignment,
+            "forward_clearance": forward_clearance,
+            "stagnation_steps": self._stagnation_steps,
+            "stagnated": stagnated,
+            "truncation_reason": truncation_reason,
             "reward_terms": reward_terms.copy(),
             "telemetry": telemetry,
         }
@@ -669,6 +805,16 @@ class DrivingEnv:
             "effective_grip": active_terrain.grip * build.grip_multiplier,
             "track_offset": projection.signed_offset,
             "progress": projection.progress,
+            "forward_clearance": min(
+                ray.normalized_distance
+                for ray in self.sensor_rays()[
+                    len(self.SENSOR_RELATIVE_ANGLES) // 2
+                    - 1 : len(self.SENSOR_RELATIVE_ANGLES) // 2
+                    + 2
+                ]
+            ),
+            "stagnation_steps": self._stagnation_steps,
+            "stagnation_limit_steps": self.STAGNATION_LIMIT_STEPS,
             "damage": state.damage,
             "components": {
                 "motor": build.motor,

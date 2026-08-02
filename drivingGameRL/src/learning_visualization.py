@@ -7,8 +7,9 @@ Double-DQN, and population-based variants without coupling it to one trainer.
 
 from __future__ import annotations
 
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 import math
 from pathlib import Path
 from typing import Any
@@ -25,16 +26,9 @@ LEARNING_WINDOW_SIZE = (LEARNING_WINDOW_WIDTH, LEARNING_WINDOW_HEIGHT)
 
 ACTION_LABELS = ("COAST", "THROTTLE", "BRAKE", "LEFT", "RIGHT")
 
-SENSOR_RAY_COUNT = 5
-SENSOR_MAX_DISTANCE = 150.0
-SENSOR_ANGLE_OFFSETS = (
-    -math.pi / 2,
-    -math.pi / 4,
-    0.0,
-    math.pi / 4,
-    math.pi / 2,
-)
+MAX_RENDERED_SENSOR_RAYS = 64
 MAX_POPULATION_CARS = 12
+POPULATION_TRAIL_LENGTH = 90
 CAR_ROTATION_STEP_DEGREES = 6
 TEXT_SURFACE_CACHE_LIMIT = 512
 
@@ -75,6 +69,17 @@ COLORS = {
     "human": (250, 197, 49),
     "champion": (46, 220, 239),
 }
+
+
+@dataclass(frozen=True, slots=True)
+class _PopulationVisual:
+    """One scored member prepared for truthful track rendering."""
+
+    rollout: Mapping[str, Any]
+    color: tuple[int, int, int]
+    label: str
+    member_key: int
+    generation: int
 
 
 def _font_path() -> Path:
@@ -183,8 +188,15 @@ class DrivingLearningVisualization:
         self._track_renderer = CircuitRenderer()
         self._scaled_tracks: dict[tuple[str, int, int], pygame.Surface] = {}
         self._ray_layers: dict[tuple[int, int], pygame.Surface] = {}
+        self._trail_layers: dict[tuple[int, int], pygame.Surface] = {}
         self._car_bodies: dict[tuple[int, int, int], pygame.Surface] = {}
         self._car_rotations: dict[tuple[tuple[int, int, int], int], pygame.Surface] = {}
+        self._population_trails: dict[tuple[int, int], deque[tuple[float, float]]] = {}
+        self._population_trail_steps: dict[tuple[int, int], int] = {}
+        self._population_hitboxes: dict[int, list[pygame.Rect]] = {}
+        self.selected_population_member: int | None = None
+        self.control_rects: dict[str, pygame.Rect] = {}
+        self._action_requests: deque[str] = deque(maxlen=32)
         self.tab_rects: dict[str, pygame.Rect] = {
             name: pygame.Rect(796 + index * 184, 18, 170, 42)
             for index, name in enumerate(self.TABS)
@@ -318,6 +330,13 @@ class DrivingLearningVisualization:
             self.active_tab = name
         return self.active_tab
 
+    def consume_action_requests(self) -> tuple[str, ...]:
+        """Return and clear presentation-control requests queued by clicks."""
+
+        requests = tuple(self._action_requests)
+        self._action_requests.clear()
+        return requests
+
     def handle_event(self, event: pygame.event.Event) -> bool:
         """Handle tab navigation and report whether the event was consumed."""
 
@@ -340,9 +359,17 @@ class DrivingLearningVisualization:
                 self.return_to_training_requested = True
                 return True
         if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            for action, rect in self.control_rects.items():
+                if rect.collidepoint(event.pos):
+                    self._action_requests.append(action)
+                    return True
             for name, rect in self.tab_rects.items():
                 if rect.collidepoint(event.pos):
                     self.set_tab(name)
+                    return True
+            for member_key, hitboxes in self._population_hitboxes.items():
+                if any(rect.collidepoint(event.pos) for rect in hitboxes):
+                    self.selected_population_member = member_key
                     return True
         return False
 
@@ -352,44 +379,36 @@ class DrivingLearningVisualization:
             consumed = self.handle_event(event) or consumed
         return consumed
 
-    def _header(self, data: Mapping[str, Any], *, race: bool = False) -> None:
-        pygame.draw.rect(self.surface, COLORS["panel"], (0, 0, self.WIDTH, 76))
-        pygame.draw.line(self.surface, COLORS["edge"], (0, 75), (self.WIDTH, 75), 1)
-        workers = max(1, _integer(data.get("parallel_workers"), 1))
-        population_size = max(1, _integer(data.get("population_size"), 1))
-        parallel_population = not race and population_size > 1 and workers > 1
-        title = "HUMAN VS GENERATION CHAMPION" if race else (
-            "PARALLEL EVOLUTIONARY DQN OBSERVATORY"
-            if parallel_population
-            else "EVOLUTIONARY DQN OBSERVATORY"
+    def _control_button(
+        self,
+        action: str,
+        rect: pygame.Rect,
+        label: str,
+        *,
+        active: bool = False,
+    ) -> None:
+        """Draw one discoverable control and publish its click target."""
+
+        self.control_rects[action] = rect
+        fill = COLORS["cyan_dim"] if active else COLORS["panel_alt"]
+        edge = COLORS["cyan"] if active else COLORS["edge"]
+        pygame.draw.rect(self.surface, fill, rect, border_radius=6)
+        pygame.draw.rect(self.surface, edge, rect, 1, border_radius=6)
+        text = self._render_text(
+            label,
+            size=9,
+            color=COLORS["text"],
+            bold=True,
         )
-        self._text(title, (22, 14), size=22, color=COLORS["cyan"], bold=True)
-        subtitle = (
-            "Same circuit · deterministic simulation · one fair race"
-            if race
-            else (
-                f"Synchronous generation · {workers} worker threads · "
-                "stable deterministic merge"
-                if parallel_population
-                else "Live policy, population, replay memory, and neural activity"
-            )
-        )
-        self._text(subtitle, (23, 44), size=12, color=COLORS["muted"])
-        if race:
-            ray_state = "ON" if _flag(data.get("show_sensor_rays")) else "OFF"
-            self._right_text(
-                f"P  TRAINING   ·   V RAYS {ray_state}",
-                1_378,
-                46,
-                size=10,
-                color=COLORS["muted"],
-                bold=True,
-            )
-            return
+        self.surface.blit(text, text.get_rect(center=rect.center))
+
+    def _training_controls(self, data: Mapping[str, Any]) -> None:
+        """Draw mouse controls while preserving the existing keyboard bindings."""
+
+        paused = _flag(data.get("paused", data.get("training_paused")))
+        cars = _flag(data.get("show_population_cars"))
+        rays = _flag(data.get("show_sensor_rays"))
         speed = str(data.get("training_speed_label", "16x")).upper()
-        ray_state = "ON" if _flag(data.get("show_sensor_rays")) else "OFF"
-        cars_state = "ON" if _flag(data.get("show_population_cars")) else "OFF"
-        car_limit = max(1, _integer(data.get("population_car_limit", 8), 8))
         requested_steps = max(
             1,
             _integer(
@@ -405,20 +424,120 @@ class DrivingLearningVisualization:
             _flag(data.get("training_slice_capped"))
             and 0 < frame_steps < requested_steps
         ):
-            speed = f"{speed}:{frame_steps}/F"
-        fps = _finite(data.get("render_fps"))
-        fps_hint = f"  ·  {fps:.0f} FPS" if fps >= 1.0 else ""
-        self._right_text(
-            (
-                f"P RACE  ·  V RAYS {ray_state}  ·  M CARS {cars_state}  ·  "
-                f"C {car_limit}  ·  [ ] {speed}{fps_hint}"
-            ),
-            778,
-            46,
+            speed = f"{speed}:{frame_steps}"
+
+        self.control_rects = {}
+        y, height, gap = 42, 25, 5
+        x = 398
+        pause_rect = pygame.Rect(x, y, 68, height)
+        self._control_button(
+            "toggle_pause",
+            pause_rect,
+            "PLAY" if paused else "PAUSE",
+            active=paused,
+        )
+        x = pause_rect.right + gap
+        down_rect = pygame.Rect(x, y, 28, height)
+        self._control_button("speed_down", down_rect, "-")
+        x = down_rect.right + 3
+        speed_rect = pygame.Rect(x, y, 57, height)
+        pygame.draw.rect(self.surface, COLORS["panel_alt"], speed_rect, border_radius=6)
+        pygame.draw.rect(self.surface, COLORS["edge"], speed_rect, 1, border_radius=6)
+        speed_text = self._render_text(
+            self._fit_text(speed, speed_rect.width - 8, 9, True),
             size=9,
-            color=COLORS["muted"],
+            color=COLORS["yellow"],
             bold=True,
         )
+        self.surface.blit(speed_text, speed_text.get_rect(center=speed_rect.center))
+        x = speed_rect.right + 3
+        up_rect = pygame.Rect(x, y, 28, height)
+        self._control_button("speed_up", up_rect, "+")
+        x = up_rect.right + gap
+        cars_rect = pygame.Rect(x, y, 76, height)
+        self._control_button(
+            "toggle_population_cars",
+            cars_rect,
+            f"CARS {'ON' if cars else 'OFF'}",
+            active=cars,
+        )
+        x = cars_rect.right + gap
+        rays_rect = pygame.Rect(x, y, 76, height)
+        self._control_button(
+            "toggle_sensor_rays",
+            rays_rect,
+            f"RAYS {'ON' if rays else 'OFF'}",
+            active=rays,
+        )
+
+    def _header(self, data: Mapping[str, Any], *, race: bool = False) -> None:
+        pygame.draw.rect(self.surface, COLORS["panel"], (0, 0, self.WIDTH, 76))
+        pygame.draw.line(self.surface, COLORS["edge"], (0, 75), (self.WIDTH, 75), 1)
+        workers = max(1, _integer(data.get("parallel_workers"), 1))
+        population_size = max(1, _integer(data.get("population_size"), 1))
+        parallel_population = not race and population_size > 1 and workers > 1
+        title = (
+            "HUMAN VS GENERATION CHAMPION"
+            if race
+            else (
+                "PARALLEL EVOLUTIONARY DQN OBSERVATORY"
+                if parallel_population
+                else "EVOLUTIONARY DQN OBSERVATORY"
+            )
+        )
+        self._text(title, (22, 14), size=22, color=COLORS["cyan"], bold=True)
+        if not race:
+            ticks_per_second = max(0.0, _finite(data.get("training_ticks_per_second")))
+            decisions_per_second = max(
+                0.0, _finite(data.get("environment_decisions_per_second"))
+            )
+            render_fps = max(0.0, _finite(data.get("render_fps")))
+            throughput = []
+            if ticks_per_second > 0.0:
+                throughput.append(f"{_compact_number(ticks_per_second)} TICK/S")
+            if decisions_per_second > 0.0:
+                throughput.append(f"{_compact_number(decisions_per_second)} DEC/S")
+            if render_fps > 0.0:
+                throughput.append(f"{render_fps:.0f} FPS")
+            if throughput:
+                self._right_text(
+                    " · ".join(throughput),
+                    776,
+                    19,
+                    size=9,
+                    color=COLORS["green"],
+                    bold=True,
+                )
+        subtitle = (
+            "Same circuit · deterministic simulation · one fair race"
+            if race
+            else (
+                f"Synchronous generation · {workers} worker threads · "
+                "stable deterministic merge"
+                if parallel_population
+                else "Live policy, population, replay memory, and neural activity"
+            )
+        )
+        subtitle_width = 750 if race else 360
+        self._text(
+            self._fit_text(subtitle, subtitle_width, 11),
+            (23, 47),
+            size=11,
+            color=COLORS["muted"],
+        )
+        if race:
+            self.control_rects = {}
+            ray_state = "ON" if _flag(data.get("show_sensor_rays")) else "OFF"
+            self._right_text(
+                f"P  TRAINING   ·   V RAYS {ray_state}",
+                1_378,
+                46,
+                size=10,
+                color=COLORS["muted"],
+                bold=True,
+            )
+            return
+        self._training_controls(data)
         for name, rect in self.tab_rects.items():
             selected = name == self.active_tab
             pygame.draw.rect(
@@ -575,9 +694,14 @@ class DrivingLearningVisualization:
                 self._field(candidate, "normalized_distance"), math.nan
             )
             distance = _finite(self._field(candidate, "distance"), math.nan)
-            maximum = _finite(
-                self._field(candidate, "max_distance"), SENSOR_MAX_DISTANCE
+            maximum = _finite(self._field(candidate, "max_distance"), math.nan)
+            geometric_distance = math.hypot(
+                endpoint[0] - origin[0], endpoint[1] - origin[1]
             )
+            if not math.isfinite(distance):
+                distance = geometric_distance
+            if not math.isfinite(maximum) or maximum <= 0.0:
+                maximum = distance if distance > 0.0 else math.nan
             if not math.isfinite(normalized):
                 normalized = (
                     distance / maximum
@@ -589,6 +713,7 @@ class DrivingLearningVisualization:
                     "origin": origin,
                     "endpoint": endpoint,
                     "distance": distance,
+                    "max_distance": maximum,
                     "normalized_distance": max(0.0, min(1.0, normalized)),
                     "hit": _flag(self._field(candidate, "hit"), normalized < 1.0),
                 }
@@ -614,15 +739,24 @@ class DrivingLearningVisualization:
             try:
                 snapshots = sensor_api() if callable(sensor_api) else sensor_api
                 rays = self._coerce_rays(snapshots)
-                if len(rays) >= SENSOR_RAY_COUNT:
-                    return rays[:SENSOR_RAY_COUNT]
+                if rays:
+                    return rays[:MAX_RENDERED_SENSOR_RAYS]
             except (AttributeError, TypeError, ValueError):
                 pass
 
+        offsets = tuple(
+            _finite(value, math.nan)
+            for value in _sequence(getattr(env, "SENSOR_RELATIVE_ANGLES", ()))
+        )
+        offsets = tuple(value for value in offsets if math.isfinite(value))
+        if not offsets:
+            return []
+        ray_count = min(len(offsets), MAX_RENDERED_SENSOR_RAYS)
+        offsets = offsets[:ray_count]
         observation_values = _sequence(observation)
         readings = (
-            [_finite(value) for value in observation_values[-SENSOR_RAY_COUNT:]]
-            if len(observation_values) >= SENSOR_RAY_COUNT
+            [_finite(value) for value in observation_values[-ray_count:]]
+            if len(observation_values) >= ray_count
             else []
         )
         # Older environments expose only the normalized observation values.
@@ -630,18 +764,19 @@ class DrivingLearningVisualization:
         # keeps this dashboard compatible while SensorRay rolls out.
         if not readings:
             try:
-                readings = [
-                    _finite(value) for value in env.observation()[-SENSOR_RAY_COUNT:]
-                ]
+                readings = [_finite(value) for value in env.observation()[-ray_count:]]
             except (AttributeError, TypeError, ValueError):
                 readings = []
-        if len(readings) != SENSOR_RAY_COUNT:
+        if len(readings) != ray_count:
+            return []
+        max_distance = _finite(getattr(env, "SENSOR_MAX_DISTANCE", math.nan), math.nan)
+        if not math.isfinite(max_distance) or max_distance <= 0.0:
             return []
         x, y, heading = requested_pose
         result: list[dict[str, Any]] = []
-        for angle, reading in zip(SENSOR_ANGLE_OFFSETS, readings):
+        for angle, reading in zip(offsets, readings):
             normalized = max(0.0, min(1.0, reading))
-            distance = normalized * SENSOR_MAX_DISTANCE
+            distance = normalized * max_distance
             endpoint = (
                 x + math.cos(heading + angle) * distance,
                 y + math.sin(heading + angle) * distance,
@@ -651,6 +786,7 @@ class DrivingLearningVisualization:
                     "origin": (x, y),
                     "endpoint": endpoint,
                     "distance": distance,
+                    "max_distance": max_distance,
                     "normalized_distance": normalized,
                     "hit": normalized < 1.0,
                 }
@@ -668,9 +804,7 @@ class DrivingLearningVisualization:
             return fallback
         return sum((index + 1) * ord(character) for index, character in enumerate(text))
 
-    def _population_rollouts(
-        self, data: Mapping[str, Any]
-    ) -> list[tuple[Mapping[str, Any], tuple[int, int, int], str]]:
+    def _population_rollouts(self, data: Mapping[str, Any]) -> list[_PopulationVisual]:
         raw = _sequence(data.get("population_rollouts"))
         if not raw:
             return []
@@ -693,9 +827,7 @@ class DrivingLearningVisualization:
                         target_generation = int(generation)
                         break
 
-        prepared: list[
-            tuple[int, int, Mapping[str, Any], tuple[int, int, int], str]
-        ] = []
+        prepared: list[tuple[int, int, _PopulationVisual]] = []
         for ordinal, candidate in enumerate(raw):
             rollout = _mapping(candidate)
             if (
@@ -720,12 +852,28 @@ class DrivingLearningVisualization:
             label_value = rollout.get("index", member_value)
             label_number = self._stable_member_key(label_value, ordinal)
             label = f"M{label_number + 1:02d}"[-5:]
-            prepared.append((label_number, ordinal, rollout, color, label))
+            rollout_generation = (
+                int(generation)
+                if isinstance(generation, (int, float))
+                and not isinstance(generation, bool)
+                and math.isfinite(float(generation))
+                else target_generation or 0
+            )
+            prepared.append(
+                (
+                    label_number,
+                    ordinal,
+                    _PopulationVisual(
+                        rollout=rollout,
+                        color=color,
+                        label=label,
+                        member_key=member_key,
+                        generation=rollout_generation,
+                    ),
+                )
+            )
         prepared.sort(key=lambda item: (item[0], item[1]))
-        return [
-            (rollout, color, label)
-            for _, _, rollout, color, label in prepared[:MAX_POPULATION_CARS]
-        ]
+        return [visual for _, _, visual in prepared[:MAX_POPULATION_CARS]]
 
     @staticmethod
     def _ray_color(ray: Mapping[str, Any]) -> tuple[int, int, int]:
@@ -756,7 +904,7 @@ class DrivingLearningVisualization:
             y = max(-TRACK_HEIGHT * 4, min(TRACK_HEIGHT * 5, point[1]))
             return round(x * scale_x), round(y * scale_y)
 
-        for ray in list(rays)[:SENSOR_RAY_COUNT]:
+        for ray in list(rays)[:MAX_RENDERED_SENSOR_RAYS]:
             origin = _point(ray.get("origin"))
             endpoint = _point(ray.get("endpoint"))
             if origin is None or endpoint is None:
@@ -780,6 +928,314 @@ class DrivingLearningVisualization:
         else:
             layer.fill((0, 0, 0, 0))
         return layer
+
+    def _trail_layer(self, size: tuple[int, int]) -> pygame.Surface:
+        """Return a cleared reusable layer for truthful member trajectories."""
+
+        layer = self._trail_layers.get(size)
+        if layer is None:
+            layer = pygame.Surface(size, pygame.SRCALPHA)
+            self._trail_layers[size] = layer
+        else:
+            layer.fill((0, 0, 0, 0))
+        return layer
+
+    @staticmethod
+    def _viewport_point(
+        viewport: pygame.Rect,
+        point: tuple[float, float],
+        *,
+        local: bool = False,
+    ) -> tuple[int, int]:
+        x = round(point[0] * viewport.width / TRACK_VIEW_WIDTH)
+        y = round(point[1] * viewport.height / TRACK_HEIGHT)
+        return (x, y) if local else (viewport.x + x, viewport.y + y)
+
+    def _update_population_trails(
+        self, population: Sequence[_PopulationVisual]
+    ) -> None:
+        """Record only supplied real poses, deduplicated and strictly bounded."""
+
+        generations = {visual.generation for visual in population}
+        if generations:
+            for key in tuple(self._population_trails):
+                if key[0] not in generations:
+                    self._population_trails.pop(key, None)
+                    self._population_trail_steps.pop(key, None)
+
+        for visual in population:
+            position = _point(visual.rollout.get("position", visual.rollout.get("pos")))
+            if position is None:
+                continue
+            key = (visual.generation, visual.member_key)
+            step = _integer(
+                visual.rollout.get("steps", visual.rollout.get("evaluation_step", -1)),
+                -1,
+            )
+            trail = self._population_trails.setdefault(
+                key, deque(maxlen=POPULATION_TRAIL_LENGTH)
+            )
+            previous_step = self._population_trail_steps.get(key)
+            if (
+                previous_step is not None
+                and step >= 0
+                and previous_step >= 0
+                and step < previous_step
+            ):
+                trail.clear()
+            if not trail or not (
+                math.isclose(trail[-1][0], position[0], abs_tol=1e-7)
+                and math.isclose(trail[-1][1], position[1], abs_tol=1e-7)
+            ):
+                trail.append(position)
+            self._population_trail_steps[key] = step
+
+    def _draw_population_trails(
+        self,
+        viewport: pygame.Rect,
+        population: Sequence[_PopulationVisual],
+    ) -> None:
+        self._update_population_trails(population)
+        layer = self._trail_layer(viewport.size)
+        ordered = sorted(
+            population,
+            key=lambda visual: visual.member_key == self.selected_population_member,
+        )
+        for visual in ordered:
+            trail = self._population_trails.get(
+                (visual.generation, visual.member_key), deque()
+            )
+            if len(trail) < 2:
+                continue
+            points = [
+                self._viewport_point(viewport, point, local=True) for point in trail
+            ]
+            selected = visual.member_key == self.selected_population_member
+            pygame.draw.lines(
+                layer,
+                (*visual.color, 190 if selected else 105),
+                False,
+                points,
+                3 if selected else 2,
+            )
+        self.surface.blit(layer, viewport.topleft)
+
+    @staticmethod
+    def _population_clusters(
+        entries: Sequence[tuple[_PopulationVisual, tuple[int, int], float]],
+    ) -> list[list[tuple[_PopulationVisual, tuple[int, int], float]]]:
+        """Group only visually overlapping true poses for callout placement."""
+
+        clusters: list[list[tuple[_PopulationVisual, tuple[int, int], float]]] = []
+        for entry in entries:
+            center = entry[1]
+            for cluster in clusters:
+                if any(
+                    math.hypot(center[0] - other[1][0], center[1] - other[1][1]) <= 34.0
+                    for other in cluster
+                ):
+                    cluster.append(entry)
+                    break
+            else:
+                clusters.append([entry])
+        return clusters
+
+    def _draw_population_callout(
+        self,
+        viewport: pygame.Rect,
+        visual: _PopulationVisual,
+        center: tuple[int, int],
+        box: pygame.Rect,
+    ) -> None:
+        selected = visual.member_key == self.selected_population_member
+        anchor = (
+            (box.left, box.centery)
+            if box.centerx >= center[0]
+            else (box.right, box.centery)
+        )
+        pygame.draw.line(self.surface, COLORS["background"], center, anchor, 3)
+        pygame.draw.line(self.surface, visual.color, center, anchor, 1)
+        pygame.draw.rect(
+            self.surface,
+            COLORS["panel_high"] if selected else COLORS["background"],
+            box,
+            border_radius=4,
+        )
+        pygame.draw.rect(
+            self.surface,
+            COLORS["text"] if selected else visual.color,
+            box,
+            2 if selected else 1,
+            border_radius=4,
+        )
+        action = _integer(visual.rollout.get("action"), -1)
+        action_label = (
+            ACTION_LABELS[action][:3] if 0 <= action < len(ACTION_LABELS) else "---"
+        )
+        text = self._render_text(
+            f"{visual.label} {action_label}",
+            size=8,
+            color=visual.color,
+            bold=True,
+        )
+        self.surface.blit(text, text.get_rect(center=box.center))
+        self._population_hitboxes.setdefault(visual.member_key, []).append(box.copy())
+
+    def _draw_population_legend(
+        self,
+        viewport: pygame.Rect,
+        population: Sequence[_PopulationVisual],
+    ) -> None:
+        if not population:
+            return
+        columns = 3 if len(population) > 6 else 2
+        rows = math.ceil(len(population) / columns)
+        chip_width, chip_height = 84, 19
+        panel = pygame.Rect(
+            viewport.right - columns * chip_width - 14,
+            viewport.y + 8,
+            columns * chip_width + 8,
+            rows * chip_height + 25,
+        )
+        pygame.draw.rect(self.surface, (*COLORS["background"],), panel, border_radius=7)
+        pygame.draw.rect(self.surface, COLORS["edge"], panel, 1, border_radius=7)
+        self._text(
+            "SCORED CARS · CLICK TO FOLLOW",
+            (panel.x + 7, panel.y + 5),
+            size=8,
+            color=COLORS["muted"],
+            bold=True,
+        )
+        for index, visual in enumerate(population):
+            column = index // rows
+            row = index % rows
+            chip = pygame.Rect(
+                panel.x + 4 + column * chip_width,
+                panel.y + 21 + row * chip_height,
+                chip_width - 3,
+                chip_height - 2,
+            )
+            selected = visual.member_key == self.selected_population_member
+            if selected:
+                pygame.draw.rect(
+                    self.surface, COLORS["panel_high"], chip, border_radius=4
+                )
+                pygame.draw.rect(self.surface, COLORS["text"], chip, 1, border_radius=4)
+            status = str(visual.rollout.get("status", "active")).lower()
+            pygame.draw.circle(
+                self.surface,
+                visual.color,
+                (chip.x + 8, chip.centery),
+                4,
+                0 if status in {"active", "evaluating", "running"} else 1,
+            )
+            action = _integer(visual.rollout.get("action"), -1)
+            action_text = f"A{action}" if action >= 0 else "--"
+            self._text(
+                f"{visual.label} {action_text}",
+                (chip.x + 16, chip.y + 3),
+                size=8,
+                color=visual.color,
+                bold=selected,
+            )
+            self._population_hitboxes.setdefault(visual.member_key, []).append(
+                chip.copy()
+            )
+
+    def _draw_population_cars(
+        self,
+        viewport: pygame.Rect,
+        env: DrivingEnv,
+        population: Sequence[_PopulationVisual],
+    ) -> None:
+        self._population_hitboxes = {}
+        if not population:
+            return
+        available = {visual.member_key for visual in population}
+        if self.selected_population_member not in available:
+            self.selected_population_member = population[0].member_key
+
+        entries: list[tuple[_PopulationVisual, tuple[int, int], float]] = []
+        for visual in population:
+            x, y, heading = self._pose(env, visual.rollout)
+            entries.append(
+                (
+                    visual,
+                    self._viewport_point(viewport, (x, y)),
+                    heading,
+                )
+            )
+
+        for cluster in self._population_clusters(entries):
+            ordered = sorted(
+                cluster,
+                key=lambda entry: entry[0].member_key
+                == self.selected_population_member,
+            )
+            for ring_index, (visual, center, _) in enumerate(ordered):
+                pygame.draw.circle(
+                    self.surface,
+                    visual.color,
+                    center,
+                    18 + ring_index * 4,
+                    3 if visual.member_key == self.selected_population_member else 2,
+                )
+            for visual, center, heading in ordered:
+                self._draw_car(center, heading, visual.color)
+                self._population_hitboxes.setdefault(visual.member_key, []).append(
+                    pygame.Rect(center[0] - 20, center[1] - 20, 40, 40)
+                )
+
+            cluster_center = (
+                round(sum(entry[1][0] for entry in cluster) / len(cluster)),
+                round(sum(entry[1][1] for entry in cluster) / len(cluster)),
+            )
+            callout_width, callout_height, gap = 66, 18, 3
+            total_height = len(cluster) * (callout_height + gap) - gap
+            use_right = cluster_center[0] + callout_width + 34 <= viewport.right
+            callout_x = (
+                cluster_center[0] + 27
+                if use_right
+                else cluster_center[0] - callout_width - 27
+            )
+            callout_x = max(
+                viewport.left + 5,
+                min(callout_x, viewport.right - callout_width - 5),
+            )
+            callout_y = max(
+                viewport.top + 7,
+                min(
+                    cluster_center[1] - total_height // 2,
+                    viewport.bottom - total_height - 42,
+                ),
+            )
+            if len(cluster) > 1:
+                stack = self._render_text(
+                    f"{len(cluster)}× TRUE POSE",
+                    size=7,
+                    color=COLORS["text"],
+                    bold=True,
+                )
+                stack_rect = stack.get_rect(
+                    bottomleft=(callout_x, max(viewport.top + 8, callout_y - 3))
+                )
+                pygame.draw.rect(
+                    self.surface,
+                    COLORS["background"],
+                    stack_rect.inflate(6, 3),
+                    border_radius=3,
+                )
+                self.surface.blit(stack, stack_rect)
+            for index, (visual, center, _) in enumerate(cluster):
+                box = pygame.Rect(
+                    callout_x,
+                    callout_y + index * (callout_height + gap),
+                    callout_width,
+                    callout_height,
+                )
+                self._draw_population_callout(viewport, visual, center, box)
+
+        self._draw_population_legend(viewport, population)
 
     def _draw_curriculum_origin(
         self,
@@ -861,12 +1317,18 @@ class DrivingLearningVisualization:
             if include_population and _flag(data.get("show_population_cars"))
             else []
         )
+        self._population_hitboxes = {}
+        if population:
+            available_members = {visual.member_key for visual in population}
+            if self.selected_population_member not in available_members:
+                self.selected_population_member = population[0].member_key
+            self._draw_population_trails(viewport, population)
         if _flag(data.get("show_sensor_rays")):
             ray_layer = self._ray_layer(viewport.size)
             if ray_sources:
                 for source, source_env, pose, color in ray_sources:
                     rays = self._coerce_rays(source)
-                    if len(rays) < SENSOR_RAY_COUNT:
+                    if not rays:
                         rays = self._environment_rays(source_env, pose)
                     self._draw_ray_set(
                         ray_layer, viewport, rays, color=color, alpha=145, width=2
@@ -882,23 +1344,29 @@ class DrivingLearningVisualization:
                     alpha=165,
                     width=2,
                 )
-            for rollout, color, _ in population:
+            for visual in population:
                 self._draw_ray_set(
                     ray_layer,
                     viewport,
-                    self._coerce_rays(rollout.get("rays")),
-                    color=color,
-                    alpha=58,
-                    width=1,
+                    self._coerce_rays(visual.rollout),
+                    color=visual.color,
+                    alpha=(
+                        125
+                        if visual.member_key == self.selected_population_member
+                        else 52
+                    ),
+                    width=(
+                        2 if visual.member_key == self.selected_population_member else 1
+                    ),
                 )
             self.surface.blit(ray_layer, viewport.topleft)
         self._draw_curriculum_origin(viewport, env, snapshot)
         if not cars and not population:
             cars = ((None, COLORS["cyan"], "POLICY"),)
-        all_cars = [*population, *cars]
+        self._draw_population_cars(viewport, env, population)
         scale_x = viewport.width / TRACK_VIEW_WIDTH
         scale_y = viewport.height / TRACK_HEIGHT
-        for explicit, color, label in all_cars:
+        for explicit, color, label in cars:
             x, y, heading = self._pose(env, explicit)
             center = (
                 round(viewport.x + x * scale_x),
@@ -1368,10 +1836,12 @@ class DrivingLearningVisualization:
             active_count = max(0, _integer(data.get("last_tick_member_count"), 0))
         workers = max(1, _integer(data.get("parallel_workers"), 1))
         if population_size > 1:
-            generation_detail = (
-                f"{active_count} cars/tick · {workers} "
-                f"{'thread' if workers == 1 else 'threads'}"
+            decisions_per_second = max(
+                0.0, _finite(data.get("environment_decisions_per_second"))
             )
+            generation_detail = f"{active_count}c/t · {workers}th"
+            if decisions_per_second > 0.0:
+                generation_detail += f" · {_compact_number(decisions_per_second)} d/s"
         else:
             generation_detail = f"member {member + 1}/{max(1, population_size)}"
         fitness = _finite(data.get("current_fitness", data.get("fitness")))

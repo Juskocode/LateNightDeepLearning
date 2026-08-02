@@ -23,6 +23,7 @@ import math
 import os
 from pathlib import Path
 import tempfile
+from time import perf_counter
 from typing import Any, Literal, NoReturn
 
 import numpy as np
@@ -314,6 +315,7 @@ class PopulationTrainer:
 
     CHECKPOINT_VERSION = 1
     GENOME_SAMPLE_LIMIT = 2_048
+    MAX_WORKER_CHUNK_TICKS = 8
     _SEED_LIMIT = 2**63
 
     def __init__(
@@ -358,6 +360,11 @@ class PopulationTrainer:
         self._worker_failure: BaseException | None = None
         self._environment_decisions = 0
         self._last_tick_member_count = 0
+        self._last_batch_ticks = 0
+        self._last_batch_decisions = 0
+        self._last_batch_ms = 0.0
+        self._decision_throughput = 0.0
+        self._tick_throughput = 0.0
         self._rng = np.random.default_rng(self.config.seed)
         self._next_member_id = 0
         self.generation = 0
@@ -497,6 +504,12 @@ class PopulationTrainer:
         )
 
     @property
+    def environment_decisions(self) -> int:
+        """Total scored member transitions across every generation."""
+
+        return self._environment_decisions
+
+    @property
     def member_runtime(self) -> tuple[dict[str, object], ...]:
         """Cheap aligned status rows for renderers and runtime facades."""
 
@@ -595,17 +608,115 @@ class PopulationTrainer:
     def step(self) -> PopulationStep:
         """Advance every active member by one concurrent, lockstep physics frame."""
 
+        return self.step_many(1)[0]
+
+    def step_many(
+        self,
+        max_ticks: int,
+        *,
+        stop_after_generation: bool = False,
+    ) -> tuple[PopulationStep, ...]:
+        """Advance bounded population ticks with one submit per car and chunk.
+
+        A worker owns one member for the duration of a short chunk, which avoids
+        submitting and joining ``population_size`` futures on every physics
+        frame.  Worker output is replayed by tick and merged in stable member
+        order, so this is bit-equivalent to repeated :meth:`step` calls for both
+        ``workers=1`` and a parallel pool.  A chunk never evaluates a member past
+        termination or its generation budget.
+
+        ``stop_after_generation`` is useful to an interactive loop with an exact
+        generation limit: it returns immediately after the first evolution even
+        when ``max_ticks`` had spare capacity.
+        """
+
         self._require_usable()
-        active_indices = self.active_member_indices
-        if not active_indices:
-            raise RuntimeError("generation is complete; call evolve() before stepping")
+        if isinstance(max_ticks, bool) or not isinstance(max_ticks, int):
+            raise ValueError("max_ticks must be a positive integer")
+        if max_ticks <= 0:
+            raise ValueError("max_ticks must be a positive integer")
+
+        started_at = perf_counter()
+        starting_decisions = self._environment_decisions
+        steps: list[PopulationStep] = []
+        while len(steps) < max_ticks:
+            active_indices = self.active_member_indices
+            if not active_indices:
+                if steps:
+                    break
+                raise RuntimeError(
+                    "generation is complete; call evolve() before stepping"
+                )
+            generation = self.generation
+            # Very long per-member tasks let Python-heavy ray casting monopolize
+            # a worker and reduce fairness. Eight ticks amortizes submission
+            # overhead while returning to the stable coordinator barrier often
+            # enough for responsive telemetry and balanced workers.
+            requested_ticks = min(
+                max_ticks - len(steps),
+                self.MAX_WORKER_CHUNK_TICKS,
+            )
+            batches = self._advance_active_member_batches(
+                active_indices,
+                requested_ticks,
+            )
+            batch_ticks = max((len(batch) for batch in batches), default=0)
+            if batch_ticks <= 0:
+                raise RuntimeError("population workers produced no transitions")
+
+            for offset in range(batch_ticks):
+                advances = tuple(
+                    batch[offset] for batch in batches if offset < len(batch)
+                )
+                tick_active_indices = tuple(advance.index for advance in advances)
+                population_step = self._merge_population_tick(
+                    tick_active_indices,
+                    advances,
+                    generation=generation,
+                )
+                steps.append(population_step)
+                if population_step.generation_completed:
+                    break
+
+            generation_ended = bool(steps[-1].generation_completed)
+            if generation_ended and (stop_after_generation or not self.auto_evolve):
+                break
+
+        elapsed = max(perf_counter() - started_at, 1e-12)
+        decisions = self._environment_decisions - starting_decisions
+        self._last_batch_ticks = len(steps)
+        self._last_batch_decisions = decisions
+        self._last_batch_ms = elapsed * 1_000.0
+        decision_sample = decisions / elapsed
+        tick_sample = len(steps) / elapsed
+        smoothing = 0.20
+        self._decision_throughput = (
+            decision_sample
+            if self._decision_throughput <= 0.0
+            else self._decision_throughput * (1.0 - smoothing)
+            + decision_sample * smoothing
+        )
+        self._tick_throughput = (
+            tick_sample
+            if self._tick_throughput <= 0.0
+            else self._tick_throughput * (1.0 - smoothing) + tick_sample * smoothing
+        )
+        return tuple(steps)
+
+    def _merge_population_tick(
+        self,
+        active_indices: tuple[int, ...],
+        advances: tuple[_MemberAdvance, ...],
+        *,
+        generation: int,
+    ) -> PopulationStep:
+        """Merge one worker-produced lockstep tick on the coordinator thread."""
+
         member_index = (
             self._current_index
             if self._current_index in active_indices
             else active_indices[0]
         )
-        generation = self.generation
-        advances = self._advance_active_members(active_indices)
         self._last_tick_member_count = len(advances)
         self._environment_decisions += len(advances)
         advances_by_index = {advance.index: advance for advance in advances}
@@ -897,6 +1008,11 @@ class PopulationTrainer:
             ),
             "environment_decisions": self._environment_decisions,
             "last_tick_member_count": self._last_tick_member_count,
+            "last_batch_ticks": self._last_batch_ticks,
+            "last_batch_decisions": self._last_batch_decisions,
+            "last_batch_ms": self._last_batch_ms,
+            "decision_throughput": self._decision_throughput,
+            "tick_throughput": self._tick_throughput,
             "active_member_indices": list(active_indices),
             "evaluated_members": len(evaluated),
             "current_member_index": self.current_member_index,
@@ -998,19 +1114,14 @@ class PopulationTrainer:
         saved_dqn = DQNConfig.from_dict(state["dqn_config"])
         if saved_evolution != self.config:
             raise ValueError("population checkpoint EvolutionConfig is incompatible")
-        current_signature = (
-            self.dqn_config.observation_size,
-            self.dqn_config.action_size,
-            self.dqn_config.hidden_sizes,
-            self.dqn_config.algorithm,
-        )
-        saved_signature = (
-            saved_dqn.observation_size,
-            saved_dqn.action_size,
-            saved_dqn.hidden_sizes,
-            saved_dqn.algorithm,
-        )
-        if saved_signature != current_signature:
+        # The agent owns the one supported architecture bridge (the legacy
+        # five-ray input expands into the denser current fan). Keep the outer
+        # population envelope strict for every other mismatch while allowing
+        # each member payload to pass through that same validated migration.
+        if not DrivingDQNAgent.checkpoint_config_compatible(
+            self.dqn_config,
+            saved_dqn,
+        ):
             raise ValueError("population checkpoint DQN architecture is incompatible")
 
         population_payload = list(state["population"])
@@ -1055,6 +1166,11 @@ class PopulationTrainer:
             )
         )
         self._last_tick_member_count = 0
+        self._last_batch_ticks = 0
+        self._last_batch_decisions = 0
+        self._last_batch_ms = 0.0
+        self._decision_throughput = 0.0
+        self._tick_throughput = 0.0
         self._rng.bit_generator.state = deepcopy(state["rng_state"])
         self.history = deque(
             (GenerationRecord.from_dict(item) for item in state.get("history", ())),
@@ -1234,19 +1350,21 @@ class PopulationTrainer:
         self._last_reward = runtime.last_reward
         self._last_info = runtime.last_info
 
-    def _advance_active_members(
-        self, active_indices: tuple[int, ...]
-    ) -> tuple[_MemberAdvance, ...]:
-        """Run isolated member ticks concurrently and collect in stable order."""
+    def _advance_active_member_batches(
+        self,
+        active_indices: tuple[int, ...],
+        max_ticks: int,
+    ) -> tuple[tuple[_MemberAdvance, ...], ...]:
+        """Run isolated member chunks concurrently and collect in stable order."""
 
         if self.parallel_workers == 1 or len(active_indices) == 1:
-            advances: list[_MemberAdvance] = []
+            batches: list[tuple[_MemberAdvance, ...]] = []
             try:
                 for index in active_indices:
-                    advances.append(self._advance_member(index))
+                    batches.append(self._advance_member_many(index, max_ticks))
             except BaseException as error:
                 self._fail_after_worker_error(error)
-            return tuple(advances)
+            return tuple(batches)
         if self._executor is None:
             self._executor = ThreadPoolExecutor(
                 max_workers=self.parallel_workers,
@@ -1254,22 +1372,26 @@ class PopulationTrainer:
             )
         try:
             futures = {
-                index: self._executor.submit(self._advance_member, index)
+                index: self._executor.submit(
+                    self._advance_member_many,
+                    index,
+                    max_ticks,
+                )
                 for index in active_indices
             }
         except BaseException as error:
             self._fail_after_worker_error(error)
-        advances: list[_MemberAdvance] = []
+        batches = []
         first_error: BaseException | None = None
         for index in active_indices:
             try:
-                advances.append(futures[index].result())
+                batches.append(futures[index].result())
             except BaseException as error:  # wait for every in-flight context
                 if first_error is None:
                     first_error = error
         if first_error is not None:
             self._fail_after_worker_error(first_error)
-        return tuple(advances)
+        return tuple(batches)
 
     def _fail_after_worker_error(self, error: BaseException) -> NoReturn:
         """Permanently stop after a partially executed population tick.
@@ -1303,39 +1425,55 @@ class PopulationTrainer:
         if self._closed:
             raise RuntimeError("population trainer is closed")
 
-    def _advance_member(self, index: int) -> _MemberAdvance:
-        """Advance one member; this method touches no other member context."""
+    def _advance_member_many(
+        self,
+        index: int,
+        max_ticks: int,
+    ) -> tuple[_MemberAdvance, ...]:
+        """Advance one member chunk without touching another member context."""
 
         member = self.population[index]
         runtime = self._member_runtimes[index]
         state = runtime.observation.copy()
+        completed_steps = runtime.steps
         explore = self.config.algorithm == "genetic_dqn"
-        action = member.agent.select_action(state, explore=explore)
-        env_result = runtime.env.step(action)
-        next_state = np.asarray(env_result.observation, dtype=np.float32)
-        budget_reached = runtime.steps + 1 >= self.config.evaluation_steps
-        done = bool(env_result.terminated or env_result.truncated or budget_reached)
-        loss: float | None = None
-        if self.config.algorithm == "genetic_dqn":
-            observed_loss = member.agent.observe(
-                state,
-                action,
-                env_result.reward,
-                next_state,
-                done,
+        advances: list[_MemberAdvance] = []
+        for _ in range(max_ticks):
+            action = member.agent.select_action(state, explore=explore)
+            env_result = runtime.env.step(action)
+            next_state = np.asarray(env_result.observation, dtype=np.float32)
+            completed_steps += 1
+            budget_reached = completed_steps >= self.config.evaluation_steps
+            done = bool(
+                env_result.terminated or env_result.truncated or budget_reached
             )
-            if observed_loss is not None and math.isfinite(float(observed_loss)):
-                loss = float(observed_loss)
-        return _MemberAdvance(
-            index=index,
-            state=state,
-            action=action,
-            env_result=env_result,
-            next_state=next_state,
-            budget_reached=budget_reached,
-            done=done,
-            loss=loss,
-        )
+            loss: float | None = None
+            if self.config.algorithm == "genetic_dqn":
+                observed_loss = member.agent.observe(
+                    state,
+                    action,
+                    env_result.reward,
+                    next_state,
+                    done,
+                )
+                if observed_loss is not None and math.isfinite(float(observed_loss)):
+                    loss = float(observed_loss)
+            advances.append(
+                _MemberAdvance(
+                    index=index,
+                    state=state,
+                    action=action,
+                    env_result=env_result,
+                    next_state=next_state,
+                    budget_reached=budget_reached,
+                    done=done,
+                    loss=loss,
+                )
+            )
+            state = next_state
+            if done:
+                break
+        return tuple(advances)
 
     def _finish_member(
         self,

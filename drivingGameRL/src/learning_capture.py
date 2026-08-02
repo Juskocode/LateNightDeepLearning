@@ -70,7 +70,7 @@ def capture_learning_gif(
     duration_ms: int = 120,
     palette_colors: int = 96,
     show_sensor_rays: bool = True,
-    show_population_cars: bool = False,
+    show_population_cars: bool | None = None,
     population_car_limit: int = 8,
 ) -> Path:
     """Capture training observatory tabs followed by a champion race.
@@ -87,6 +87,10 @@ def capture_learning_gif(
 
     if not isinstance(session, DrivingLearningSession):
         raise TypeError("session must be a DrivingLearningSession")
+    if show_population_cars is None:
+        show_population_cars = session.is_population
+    elif not isinstance(show_population_cars, bool):
+        raise TypeError("show_population_cars must be a bool or None")
     frames_per_tab = _bounded_integer(
         "frames_per_tab",
         frames_per_tab,
@@ -139,14 +143,19 @@ def capture_learning_gif(
     for tab in TRAINING_TABS:
         visualization.set_tab(tab)
         for _ in range(frames_per_tab):
-            for _ in range(training_steps_per_frame):
-                session.step()
+            session.step_many(training_steps_per_frame)
             if show_population_cars:
                 rollouts.refresh()
                 rollouts.step(training_steps_per_frame)
             telemetry = session.telemetry()
             telemetry.update(
                 {
+                    "training_ticks_per_second": telemetry.get(
+                        "tick_throughput", 0.0
+                    ),
+                    "environment_decisions_per_second": telemetry.get(
+                        "decision_throughput", 0.0
+                    ),
                     "show_sensor_rays": bool(show_sensor_rays),
                     "show_population_cars": bool(show_population_cars),
                     "population_car_limit": population_car_limit,

@@ -15,10 +15,10 @@ class DQNConfig:
     """Hyperparameters for a deterministic CPU DQN experiment.
 
     The defaults match :class:`drivingGameRL.src.environment.DrivingEnv`:
-    twelve normalized observations and five discrete driving actions.
+    sixteen normalized observations and five discrete driving actions.
     """
 
-    observation_size: int = 12
+    observation_size: int = 16
     action_size: int = 5
     hidden_sizes: tuple[int, ...] = (128, 128)
     algorithm: Algorithm = "double_dqn"

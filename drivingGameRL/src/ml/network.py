@@ -17,7 +17,7 @@ class DrivingQNetwork(nn.Module):
 
     def __init__(
         self,
-        observation_size: int | DQNConfig = 12,
+        observation_size: int | DQNConfig = 16,
         action_size: int = 5,
         hidden_sizes: Sequence[int] = (128, 128),
     ):

@@ -327,7 +327,7 @@ python -m drivingGameRL.main --list-circuits
 | `1` / `2` / `3` / `4` | Cycle motor, wheels, suspension, or grip level |
 | `C` | Cycle circuit |
 | `G` | Toggle the best-lap ghost and racing line |
-| `V` | Toggle five live sensor rays |
+| `V` | Toggle nine live sensor rays |
 | `R` | Reset the car and current run; retain in-session circuit records |
 | `F12` | Save `driving-screenshot.png` |
 
@@ -344,18 +344,25 @@ Each component has levels 0–5 and changes actual physics:
 | Suspension | Yaw response and lateral recovery |
 | Grip | Tire grip, cornering authority, and lateral recovery |
 
-The reusable `DrivingEnv` returns 12 normalized observations: speed, longitudinal/lateral velocity, heading error, track offset, terrain grip, lap progress, and five barrier rays. Its five discrete actions are coast, accelerate, brake, steer left, and steer right; continuous `DriverControls` power manual play. The renderer uses an alpha-cropped car-body asset with procedural wheel/suspension layers and a code-only fallback. Seeded, bounded particles visualize gravel/mud spray, tire slip, braking, and barrier impacts without affecting physics.
+The reusable `DrivingEnv` returns 16 normalized observations: speed,
+longitudinal/lateral velocity, heading error, track offset, terrain grip, lap
+progress, and nine barrier rays spanning -90° to +90° in 22.5° increments.
+Its five discrete actions are coast, accelerate, brake, steer left, and steer
+right; continuous `DriverControls` power manual play. The renderer uses an
+alpha-cropped car-body asset with procedural wheel/suspension layers and a
+code-only fallback. Seeded, bounded particles visualize gravel/mud spray, tire
+slip, braking, and barrier impacts without affecting physics.
 
 ### Driving DQN and population lab
 
 The learning mode uses the same fixed-step `DrivingEnv` as manual play. All four
-algorithms receive the 12-value observation above and choose among the same five
+algorithms receive the 16-value observation above and choose among the same five
 actions. Deep modes use an inspectable network:
 
 ![Driving genetic Double-DQN observatory cycling through live population, network, memory, and champion-race views](assets/gifs/driving-genetic-dqn.gif)
 
 ```text
-12 observations → 128 ReLU → 128 ReLU → 5 Q-values
+16 observations → 128 ReLU → 128 ReLU → 5 Q-values
 ```
 
 | Algorithm | What changes during an evaluation | How the next policy is produced |
@@ -372,23 +379,24 @@ member and are not inherited by children, so ancestry transfers network weights
 rather than stale transitions. Pure `genetic` mode is a useful control because
 it has the same population operators without replay, targets, or TD learning.
 
-Population evaluation is synchronous and concurrent. One trainer tick submits
-one fixed simulation step for every unfinished member to a bounded thread pool;
-each member owns a private environment, car, policy, replay buffer, and optimizer.
-The coordinator waits at a tick barrier and merges results in stable member
-order before ranking or evolution, so thread completion timing cannot change
-selection. `--workers` selects the pool size, `--workers 1` is the exact
-sequential fallback, and the automatic default is capped by both population size
-and available CPUs. Worker count is runtime-only and does not affect checkpoint
-compatibility. A worker exception makes the trainer fail-stop, preventing a
-partially executed tick from being resumed or saved as a valid checkpoint.
+Population evaluation is synchronous and concurrent. Each unfinished member
+owns a private environment, car, policy, replay buffer, and optimizer. The
+trainer submits one short chunk per member to a bounded thread pool, then merges
+its logical ticks and members in stable order before ranking or evolution. This
+amortizes scheduling overhead while preserving the same deterministic tick
+barriers and results as single-step execution. `--workers` selects the pool
+size, `--workers 1` is the exact sequential fallback, and the automatic default
+is capped by both population size and available CPUs. Worker count is
+runtime-only and does not affect checkpoint compatibility. A worker exception
+makes the trainer fail-stop, preventing a partially executed chunk from being
+resumed or saved as a valid checkpoint.
 
 Every learning algorithm starts with the same anti-memorization curriculum:
 
 1. Before qualification, every evaluation spawns at a seeded random point on
    the track centerline, facing the local forward tangent.
 2. The 25%, 50%, and 75% safety gates rotate with that episode's origin. A full
-   ordered loop back to the origin earns the existing `+20` lap reward and ends
+   ordered loop back to the origin earns the `+75` lap reward and ends
    the evaluation; crossing the permanent grid line is not a shortcut.
 3. After the learner proves one random-origin loop, resets use the normal start
    line 80% of the time and another random origin 20% of the time.
@@ -443,7 +451,7 @@ The 1,400×760 learning dashboard is fed only by live telemetry:
 | `N` | Advance one training step while paused |
 | `[` or `,` | Reduce simulated training steps per rendered frame |
 | `]` or `.` | Increase simulated training steps per rendered frame |
-| `V` | Show or hide the five exact sensor rays supplied to the policy |
+| `V` | Show or hide the nine exact sensor rays supplied to the policy |
 | `M` | Show or hide the real scored cars running in the current generation |
 | `C` | Cycle the live comparison limit through 2, 4, 8, and 12 cars |
 | `P` | Pause training and start/leave a one-lap race against the current generation champion |
@@ -452,14 +460,18 @@ The 1,400×760 learning dashboard is fed only by live telemetry:
 | `Esc` | Quit |
 
 With rays enabled, every line endpoint comes from the same immutable
-`SensorRay` snapshot used to build the final five observation values. In a
-population run, `M` renders the selected real scored members from the most recent
-completed lockstep tick: their poses, actions, observations, returns, and rays
-are telemetry snapshots, not independently simulated previews. `C` changes only
-the number drawn. Standalone DQN modes retain isolated comparison clones because
-there is no population to display. Pass `--population-cars` to start with the
-population visible, `--preview-cars N` to choose an initial limit of 2, 4, 8, or
-12, or `--no-sensors` to start with rays hidden.
+`SensorRay` snapshot used to build the final nine observation values. In a
+population run, the Overview starts with up to eight real scored members
+visible. Their poses, bounded trails, actions, observations, returns, and rays
+come from the most recent completed training barrier—not independently
+simulated previews. Overlapping bodies receive identity halos and separated
+callouts; click a car or its legend entry to follow it. `M` toggles the group and
+`C` changes only the number drawn. Standalone DQN modes retain isolated
+comparison clones because there is no population to display. Use
+`--no-population-cars` to start a genetic run with cars hidden,
+`--preview-cars N` to choose an initial limit of 2, 4, 8, or 12, or
+`--no-sensors` to start with rays hidden. Pause, speed, cars, and rays are also
+clickable in the header.
 
 The yellow **RANDOM ORIGIN** gate on the track is the finish target for the
 current qualifying episode. The footer reports origin-relative
@@ -468,15 +480,31 @@ The network's `lap_progress` observation remains the absolute circuit coordinate
 so telemetry never overloads one field with two meanings.
 
 Visible training is time-sliced so a costly DQN update or `MAX` setting cannot
-starve input and rendering. For populations, one displayed training step is one
-synchronous tick across every unfinished member, so it may represent up to
-`population_size` environment decisions. The overview reports cars per tick and
-worker threads; the header still shows actual trainer ticks completed in the
-last frame and smoothed FPS when the CPU budget caps it. No transition is dropped
-or reordered, and headless training still runs the exact requested batches at
-full throughput.
-Immutable circuit-segment geometry and same-pose ray snapshots are reused
-across cars and panels instead of being recomputed every frame.
+starve input and rendering. Speed presets increase both the requested ticks and
+a bounded work budget, while short population chunks yield regularly to events
+and drawing. One population tick may represent up to `population_size`
+environment decisions, so the dashboard reports trainer ticks/s, environment
+decisions/s, worker count, and render FPS separately. Auto-configured hybrid
+members start replay learning after 96 decisions and update every fourth
+transition, producing earlier feedback with less optimizer contention than the
+old 512-step/every-tick schedule. No scored transition is dropped or reordered,
+and headless training still runs exact requested batches at full throughput.
+Vectorized immutable circuit geometry evaluates the denser ray fan in one batch,
+and same-pose ray snapshots are reused across panels instead of being recomputed.
+
+Fitness now rewards signed centerline progress symmetrically, gates the small
+pace bonus by alignment, centering, and forward clearance, and applies explicit
+penalties for track offset, slip, reversing, low clearance, barrier contact,
+collision impact, and prolonged stagnation. There is no positive idle/survival
+term: an agent that fails to make meaningful progress is increasingly penalized
+after 90 ticks and truncated at 240. A valid gated loop earns +75. These terms,
+forward clearance, heading alignment, stagnation count, and truncation reason
+are exposed directly in telemetry for inspection.
+
+Older 12-input driving checkpoints remain loadable. Their five legacy ray
+columns map onto the matching angles in the nine-ray fan; new input columns and
+optimizer moments begin at zero, preserving the legacy policy's predictions at
+migration time.
 
 The race always advances at a fixed 60 simulation steps per second, regardless
 of the accelerated training setting. Drive with arrows or `WASD` and brake with
@@ -554,7 +582,13 @@ late-night-tests -v
 
 `python -m unittest discover -v` also works from the repository root. Standard discovery searches the current directory, so running it from `~` correctly finds zero project tests.
 
-Coverage includes Pacman contour/combat/level/RL behavior; Snake algorithms, dueling heads, tabular updates, held-out evaluation, seed streams, curricula, checkpoint compatibility, and environment edge cases; and driving circuit geometry, terrain physics, gated lap records, ghost interpolation, DQN targets, bounded replay, evolutionary operators, isolated champion races, component effects, collisions, particles, screenshots, and renderer smoke tests.
+Coverage includes Pacman contour/combat/level/RL behavior; Snake algorithms,
+dueling heads, tabular updates, held-out evaluation, seed streams, curricula,
+checkpoint compatibility, and environment edge cases; and driving vectorized
+ray geometry, anti-stall fitness, legacy observation migration, chunked parallel
+determinism, circuit/terrain physics, gated lap records, DQN targets, replay,
+evolution, isolated champion races, clickable observability, screenshots, and
+renderer smoke tests.
 
 Regenerate documentation media from the real renderers:
 
@@ -578,13 +612,13 @@ python -m drivingGameRL.main \
 python -m drivingGameRL.main \
   --learn --algorithm genetic_dqn --population 4 --elite-count 1 \
   --evaluation-steps 600 --workers 4 --seed 19 --steps 1150 \
-  --population-cars --preview-cars 8 \
+  --preview-cars 8 \
   --screenshot assets/screenshots/driving-learning.png
 
 python -m drivingGameRL.main \
   --learn --algorithm genetic_dqn --population 4 --elite-count 1 \
   --evaluation-steps 600 --workers 4 --seed 19 \
-  --population-cars --preview-cars 8 \
+  --preview-cars 8 \
   --gif assets/gifs/driving-genetic-dqn.gif --no-save
 ```
 

@@ -55,7 +55,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--car-sprite", type=Path, help="Optional transparent top-down car image"
     )
     parser.add_argument(
-        "--no-sensors", action="store_true", help="Hide the five live track rays"
+        "--no-sensors", action="store_true", help="Hide the nine live track rays"
     )
     parser.add_argument(
         "--no-ghost", action="store_true", help="Hide the in-session best-lap ghost"
@@ -148,11 +148,23 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="Capture real Overview, Network, Memory, and champion-race frames",
     )
-    learning.add_argument(
+    population_view = learning.add_mutually_exclusive_group()
+    population_view.add_argument(
         "--population-cars",
         "--show-population-cars",
+        dest="population_cars",
         action="store_true",
-        help="Start with real scored generation cars visible",
+        default=None,
+        help=(
+            "Start with real scored generation cars visible (the default in "
+            "genetic modes)"
+        ),
+    )
+    population_view.add_argument(
+        "--no-population-cars",
+        dest="population_cars",
+        action="store_false",
+        help="Start with generation cars hidden; M still toggles them",
     )
     learning.add_argument(
         "--preview-cars",
@@ -206,13 +218,18 @@ def _run_learning(args: argparse.Namespace, parser: argparse.ArgumentParser) -> 
         print(f"Loaded driving learner from {args.checkpoint.expanduser().resolve()}")
 
     capture_mode = args.headless or args.screenshot is not None or args.gif is not None
+    show_population_cars = (
+        args.algorithm in ("genetic", "genetic_dqn")
+        if args.population_cars is None
+        else args.population_cars
+    )
     game = DrivingLearningGame(
         session,
         render=not capture_mode,
         learning_speed=args.learning_speed,
         checkpoint_path=args.checkpoint,
         show_sensor_rays=not args.no_sensors,
-        show_population_cars=args.population_cars,
+        show_population_cars=show_population_cars,
         population_car_limit=args.preview_cars,
     )
     try:
@@ -241,7 +258,7 @@ def _run_learning(args: argparse.Namespace, parser: argparse.ArgumentParser) -> 
                 training_steps_per_frame=60,
                 race_frames=12,
                 show_sensor_rays=not args.no_sensors,
-                show_population_cars=args.population_cars,
+                show_population_cars=show_population_cars,
                 population_car_limit=args.preview_cars,
             )
             print(f"Learning GIF saved to {output.resolve()}")

@@ -24,6 +24,13 @@ class DrivingDQNAgent:
     """CPU DQN learner with replay, target network, and observable internals."""
 
     CHECKPOINT_VERSION = 1
+    LEGACY_OBSERVATION_SIZE = 12
+    CURRENT_OBSERVATION_SIZE = 16
+    OBSERVATION_BASE_FEATURES = 7
+    # The denser nine-ray fan retains every legacy angle. The four odd slots
+    # are new intermediate readings and receive neutral weights during
+    # migration so the old policy's predictions remain exactly reproducible.
+    LEGACY_RAY_INDICES = (0, 2, 4, 6, 8)
 
     def __init__(self, config: DQNConfig | None = None):
         self.config = config or DQNConfig()
@@ -310,25 +317,27 @@ class DrivingDQNAgent:
         if int(state.get("checkpoint_version", -1)) != self.CHECKPOINT_VERSION:
             raise ValueError("unsupported Driving DQN checkpoint version")
         saved_config = DQNConfig.from_dict(state["config"])
-        current_signature = (
-            self.config.observation_size,
-            self.config.action_size,
-            self.config.hidden_sizes,
-            self.config.algorithm,
-        )
-        saved_signature = (
-            saved_config.observation_size,
-            saved_config.action_size,
-            saved_config.hidden_sizes,
-            saved_config.algorithm,
-        )
-        if current_signature != saved_signature:
+        if not self.checkpoint_config_compatible(self.config, saved_config):
             raise ValueError("checkpoint architecture or algorithm is incompatible")
-        self.online_network.load_state_dict(state["online_network"])
-        self.target_network.load_state_dict(state["target_network"])
+        migrate_legacy_input = (
+            saved_config.observation_size == self.LEGACY_OBSERVATION_SIZE
+            and self.config.observation_size == self.CURRENT_OBSERVATION_SIZE
+        )
+        online_state = state["online_network"]
+        target_state = state["target_network"]
+        if migrate_legacy_input:
+            online_state = self._migrate_legacy_network_state(online_state)
+            target_state = self._migrate_legacy_network_state(target_state)
+        self.online_network.load_state_dict(online_state)
+        self.target_network.load_state_dict(target_state)
         self.target_network.eval()
         if load_optimizer:
-            self.optimizer.load_state_dict(state["optimizer"])
+            optimizer_state = state["optimizer"]
+            if migrate_legacy_input:
+                optimizer_state = self._migrate_legacy_optimizer_state(
+                    optimizer_state
+                )
+            self.optimizer.load_state_dict(optimizer_state)
         self.environment_steps = int(state.get("environment_steps", 0))
         self.gradient_steps = int(state.get("gradient_steps", 0))
         self.target_syncs = int(state.get("target_syncs", 0))
@@ -381,9 +390,77 @@ class DrivingDQNAgent:
         cls, path: str | Path, *, load_optimizer: bool = True
     ) -> "DrivingDQNAgent":
         state = cls.read_checkpoint(path)
-        agent = cls(DQNConfig.from_dict(state["config"]))
+        config = DQNConfig.from_dict(state["config"])
+        if config.observation_size == cls.LEGACY_OBSERVATION_SIZE:
+            config = replace(config, observation_size=cls.CURRENT_OBSERVATION_SIZE)
+        agent = cls(config)
         agent.load_state_dict(state, load_optimizer=load_optimizer)
         return agent
+
+    @classmethod
+    def checkpoint_config_compatible(
+        cls, current: DQNConfig, saved: DQNConfig
+    ) -> bool:
+        """Whether ``saved`` can load directly or through the 5→9 ray bridge."""
+
+        observations_match = current.observation_size == saved.observation_size
+        legacy_rays_can_expand = (
+            current.observation_size == cls.CURRENT_OBSERVATION_SIZE
+            and saved.observation_size == cls.LEGACY_OBSERVATION_SIZE
+        )
+        return (
+            (observations_match or legacy_rays_can_expand)
+            and current.action_size == saved.action_size
+            and current.hidden_sizes == saved.hidden_sizes
+            and current.algorithm == saved.algorithm
+        )
+
+    @classmethod
+    def _migrate_legacy_network_state(
+        cls, state: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        migrated = deepcopy(dict(state))
+        key = "layers.0.weight"
+        weight = migrated.get(key)
+        if not isinstance(weight, torch.Tensor) or weight.ndim != 2:
+            raise ValueError("legacy checkpoint is missing its first-layer weights")
+        if weight.shape[1] != cls.LEGACY_OBSERVATION_SIZE:
+            raise ValueError("legacy checkpoint has malformed first-layer weights")
+        migrated[key] = cls._expand_legacy_input_tensor(weight)
+        return migrated
+
+    @classmethod
+    def _migrate_legacy_optimizer_state(
+        cls, state: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        migrated = deepcopy(dict(state))
+        groups = list(migrated.get("param_groups", ()))
+        optimizer_states = migrated.get("state", {})
+        if not groups or not groups[0].get("params") or not optimizer_states:
+            return migrated
+        first_parameter = groups[0]["params"][0]
+        parameter_state = optimizer_states.get(first_parameter)
+        if parameter_state is None:
+            parameter_state = optimizer_states.get(str(first_parameter))
+        if not isinstance(parameter_state, Mapping):
+            return migrated
+        for name, value in list(parameter_state.items()):
+            if (
+                isinstance(value, torch.Tensor)
+                and value.ndim == 2
+                and value.shape[1] == cls.LEGACY_OBSERVATION_SIZE
+            ):
+                parameter_state[name] = cls._expand_legacy_input_tensor(value)
+        return migrated
+
+    @classmethod
+    def _expand_legacy_input_tensor(cls, tensor: torch.Tensor) -> torch.Tensor:
+        expanded = tensor.new_zeros((tensor.shape[0], cls.CURRENT_OBSERVATION_SIZE))
+        base = cls.OBSERVATION_BASE_FEATURES
+        expanded[:, :base] = tensor[:, :base]
+        for legacy_index, current_index in enumerate(cls.LEGACY_RAY_INDICES):
+            expanded[:, base + current_index] = tensor[:, base + legacy_index]
+        return expanded
 
     @staticmethod
     def read_checkpoint(path: str | Path) -> dict[str, Any]:

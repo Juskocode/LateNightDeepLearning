@@ -51,6 +51,73 @@ class LearningRuntimeConfigTests(unittest.TestCase):
 
 
 class DrivingLearningSessionTests(unittest.TestCase):
+    def test_default_population_replay_starts_early_and_updates_periodically(self):
+        automatic = DrivingLearningSession(
+            LearningRuntimeConfig(
+                algorithm="genetic_dqn",
+                population_size=2,
+                elite_count=1,
+                evaluation_steps=900,
+                seed=3,
+            )
+        )
+        explicit_config = tiny_dqn(seed=3)
+        explicit = DrivingLearningSession(
+            LearningRuntimeConfig(
+                algorithm="genetic_dqn",
+                population_size=2,
+                elite_count=1,
+                evaluation_steps=900,
+                seed=3,
+            ),
+            dqn_config=explicit_config,
+        )
+        self.addCleanup(automatic.close)
+        self.addCleanup(explicit.close)
+
+        self.assertEqual(automatic.agent.config.warmup_steps, 96)
+        self.assertEqual(automatic.agent.config.train_interval, 4)
+        self.assertEqual(
+            explicit.agent.config.warmup_steps,
+            explicit_config.warmup_steps,
+        )
+        self.assertEqual(
+            explicit.agent.config.train_interval,
+            explicit_config.train_interval,
+        )
+        self.assertEqual(
+            explicit.agent.config.hidden_sizes,
+            explicit_config.hidden_sizes,
+        )
+        telemetry = automatic.telemetry()
+        self.assertEqual(telemetry["warmup_steps"], 96)
+        self.assertEqual(telemetry["train_interval"], 4)
+
+    def test_population_step_many_stops_exactly_and_counts_all_car_decisions(self):
+        session = DrivingLearningSession(
+            LearningRuntimeConfig(
+                algorithm="genetic",
+                evaluation_steps=3,
+                population_size=4,
+                elite_count=1,
+                tournament_size=2,
+                parallel_workers=4,
+                seed=8,
+            ),
+            dqn_config=tiny_dqn(seed=8),
+        )
+        self.addCleanup(session.close)
+
+        results = session.step_many(20, stop_after_generation=True)
+
+        self.assertEqual(len(results), 3)
+        self.assertTrue(results[-1].evolved)
+        self.assertEqual(session.completed_generations, 1)
+        self.assertEqual(session.environment_decisions, 12)
+        telemetry = session.telemetry()
+        self.assertEqual(telemetry["last_batch_ticks"], 3)
+        self.assertEqual(telemetry["last_batch_decisions"], 12)
+
     def test_dqn_episode_trains_and_advances_generation(self):
         session = DrivingLearningSession(
             LearningRuntimeConfig(
@@ -70,9 +137,9 @@ class DrivingLearningSessionTests(unittest.TestCase):
         self.assertEqual(session.completed_generations, 1)
         self.assertEqual(telemetry["generation"], 2)
         self.assertEqual(telemetry["gradient_steps"], 1)
-        self.assertEqual(len(telemetry["observation"]), 12)
+        self.assertEqual(len(telemetry["observation"]), 16)
         self.assertEqual(len(telemetry["q_values"]), 5)
-        self.assertEqual(telemetry["network"]["architecture"], [12, 8, 5])
+        self.assertEqual(telemetry["network"]["architecture"], [16, 8, 5])
         self.assertEqual(telemetry["replay_size"], 2)
 
     def test_pure_genetic_population_evolves_after_one_lockstep_tick(self):
@@ -150,7 +217,7 @@ class DrivingLearningSessionTests(unittest.TestCase):
         self.assertEqual(len(cars), 4)
         self.assertEqual({item["steps"] for item in cars}, {1})
         self.assertTrue(all(item["source"] == "training" for item in cars))
-        self.assertTrue(all(len(item["sensor_rays"]) == 5 for item in cars))
+        self.assertTrue(all(len(item["sensor_rays"]) == 9 for item in cars))
         self.assertEqual(
             tuple(id(env) for env in session._population_trainer.member_environments),
             tuple(id(env) for env in PopulationRolloutManager(session).environments),
@@ -242,6 +309,31 @@ class DrivingLearningGameTests(unittest.TestCase):
         self.game.handle_events()
         self.assertIsNone(self.game.race)
 
+    def test_population_game_shows_real_generation_cars_by_default(self):
+        session = DrivingLearningSession(
+            LearningRuntimeConfig(
+                algorithm="genetic",
+                evaluation_steps=4,
+                population_size=4,
+                elite_count=1,
+                tournament_size=2,
+                seed=17,
+            ),
+            dqn_config=tiny_dqn(seed=17),
+        )
+        game = DrivingLearningGame(session, render=False)
+        self.addCleanup(game.close)
+
+        self.assertTrue(game.show_population_cars)
+        telemetry = game._training_telemetry()
+        self.assertEqual(len(telemetry["population_rollouts"]), 4)
+        self.assertTrue(
+            all(
+                item["source"] == "training"
+                for item in telemetry["population_rollouts"]
+            )
+        )
+
     def test_speed_keys_cover_slow_through_max(self):
         self.assertEqual(self.game.steps_per_frame, 4)
         for _ in range(10):
@@ -267,6 +359,35 @@ class DrivingLearningGameTests(unittest.TestCase):
         self.assertTrue(telemetry["show_population_cars"])
         self.assertEqual(len(telemetry["population_rollouts"]), 1)
         self.assertEqual(telemetry["population_rollouts"][0]["sensor_rays"], [])
+
+    def test_dashboard_buttons_control_training_without_keyboard_shortcuts(self):
+        self.game.draw()
+
+        pause = self.game.dashboard.control_rects["toggle_pause"].center
+        pygame.event.post(
+            pygame.event.Event(pygame.MOUSEBUTTONDOWN, button=1, pos=pause)
+        )
+        self.game.handle_events()
+        self.assertTrue(self.game.paused)
+
+        faster = self.game.dashboard.control_rects["speed_up"].center
+        pygame.event.post(
+            pygame.event.Event(pygame.MOUSEBUTTONDOWN, button=1, pos=faster)
+        )
+        self.game.handle_events()
+        self.assertEqual(self.game.steps_per_frame, 16)
+
+        cars = self.game.dashboard.control_rects["toggle_population_cars"].center
+        rays = self.game.dashboard.control_rects["toggle_sensor_rays"].center
+        pygame.event.post(
+            pygame.event.Event(pygame.MOUSEBUTTONDOWN, button=1, pos=cars)
+        )
+        pygame.event.post(
+            pygame.event.Event(pygame.MOUSEBUTTONDOWN, button=1, pos=rays)
+        )
+        self.game.handle_events()
+        self.assertTrue(self.game.show_population_cars)
+        self.assertFalse(self.game.show_sensor_rays)
 
     def test_c_cycles_preview_breadth_without_work_while_cars_are_hidden(self):
         self.assertEqual(self.game.population_car_limit, 8)
@@ -308,7 +429,14 @@ class DrivingLearningGameTests(unittest.TestCase):
         try:
             with patch(
                 "drivingGameRL.src.learning_game.perf_counter",
-                side_effect=(100.0, 100.011),
+                side_effect=(
+                    100.0,
+                    100.0,
+                    100.0,
+                    100.011,
+                    100.011,
+                    100.011,
+                ),
             ):
                 advanced = self.game._advance_training_slice(
                     starting_generations=0,
@@ -325,19 +453,23 @@ class DrivingLearningGameTests(unittest.TestCase):
         self.assertEqual(telemetry["effective_training_steps_per_frame"], 1)
         self.assertEqual(telemetry["frame_training_steps"], 1)
         self.assertTrue(telemetry["training_slice_capped"])
+        self.assertAlmostEqual(telemetry["training_slice_ms"], 11.0)
+        self.assertGreater(telemetry["training_ticks_per_second"], 0.0)
+        self.assertGreater(telemetry["environment_decisions_per_second"], 0.0)
 
     def test_headless_training_slice_executes_the_exact_requested_batch(self):
-        with patch("drivingGameRL.src.learning_game.perf_counter") as timer:
-            advanced = self.game._advance_training_slice(
-                starting_generations=0,
-                max_training_steps=None,
-                max_generations=None,
-            )
+        advanced = self.game._advance_training_slice(
+            starting_generations=0,
+            max_training_steps=None,
+            max_generations=None,
+        )
 
         self.assertEqual(advanced, 4)
         self.assertEqual(self.game.training_steps, 4)
         self.assertFalse(self.game._training_slice_capped)
-        timer.assert_not_called()
+        telemetry = self.game._training_telemetry()
+        self.assertGreater(telemetry["training_slice_ms"], 0.0)
+        self.assertGreater(telemetry["training_ticks_per_second"], 0.0)
 
     def test_frame_budget_and_preview_limit_reject_invalid_values(self):
         for invalid in (True, 3, 8.0):
@@ -406,6 +538,19 @@ class DrivingLearningGameTests(unittest.TestCase):
         self.assertTrue(args.population_cars)
         self.assertEqual(args.preview_cars, 12)
         self.assertTrue(args.no_sensors)
+
+    def test_population_car_cli_defaults_can_be_explicitly_overridden(self):
+        parser = build_parser()
+
+        default = parser.parse_args(["--learn", "--algorithm", "genetic_dqn"])
+        hidden = parser.parse_args(
+            ["--learn", "--algorithm", "genetic_dqn", "--no-population-cars"]
+        )
+        standalone = parser.parse_args(["--learn", "--algorithm", "double_dqn"])
+
+        self.assertIsNone(default.population_cars)
+        self.assertFalse(hidden.population_cars)
+        self.assertIsNone(standalone.population_cars)
 
 
 if __name__ == "__main__":

@@ -13,6 +13,7 @@ from drivingGameRL.src.learning_runtime import (
     DrivingLearningSession,
     LearningRuntimeConfig,
 )
+from drivingGameRL.src.environment import DrivingEnv
 from drivingGameRL.src.ml import DQNConfig
 from drivingGameRL.src.population_rollout import PopulationRolloutManager
 
@@ -203,12 +204,13 @@ class PopulationRolloutManagerTests(unittest.TestCase):
 
         car = manager.telemetry(include_rays=True)[0]
         member = session._population_trainer.population[0]
+        sensor_count = len(DrivingEnv.SENSOR_RELATIVE_ANGLES)
 
-        self.assertEqual(len(car["sensor_rays"]), 5)
+        self.assertEqual(len(car["sensor_rays"]), sensor_count)
         self.assertIs(car["rays"], car["sensor_rays"])
         np.testing.assert_allclose(
             [ray["normalized_distance"] for ray in car["sensor_rays"]],
-            car["observation"][-5:],
+            car["observation"][-sensor_count:],
             rtol=0.0,
             atol=1e-7,
         )

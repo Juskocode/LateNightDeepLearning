@@ -490,7 +490,7 @@ Lap validation rotates with the sampled episode origin. The car must pass the
 relative 25%, 50%, and 75% gates in order and then cross that origin in the
 forward direction. Reverse crossings, origin oscillation, and implausible
 projection jumps retain the same rejection rules as normal laps. A valid loop
-earns the `+20` lap reward, sets `curriculum_lap_completed`, and terminates that
+earns the `+75` lap reward, sets `curriculum_lap_completed`, and terminates that
 learning evaluation. Random-origin times are deliberately excluded from the
 normal-grid best-lap record because their trajectories begin at a different
 place and would make the manual ghost misleading.
@@ -515,7 +515,7 @@ curriculum state into isolated environments. The permanent observation value
 at index 6 remains absolute circuit `lap_progress`; this is intentionally
 distinct from origin-relative episode completion.
 
-### Observation: 12 normalized values
+### Observation: 16 normalized values
 
 | Index | Label | Meaning |
 |---:|---|---|
@@ -526,13 +526,24 @@ distinct from origin-relative episode completion.
 | 4 | track offset | Signed centerline offset divided by collision radius |
 | 5 | terrain grip | Grip coefficient of the current terrain |
 | 6 | lap progress | Absolute normalized coordinate around the circuit |
-| 7–11 | five range rays | Normalized clearance at -90°, -45°, 0°, +45°, +90° |
+| 7 | ray left | Normalized clearance at -90° |
+| 8 | ray left wide | Normalized clearance at -67.5° |
+| 9 | ray left forward | Normalized clearance at -45° |
+| 10 | ray left near | Normalized clearance at -22.5° |
+| 11 | ray forward | Normalized clearance at 0° |
+| 12 | ray right near | Normalized clearance at +22.5° |
+| 13 | ray right forward | Normalized clearance at +45° |
+| 14 | ray right wide | Normalized clearance at +67.5° |
+| 15 | ray right | Normalized clearance at +90° |
 
-Each ray samples every six simulation units up to a range of 150 and reports
-`1.0` when no barrier is found. The observation exposes local geometry, motion,
-surface, and progress but not a global circuit map. Generalization should
-therefore include held-out circuits and component builds, not only new particle
-or environment seeds.
+All nine rays are evaluated as one vectorized geometry query. They sample every
+six simulation units up to a range of 150, then use four binary refinements at
+the first contact interval; `1.0` means that no barrier is in range. The fan
+retains every angle from the older five-ray observation and adds the four
+intermediate directions where an approaching corner first becomes visible.
+The observation exposes local geometry, motion, surface, and progress but not a
+global circuit map. Generalization should therefore include held-out circuits
+and component builds, not only new particle or environment seeds.
 
 ### Actions and reward
 
@@ -550,32 +561,56 @@ The discrete action space is:
 for manual or scripted driving. The shaped reward is the sum of independently
 reported terms:
 
+Let `p` be signed normalized progress, `v+` and `v-` be normalized forward
+and reverse speed, `a` be forward heading alignment, `c` be the center-track
+factor, `q` be the minimum normalized clearance of the three forward rays,
+`o` be normalized track offset, and `h` be the close-barrier hazard derived
+from `q`. The implemented terms are:
+
 ```text
-progress  = 0.12 * signed forward distance
-road      = +0.025 on road, otherwise -0.08
-speed     = 0.018 * max(0, longitudinal_speed) / max_speed
-reverse   = -0.05 when longitudinal_speed < -2
-collision = -min(5, 0.06 * impact_speed) on contact start; otherwise 0
-lap       = +20 after one valid gated forward circuit; otherwise 0
+progress        = 300 * p
+pace            = +0.045 * v+ * a * c * q
+road            = 0 on road, otherwise -0.12
+alignment       = -0.05 * v+ * (1 - a)
+track_offset    = -0.04 * v+ * o^2
+slip            = -0.04 * abs(lateral_speed) / max_speed
+clearance       = -0.14 * v+ * h^2
+reverse         = -0.16 * v-
+barrier_contact = -0.10 on every colliding tick
+collision       = -2 - min(6, 0.08 * impact_speed) on contact start
+stagnation      = ramps from 0 to -0.12 after 90 non-progress ticks
+lap             = +75 after one valid gated forward circuit
 ```
+
+There is deliberately no positive survival reward. Meaningful forward movement
+resets stagnation; otherwise the penalty grows after 90 ticks and the episode is
+truncated at 240. This prevents a stationary or oscillating genome from beating
+a cautious progressing driver, while the forward-clearance term makes an
+otherwise identical approach less fit when it is aimed at an imminent barrier.
 
 The `info` dictionary exposes the active terrain, on-road flag, absolute
 `progress`, origin-relative `episode_lap_progress`, spawn mode and origin,
 curriculum readiness, completed laps, `lap_completed`, current/last/best lap
 time, persistent-contact `collided`, one-shot `collision_started`, impact speed,
-every reward term, and vehicle telemetry. Episodes do not terminate from damage
-or collision. Curriculum learning episodes terminate on a valid loop; all modes
-truncate at their configured step limit, which defaults to 10,800 steps (three
-minutes at 60 Hz).
+heading alignment, forward clearance, stagnation count and reason, every reward
+term, and vehicle telemetry. Episodes do not terminate from damage or collision.
+Curriculum learning episodes terminate on a valid loop; all modes truncate at
+their configured step limit or the stagnation limit. The general step limit
+defaults to 10,800 steps (three minutes at 60 Hz).
 
 ### Driving value network and replay
 
-All driving learners operate on the same 12 observations and five discrete
+All driving learners operate on the same 16 observations and five discrete
 actions. The deep action-value function is a fully connected network:
 
 ```text
-12 observations → 128 ReLU → 128 ReLU → 5 Q-values
+16 observations → 128 ReLU → 128 ReLU → 5 Q-values
 ```
+
+Legacy 12-input checkpoints migrate automatically: the five old ray columns are
+copied to their matching angles, the four new input columns (and corresponding
+Adam moments) start at zero, and the policy's original predictions are retained
+at the migration boundary.
 
 The five outputs estimate the discounted return for coast, accelerate, brake,
 steer left, and steer right. In the standalone deep modes, epsilon-greedy action
@@ -615,16 +650,18 @@ budget, and its fitness is exactly its accumulated shaped environment reward:
 fitness_i = sum(t=0..T-1) reward_i,t
 ```
 
-Population evaluation is seeded, synchronous, and concurrent. One trainer tick
-submits one fixed simulation step for every unfinished member to a bounded thread
-pool. Each task mutates only its member's private environment and learner; the
-coordinator waits for the whole tick and merges results in stable member order.
-Consequently, OS completion timing cannot change reward accumulation, ranking,
-or selection. `--workers 1` follows the same path sequentially, while the default
-worker count is capped by the population and available CPUs. After every member
-has completed its budget, the next generation is built as follows. If any member
-task fails, the pool waits for its siblings and the trainer becomes fail-stop;
-it cannot resume or save the partially executed tick.
+Population evaluation is seeded, synchronous, and concurrent. The trainer
+submits one short, bounded chunk per unfinished member instead of recreating one
+future for every car on every tick. Each task mutates only its member's private
+environment and learner; the coordinator replays logical ticks and members in
+stable order. Chunked execution is bit-exact with repeated single ticks across
+generation boundaries, so OS completion timing cannot change reward
+accumulation, ranking, or selection. `--workers 1` follows the same path
+sequentially, while the default worker count is capped by the population and
+available CPUs. After every member has completed its budget, the next generation
+is built as follows. If any member task fails, the pool waits for its siblings
+and the trainer becomes fail-stop; it cannot resume or save the partially
+executed chunk.
 
 1. Rank the population by fitness, with stable member IDs breaking ties.
 2. Copy the configured number of elites without crossover or mutation.
@@ -678,6 +715,12 @@ The hybrid is not automatically superior. It spends more computation per
 environment transition and combines two sources of stochasticity. Pure
 `genetic` is the clean ablation for the evolutionary contribution, while
 standalone `double_dqn` is the clean ablation for population search.
+
+For automatically configured population members, replay updates begin after 96
+decisions and run every fourth transition. This replaces the former 512-step
+warm-up/every-tick update pattern: useful TD feedback begins within a short
+evaluation while optimizer work no longer monopolizes every frame. Explicit
+programmatic `DQNConfig` values remain unchanged.
 
 ### Live dashboard and the `P` champion race
 
@@ -808,7 +851,7 @@ Learning mode adds these controls:
 | `N` | Advance one training step while paused |
 | `[` or `,` | Reduce simulation steps per rendered frame |
 | `]` or `.` | Increase simulation steps per rendered frame |
-| `V` | Show or hide the five exact policy sensor rays |
+| `V` | Show or hide the nine exact policy sensor rays |
 | `M` | Show or hide real scored cars for the current generation |
 | `C` | Cycle the comparison limit through 2, 4, 8, and 12 cars |
 | `P` | Enter or leave the fixed-60-Hz race against the frozen generation champion |
@@ -818,26 +861,30 @@ Learning mode adds these controls:
 | `Space` | Brake during the race |
 | `Esc` | Quit |
 
-The five displayed rays are immutable snapshots from the same sampling method
+The nine displayed rays are immutable snapshots from the same sampling method
 that supplies `ray_left` through `ray_right` to the network. Their endpoints are
-therefore measurements, not reconstructed decoration. For population methods,
-the `M` view consumes read-only snapshots of the actual scored member
-environments after the synchronous barrier. It does not clone, advance, or train
-anything a second time. The default limit is eight; `C` changes only how many
-members are drawn. Standalone DQN keeps isolated, non-scoring comparison clones
-because it has no real population. Use `--population-cars` to begin with this
-view enabled, `--preview-cars N` to select an initial breadth of 2, 4, 8, or 12,
-or `--no-sensors` to begin with ray rendering disabled.
+therefore measurements, not reconstructed decoration. Genetic modes begin with
+up to eight actual scored members visible after the synchronous barrier. The
+view does not clone, advance, or train them a second time. Truthful trails show
+only supplied poses; identity halos and separated callouts keep exact overlaps
+visible. Click a car or legend entry to follow it. `M` changes visibility and
+`C` changes only how many members are drawn. Standalone DQN keeps isolated,
+non-scoring comparison clones because it has no real population. Use
+`--no-population-cars` to begin a genetic run with this view hidden,
+`--preview-cars N` to select an initial breadth of 2, 4, 8, or 12, or
+`--no-sensors` to begin with ray rendering disabled. Header buttons provide the
+same pause, speed, car, and ray controls without requiring keyboard shortcuts.
 
-Interactive training uses a short wall-clock work slice before yielding to
-events and rendering. The selected speed is still the maximum requested trainer
-ticks per frame. In population modes, one tick advances every unfinished member
-once, and telemetry separately reports the resulting environment-decision count.
-The header reports effective frame ticks and smoothed FPS if CPU cost reaches the
-slice. This changes presentation cadence only: scored transition order and
-stopping budgets remain exact. Headless runs are not time-sliced and retain full
-throughput. Circuit projection geometry and same-pose immutable ray snapshots
-are cached across panels without sharing mutable environment state.
+Interactive training uses a short adaptive wall-clock work slice before yielding
+to events and rendering. Faster presets increase the bounded work budget as well
+as requested ticks, and population workers process at most eight ticks before
+returning to the coordinator. In population modes, one tick advances every
+unfinished member once, so telemetry reports trainer ticks/s, total environment
+decisions/s, and render FPS separately. This changes presentation cadence only:
+scored transition order and stopping budgets remain exact. Headless runs are not
+time-sliced and retain full throughput. Vectorized circuit projection evaluates
+the dense sensor fan efficiently, while same-pose immutable ray snapshots are
+cached across panels without sharing mutable environment state.
 
 ## Reproducible comparison protocol
 

@@ -326,6 +326,103 @@ class DrivingParallelEvolutionTests(unittest.TestCase):
         self.assertEqual(parallel.generation, 3)
         _assert_nested_equal(self, sequential.state_dict(), parallel.state_dict())
 
+    def test_chunked_steps_are_bit_exact_to_repeated_single_ticks(self):
+        config = _evolution(evaluation_steps=5, mutation_rate=0.2, mutation_std=0.01)
+        repeated = self._track(
+            PopulationTrainer(config, _dqn(), parallel_workers=4)
+        )
+        chunked = self._track(
+            PopulationTrainer(config, _dqn(), parallel_workers=4)
+        )
+
+        repeated_steps = tuple(repeated.step() for _ in range(8))
+        chunked_steps = chunked.step_many(8)
+
+        self.assertEqual(len(chunked_steps), 8)
+        self.assertEqual(
+            tuple(
+                (
+                    step.generation,
+                    step.member_id,
+                    step.action,
+                    step.reward,
+                    step.generation_completed,
+                    step.evolved,
+                )
+                for step in chunked_steps
+            ),
+            tuple(
+                (
+                    step.generation,
+                    step.member_id,
+                    step.action,
+                    step.reward,
+                    step.generation_completed,
+                    step.evolved,
+                )
+                for step in repeated_steps
+            ),
+        )
+        _assert_nested_equal(self, repeated.state_dict(), chunked.state_dict())
+        telemetry = chunked.telemetry()
+        self.assertEqual(telemetry["last_batch_ticks"], 8)
+        self.assertEqual(telemetry["last_batch_decisions"], 32)
+        self.assertGreater(telemetry["last_batch_ms"], 0.0)
+        self.assertGreater(telemetry["decision_throughput"], 0.0)
+
+    def test_chunk_submits_once_per_member_and_preserves_real_concurrency(self):
+        probe = _ConcurrencyProbe(parties=4)
+        created = 0
+
+        def factory(seed: int) -> DrivingEnv:
+            nonlocal created
+            env = _ProbedEnv(seed, probe, created)
+            created += 1
+            return env
+
+        trainer = self._track(
+            PopulationTrainer(
+                _evolution(algorithm="genetic", evaluation_steps=3),
+                _dqn(),
+                env_factory=factory,
+                parallel_workers=4,
+                auto_evolve=False,
+            )
+        )
+
+        steps = trainer.step_many(3)
+
+        self.assertEqual(len(steps), 3)
+        self.assertEqual(probe.peak, 4)
+        self.assertEqual(len(probe.thread_ids), 4)
+        self.assertEqual([env.steps for env in trainer.member_environments], [3] * 4)
+        self.assertTrue(steps[-1].generation_completed)
+
+    def test_chunk_can_stop_exactly_at_a_generation_boundary(self):
+        trainer = self._track(
+            PopulationTrainer(
+                _evolution(algorithm="genetic", evaluation_steps=3),
+                _dqn(),
+                parallel_workers=4,
+            )
+        )
+
+        steps = trainer.step_many(20, stop_after_generation=True)
+
+        self.assertEqual(len(steps), 3)
+        self.assertTrue(steps[-1].evolved)
+        self.assertEqual(trainer.generation, 1)
+        self.assertEqual(trainer.environment_decisions, 12)
+
+    def test_chunk_size_requires_a_positive_integer(self):
+        trainer = self._track(
+            PopulationTrainer(_evolution(), _dqn(), parallel_workers=1)
+        )
+        for invalid in (True, 0, -1, 2.5):
+            with self.subTest(max_ticks=invalid):
+                with self.assertRaisesRegex(ValueError, "positive integer"):
+                    trainer.step_many(invalid)
+
     def test_generation_evolves_only_after_every_member_finishes(self):
         trainer = self._track(
             PopulationTrainer(

@@ -110,6 +110,7 @@ class DrivingLearningSession:
         self._population_trainer: Any | None = None
         self._loss_history: deque[float] = deque(maxlen=300)
         self._epsilon_history: deque[float] = deque(maxlen=300)
+        self._environment_decisions = 0
 
         if self.config.algorithm in ("genetic", "genetic_dqn"):
             self._init_population(dqn_config)
@@ -143,7 +144,18 @@ class DrivingLearningSession:
 
         base_algorithm = "double_dqn"
         if dqn_config is None:
-            dqn_config = DQNConfig(algorithm=base_algorithm, seed=self.config.seed)
+            # Population members live for a bounded 900-step episode by
+            # default. The generic 512-step warmup spends most of that lifetime
+            # collecting without learning, then trains every frame. Start
+            # replay early and spread updates across four transitions instead:
+            # better early feedback with substantially lower interactive CPU
+            # cost. Explicit caller configurations remain untouched.
+            dqn_config = DQNConfig(
+                algorithm=base_algorithm,
+                warmup_steps=96,
+                train_interval=4,
+                seed=self.config.seed,
+            )
         evolution = EvolutionConfig(
             algorithm=self.config.algorithm,
             population_size=self.config.population_size,
@@ -191,6 +203,14 @@ class DrivingLearningSession:
         if self.is_population:
             return int(self._population_trainer.generation)
         return int(self.generation)
+
+    @property
+    def environment_decisions(self) -> int:
+        """Total scored environment transitions consumed by this session."""
+
+        if self.is_population:
+            return int(self._population_trainer.environment_decisions)
+        return self._environment_decisions
 
     def population_policy_clones(
         self,
@@ -280,6 +300,7 @@ class DrivingLearningSession:
         state = self.observation
         action = self.agent.select_action(state, explore=True)
         result = self.env.step(action)
+        self._environment_decisions += 1
         done = result.terminated or result.truncated
         self.agent.observe(state, action, result.reward, result.observation, done)
         self.episode_return += result.reward
@@ -289,6 +310,58 @@ class DrivingLearningSession:
             self._finish_dqn_episode()
         self._record_learning_trace()
         return result
+
+    def step_many(
+        self,
+        max_steps: int,
+        *,
+        stop_after_generation: bool = False,
+    ) -> tuple[Any, ...]:
+        """Advance a bounded training chunk with one population pool barrier.
+
+        Population modes amortize worker scheduling across the requested ticks.
+        Standalone DQN keeps the same public contract by executing ordinary
+        deterministic steps. The returned tuple contains one result per
+        simulation tick, making generation and step limits exact.
+        """
+
+        if isinstance(max_steps, bool) or not isinstance(max_steps, int):
+            raise ValueError("max_steps must be a positive integer")
+        if max_steps <= 0:
+            raise ValueError("max_steps must be a positive integer")
+        if not self.is_population:
+            starting_generation = self.current_generation
+            results: list[Any] = []
+            for _ in range(max_steps):
+                results.append(self.step())
+                if (
+                    stop_after_generation
+                    and self.current_generation != starting_generation
+                ):
+                    break
+            return tuple(results)
+
+        results = self._population_trainer.step_many(
+            max_steps,
+            stop_after_generation=stop_after_generation,
+        )
+        self.env = self._population_trainer.env
+        self.agent = self._population_trainer.current_agent
+        self.observation = self._population_trainer.observation
+        for result in results:
+            if result.evolved:
+                self._last_event = "generation_evolved"
+            elif result.generation_completed:
+                self._last_event = "generation_complete"
+            elif result.member_completed or result.member_results:
+                self._last_event = "member_complete"
+            else:
+                self._last_event = "population_step"
+        # The trainer may have crossed an evolution boundary during this
+        # chunk. Record one honest snapshot from the final live agent instead
+        # of attributing that agent's epsilon/loss to every earlier tick.
+        self._record_learning_trace()
+        return tuple(results)
 
     def _record_learning_trace(self, population_step: Any | None = None) -> None:
         if self.agent is None:
@@ -518,6 +591,9 @@ class DrivingLearningSession:
                 "target_syncs": agent_learning["target_syncs"],
                 "action_counts": agent_learning["action_counts"],
                 "batch_size": self.agent.config.batch_size,
+                "warmup_steps": self.agent.config.warmup_steps,
+                "train_interval": self.agent.config.train_interval,
+                "environment_decisions": self.environment_decisions,
                 "replay_size": replay.get("size", 0),
                 "replay_capacity": replay.get("capacity", 0),
                 "replay": replay,
@@ -573,6 +649,7 @@ class DrivingLearningSession:
         else:
             state = self.agent.read_checkpoint(checkpoint)
             self.agent.load_state_dict(state)
+            self._environment_decisions = int(self.agent.environment_steps)
             self.env.load_curriculum_state(state.get("environment_curriculum", {}))
             rng_state = state.get("environment_rng_state")
             if rng_state is None:

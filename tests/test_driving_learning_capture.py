@@ -157,7 +157,6 @@ class DrivingLearningCaptureTests(unittest.TestCase):
                 race_frames=1,
                 palette_colors=64,
                 show_sensor_rays=True,
-                show_population_cars=True,
             )
             with Image.open(hidden_path) as hidden, Image.open(visible_path) as visible:
                 hidden.seek(0)

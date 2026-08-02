@@ -24,7 +24,7 @@ class ReplayBuffer:
     """FIFO replay memory whose sampling does not touch global RNG state."""
 
     def __init__(
-        self, capacity: int, observation_size: int = 12, *, seed: int | None = None
+        self, capacity: int, observation_size: int = 16, *, seed: int | None = None
     ):
         if isinstance(capacity, bool) or not isinstance(capacity, int) or capacity <= 0:
             raise ValueError("capacity must be a positive integer")

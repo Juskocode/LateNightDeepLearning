@@ -239,13 +239,13 @@ class PopulationRolloutManager:
 
     @staticmethod
     def _sensor_rays(rollout: _PolicyRollout) -> list[dict[str, Any]]:
-        """Serialize the five distances used by this policy's observation."""
+        """Serialize the nine distances used by this policy's observation."""
 
         return _sensor_rays(rollout.env)
 
 
 def _sensor_rays(env: DrivingEnv) -> list[dict[str, Any]]:
-    """Serialize the exact five ray readings for one environment pose."""
+    """Serialize the exact nine ray readings for one environment pose."""
 
     sensor_rays = env.sensor_rays()
     labels = DrivingEnv.OBSERVATION_LABELS[-len(sensor_rays) :]
