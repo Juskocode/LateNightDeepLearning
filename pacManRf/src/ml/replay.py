@@ -5,10 +5,21 @@ from __future__ import annotations
 import random
 import threading
 from collections import Counter, deque
+from collections.abc import Sequence as SequenceABC
 from typing import Any, NamedTuple, Sequence
 
 import numpy as np
 import torch
+
+from .validation import (
+    action_index,
+    binary_flag,
+    boolean_mask,
+    finite_float,
+    finite_vector,
+    require_mapping,
+    strict_int,
+)
 
 
 class Experience(NamedTuple):
@@ -54,37 +65,61 @@ class ReplayBuffer:
         self._lock = threading.RLock()
 
     def _validated(self, experience: Experience) -> Experience:
-        state = np.asarray(experience.state, dtype=np.float32).reshape(-1).copy()
-        next_state = np.asarray(experience.next_state, dtype=np.float32).reshape(-1).copy()
+        if not isinstance(experience, Experience):
+            try:
+                experience = Experience(*experience)
+            except (TypeError, ValueError) as error:
+                raise ValueError("experience must contain six transition fields") from error
+        if self.observation_size is None:
+            try:
+                state = np.asarray(experience.state, dtype=np.float32).reshape(-1).copy()
+                next_state = np.asarray(experience.next_state, dtype=np.float32).reshape(-1).copy()
+            except (TypeError, ValueError, OverflowError) as error:
+                raise ValueError("states must be numeric vectors") from error
+            if not np.isfinite(state).all() or not np.isfinite(next_state).all():
+                raise ValueError("states must contain finite values")
+        else:
+            state = finite_vector(experience.state, self.observation_size, name="state").copy()
+            next_state = finite_vector(
+                experience.next_state,
+                self.observation_size,
+                name="next_state",
+            ).copy()
         if state.shape != next_state.shape:
             raise ValueError("state and next_state must have matching shapes")
-        if self.observation_size is not None and state.shape != (self.observation_size,):
-            raise ValueError(f"state must have shape ({self.observation_size},)")
-        if not np.isfinite(state).all() or not np.isfinite(next_state).all():
-            raise ValueError("states must contain finite values")
-        action = int(experience.action)
-        if self.action_size is not None and not 0 <= action < self.action_size:
-            raise ValueError(f"action must be between 0 and {self.action_size - 1}")
-        reward = float(experience.reward)
-        if not np.isfinite(reward):
-            raise ValueError("reward must be finite")
+        if self.action_size is None:
+            action = strict_int(experience.action, "action", minimum=0)
+        else:
+            action = action_index(experience.action, self.action_size)
+        reward = finite_float(experience.reward, "reward")
+        done = binary_flag(experience.done, "done")
         raw_mask = experience.next_legal_action_mask
         if raw_mask is None:
             if self.action_size is None:
                 raise ValueError("action_size is required when no next-action mask is supplied")
             next_legal_action_mask = np.ones(self.action_size, dtype=np.bool_)
         else:
-            next_legal_action_mask = np.asarray(raw_mask, dtype=np.bool_).reshape(-1).copy()
-            if self.action_size is not None and next_legal_action_mask.shape != (self.action_size,):
-                raise ValueError(f"next_legal_action_mask must have shape ({self.action_size},)")
-            if not next_legal_action_mask.any():
-                raise ValueError("next_legal_action_mask must allow at least one action")
+            if self.action_size is None:
+                raw_array = np.asarray(raw_mask)
+                if raw_array.ndim != 1:
+                    raise ValueError("next_legal_action_mask must be one-dimensional")
+                next_legal_action_mask = boolean_mask(
+                    raw_array,
+                    int(raw_array.size),
+                    name="next_legal_action_mask",
+                )
+            else:
+                next_legal_action_mask = boolean_mask(
+                    raw_mask,
+                    self.action_size,
+                    name="next_legal_action_mask",
+                )
         return Experience(
             state,
             action,
             reward,
             next_state,
-            bool(experience.done),
+            done,
             next_legal_action_mask,
         )
 
@@ -104,12 +139,12 @@ class ReplayBuffer:
     ) -> None:
         self.append(
             Experience(
-                np.asarray(state),
-                int(action),
-                float(reward),
-                np.asarray(next_state),
-                bool(done),
-                None if next_legal_action_mask is None else np.asarray(next_legal_action_mask),
+                state,
+                action,
+                reward,
+                next_state,
+                done,
+                next_legal_action_mask,
             )
         )
 
@@ -186,15 +221,35 @@ class ReplayBuffer:
         }
 
     def load_state_dict(self, state: dict[str, Any]) -> None:
+        state = require_mapping(state, "replay checkpoint")
+        if "capacity" in state:
+            strict_int(state["capacity"], "replay capacity", minimum=1)
         saved_observation = state.get("observation_size")
         saved_actions = state.get("action_size")
+        if saved_observation is not None:
+            saved_observation = strict_int(
+                saved_observation,
+                "replay observation_size",
+                minimum=1,
+            )
+        if saved_actions is not None:
+            saved_actions = strict_int(saved_actions, "replay action_size", minimum=1)
         if self.observation_size is not None and saved_observation not in (None, self.observation_size):
             raise ValueError("replay observation size does not match this agent")
         if self.action_size is not None and saved_actions not in (None, self.action_size):
             raise ValueError("replay action size does not match this agent")
 
+        raw_items = state.get("items", ())
+        if isinstance(raw_items, (str, bytes, bytearray)) or not isinstance(raw_items, SequenceABC):
+            raise ValueError("replay items must be a sequence")
         restored: list[Experience] = []
-        for item in state.get("items", ()):
+        for index, raw_item in enumerate(raw_items):
+            item = require_mapping(raw_item, f"replay item {index}")
+            missing = {"state", "action", "reward", "next_state", "done"} - set(item)
+            if missing:
+                raise ValueError(
+                    f"replay item {index} is missing: {', '.join(sorted(missing))}"
+                )
             state_value = item["state"]
             next_state_value = item["next_state"]
             if isinstance(state_value, torch.Tensor):
@@ -208,19 +263,27 @@ class ReplayBuffer:
                 self._validated(
                     Experience(
                         np.asarray(state_value),
-                        int(item["action"]),
-                        float(item["reward"]),
+                        item["action"],
+                        item["reward"],
                         np.asarray(next_state_value),
-                        bool(item["done"]),
+                        item["done"],
                         None if next_legal_action_mask is None else np.asarray(next_legal_action_mask),
                     )
                 )
             )
+
+        restored_rng_state = state.get("rng_state")
+        if restored_rng_state is not None:
+            validator = random.Random()
+            try:
+                validator.setstate(restored_rng_state)
+            except (TypeError, ValueError) as error:
+                raise ValueError("replay rng_state is malformed") from error
         with self._lock:
             self._items.clear()
             self._items.extend(restored[-self.capacity :])
-            if "rng_state" in state:
-                self._rng.setstate(state["rng_state"])
+            if restored_rng_state is not None:
+                self._rng.setstate(restored_rng_state)
 
     def clear(self) -> None:
         with self._lock:

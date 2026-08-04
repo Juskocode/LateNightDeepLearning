@@ -174,7 +174,7 @@ The VISION tab groups and labels all 32 current values, highlights legal paths a
 |---|---|
 | GAME | The actual maze, score, combat state, episode, reward, loss, epsilon, replay strip, and online/target Q-values |
 | VISION | All named observation features, legal-action mask, current heading, and action-relative sensor groups |
-| METRICS | Rolling reward, loss, score, and epsilon charts plus combat telemetry, recent transitions, and replay capacity |
+| METRICS | Learner health and alert reason, replay readiness, update coverage, clipping pressure, Q/TD scale, rolling charts, combat telemetry, and recent transitions |
 | NETWORK | The current forward-pass activations, learned online-network weights, architecture, parameter count, and online/target Q-values |
 
 The NETWORK tab is model introspection, not a decorative diagram. It runs the current observation through the online model, chooses the 11 strongest-magnitude nodes from each larger layer for readability, and draws the exact learned weights connecting those selected nodes. Layer labels retain the full sizes (`11 / 32`, `11 / 256`, `11 / 128`, and all four outputs). Cyan edges are positive, magenta edges are negative, thickness represents relative magnitude, node intensity represents activation magnitude, and the selected action has a yellow outline. The action bars separately compare the online network with the synchronized target network.
@@ -228,6 +228,36 @@ flowchart LR
     M --> V
 ```
 
+## Learning health and hardening
+
+Every learner publishes the same compact `health` block alongside its detailed
+telemetry. The dashboards turn it into a visible status instead of leaving a
+stalled or numerically unstable run to look merely quiet.
+
+| Status | Meaning |
+|---|---|
+| `healthy` | Updates and measurements are finite, and no active diagnostic crossed its warning threshold |
+| `warming_up` | The run is valid but replay, evaluation, or another required evidence window is not ready yet |
+| `warning` | Training is still running, but an alert such as persistent clipping, value drift, collision dominance, contact loops, or low update coverage needs attention |
+| `critical` | A non-finite value, worker failure, or invalid learner state makes the reported training result unsafe to trust |
+
+Health telemetry reports replay fill and readiness, optimizer updates per
+environment decision, gradient norm and clipping pressure, Q-value and TD-error
+magnitude, recent reward and termination evidence, and subsystem-specific
+signals. Snake adds held-out evaluation freshness and the train–evaluation gap;
+Driving adds throughput, safety interventions, wall contact, collision loops,
+and worker state. Tabular learners explicitly mark replay and neural-only
+metrics as not applicable rather than inventing zero-valued evidence.
+
+Public transition and replay APIs reject malformed shapes, non-integral actions,
+non-binary masks, invalid terminal flags, and observations or rewards that are
+non-finite or outside the learner's numeric range.
+Checkpoint loaders validate metadata and learned tensors before committing the
+restored state; incompatible or numerically corrupt files fail clearly while
+supported legacy checkpoint migrations remain available. See the
+[learning lab guide](docs/learning-lab.md#learning-health-contract) for the field
+contract and interpretation rules.
+
 ## Snake generalization lab
 
 The Snake policy receives an 11-value binary vector:
@@ -246,7 +276,12 @@ Dueling:  11 inputs → 512 ReLU → 256 ReLU → value + advantage → 3 Q-valu
 Tabular:  11 bits   → Q table   → 3 action values
 ```
 
-Outputs estimate **straight**, **turn right**, and **turn left**. The board also shows the collision probes, dashed food vector, recent path visits, starvation budget, action values, replay state, curriculum stage, held-out mean and variance, and the live train–evaluation gap.
+Outputs estimate **straight**, **turn right**, and **turn left**. The board also
+shows the collision probes, dashed food vector, recent path visits, starvation
+budget, action values, replay state, learner health and alert reason, update and
+clipping diagnostics, termination counts, curriculum stage, held-out mean and
+variance, and the live train–evaluation gap. Tabular modes render neural-only
+signals as `N/A`.
 
 | Algorithm | Representation | Update |
 |---|---|---|
@@ -448,9 +483,9 @@ The 1,400×760 learning dashboard is fed only by live telemetry:
 
 | Tab | Live evidence |
 |---|---|
-| Overview | Real scored cars and circuit, exact rays, green-clearance value and delta, wall/contact state, proposed → executed safety actions, episode-origin gates, generation-wide cars-per-tick and worker count, population fitness, observations, and Q-values |
+| Overview | Health status and alert reason, real scored cars and circuit, exact rays, green-clearance value and delta, wall/contact state, proposed → executed safety actions, episode-origin gates, generation-wide cars-per-tick and worker count, population fitness, observations, and Q-values |
 | Network | The current network's actual architecture, activations, parameter count, and sampled connection weights |
-| Memory | Replay occupancy, epsilon, loss, TD error, gradient updates, action use, target synchronization, and recent learning state |
+| Memory | Replay readiness, update/decision ratio, clipping frequency, Q/TD scale, safety/contact rates, epsilon, action use, target synchronization, and recent learning state; pure genetic mode marks replay/gradient/TD fields `N/A` |
 
 | Learning input | Action |
 |---|---|
@@ -604,7 +639,10 @@ checkpoint compatibility, and environment edge cases; and driving vectorized
 ray geometry, anti-stall fitness, legacy observation migration, chunked parallel
 determinism, circuit/terrain physics, gated lap records, DQN targets, replay,
 evolution, isolated champion races, clickable observability, screenshots, and
-renderer smoke tests.
+renderer smoke tests. Cross-game health tests also inject non-finite values,
+float32 overflow, malformed optimizer moments, inconsistent population
+metadata, corrupt RNG state, and late checkpoint failures to verify fail-fast,
+non-mutating rejection.
 
 Regenerate documentation media from the real renderers:
 

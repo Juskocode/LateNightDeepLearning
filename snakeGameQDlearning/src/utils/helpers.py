@@ -5,6 +5,7 @@ import json
 from typing import Any, Callable, Optional, Tuple
 import functools
 from pathlib import Path
+import tempfile
 
 
 def timing_decorator(func: Callable) -> Callable:
@@ -61,6 +62,25 @@ def get_next_model_version(model_dir: str) -> int:
     return max(versions) + 1 if versions else 1
 
 
+def _atomic_json_dump(path: str | Path, payload: dict[str, Any]) -> None:
+    """Write metadata beside its model without exposing a partial JSON file."""
+
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{destination.name}.", suffix=".tmp", dir=destination.parent
+    )
+    try:
+        with os.fdopen(descriptor, "w") as handle:
+            json.dump(payload, handle, indent=2, allow_nan=False)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_name, destination)
+    finally:
+        if os.path.exists(temporary_name):
+            os.unlink(temporary_name)
+
+
 def save_model_metadata(
     model_dir: str,
     version: int,
@@ -91,8 +111,7 @@ def save_model_metadata(
     if experiment is not None:
         metadata["experiment"] = dict(experiment)
 
-    with open(metadata_file, "w") as f:
-        json.dump(metadata, f, indent=2)
+    _atomic_json_dump(metadata_file, metadata)
 
 
 def update_model_metadata(
@@ -118,8 +137,7 @@ def update_model_metadata(
     metadata["games_played"] = games
     metadata["timestamp"] = time.time()
 
-    with open(metadata_file, "w") as f:
-        json.dump(metadata, f, indent=2)
+    _atomic_json_dump(metadata_file, metadata)
 
 
 def _matches_algorithm(metadata: dict, algorithm: str | None) -> bool:

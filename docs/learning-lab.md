@@ -941,6 +941,73 @@ time-sliced and retain full throughput. Vectorized circuit projection evaluates
 the dense sensor fan efficiently, while same-pose immutable ray snapshots are
 cached across panels without sharing mutable environment state.
 
+## Learning health contract
+
+Raw charts answer *what changed*; the nested `health` telemetry answers whether
+the available evidence is internally valid and what deserves attention. Pacman,
+Snake, and Driving use the same top-level vocabulary:
+
+```text
+health
+├── status: healthy | warming_up | warning | critical
+├── finite: bool
+├── alerts: [stable machine-readable alert codes]
+├── replay: size, capacity, fill_ratio, ready, applicable
+├── optimization: updates, update_to_decision_ratio,
+│                 gradient_norm, clip_threshold, clip_ratio
+├── values: q_abs_max, td_error_abs_mean
+└── subsystem evidence: generalization, terminations, safety, throughput, workers
+```
+
+`finite` covers the values used to make the current diagnosis. A false value is
+always `critical`; it is never hidden by replacing NaN or infinity with a
+plausible number. `alerts` are stable codes suitable for tests, logs, and UI
+badges. A dashboard may shorten their presentation, but it must not synthesize a
+different condition.
+
+Replay readiness means both the configured warm-up and mini-batch requirement
+are satisfied. `fill_ratio` describes storage occupancy, not sample diversity.
+For online tabular methods, `applicable` is false and readiness is not treated as
+a failure. Likewise, gradient and TD diagnostics are neural-only unless the
+tabular backend exposes a mathematically equivalent measurement.
+
+`update_to_decision_ratio` uses optimizer updates and environment decisions from
+the same diagnostic window. Fresh runs use their full lifetime; a standalone
+resume starts a new window when replay and session-only safety counters are not
+restored, while population checkpoints persist their aggregate counters. It
+distinguishes a learner waiting for replay from one whose update schedule has
+silently stopped. `clip_ratio` is the fraction of optimizer updates in that
+same window whose pre-clipping norm exceeded the configured threshold; a single
+clipped batch is evidence, not automatically a warning. A legacy checkpoint
+that never recorded clip counts reports the lifetime ratio as unavailable
+instead of inventing zero history. Q and TD magnitudes are absolute so positive
+and negative estimates cannot cancel in a mean.
+
+Subsystem evidence stays truthful to the experiment:
+
+- Pacman reports recent transition/termination and reward behavior around its
+  replay learner.
+- Snake reports held-out evaluation freshness and generalization evidence when
+  an evaluation suite has actually run; missing validation starts as warm-up,
+  not a fabricated score.
+- Driving reports safety-filter intervention, wall contact, collision-loop,
+  environment-decision throughput, and worker failure evidence. Population
+  aggregates use the scored members, not presentation-only comparison cars.
+
+The contract is observational. Reading or rendering it must not sample replay,
+advance an environment, consume an exploration RNG, run an optimizer, alter
+population ordering, or update a checkpoint. Threshold alerts help diagnose a
+run; they do not silently modify the algorithm.
+
+Hardening happens before state mutation. Public learner/replay boundaries
+validate shapes, finite and learner-representable numeric values, integral
+in-range actions, binary legal masks, and real boolean terminal flags.
+Checkpoint loaders validate compatible
+metadata, counters, model tensors, optimizer state where restored, and optional
+replay/RNG payloads before committing them. A rejected checkpoint therefore
+cannot leave a half-restored learner, while documented legacy migrations remain
+supported.
+
 ## Reproducible comparison protocol
 
 Use this protocol across the implemented neural, tabular, and population

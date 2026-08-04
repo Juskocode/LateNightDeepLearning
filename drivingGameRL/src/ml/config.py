@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 import math
-from typing import Any, Literal, Mapping
+from typing import Any, Literal, Mapping, get_type_hints
 
 
 Algorithm = Literal["dqn", "double_dqn"]
@@ -42,7 +42,14 @@ class DQNConfig:
     seed: int = 0
 
     def __post_init__(self) -> None:
-        hidden_sizes = tuple(self.hidden_sizes)
+        if isinstance(self.hidden_sizes, (str, bytes)):
+            raise ValueError("hidden_sizes must be a sequence of positive integers")
+        try:
+            hidden_sizes = tuple(self.hidden_sizes)
+        except TypeError as error:
+            raise ValueError(
+                "hidden_sizes must be a sequence of positive integers"
+            ) from error
         object.__setattr__(self, "hidden_sizes", hidden_sizes)
 
         self._positive_integer("observation_size", self.observation_size)
@@ -96,7 +103,18 @@ class DQNConfig:
     def from_dict(cls, values: Mapping[str, Any]) -> "DQNConfig":
         """Rebuild and revalidate a serialized configuration."""
 
-        return cls(**dict(values))
+        if not isinstance(values, Mapping):
+            raise ValueError("DQNConfig payload must be a mapping")
+        allowed = set(get_type_hints(cls))
+        unexpected = sorted(set(values) - allowed)
+        if unexpected:
+            raise ValueError(
+                "DQNConfig contains unexpected fields: " + ", ".join(unexpected)
+            )
+        try:
+            return cls(**dict(values))
+        except (TypeError, ValueError) as error:
+            raise ValueError(f"invalid DQNConfig payload: {error}") from error
 
     @staticmethod
     def _positive_integer(name: str, value: object) -> None:

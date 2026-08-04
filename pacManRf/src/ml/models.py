@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import copy
+from collections.abc import Mapping
 import math
+from numbers import Integral
 import os
 import tempfile
 from pathlib import Path
@@ -23,13 +26,18 @@ class PacmanQNetwork(nn.Module):
         hidden_sizes: Iterable[int] = (256, 128),
     ) -> None:
         super().__init__()
+        raw_hidden_sizes = tuple(hidden_sizes)
+        dimensions = (input_size, output_size, *raw_hidden_sizes)
+        if any(
+            isinstance(size, bool) or not isinstance(size, Integral) or int(size) <= 0
+            for size in dimensions
+        ):
+            raise ValueError("network dimensions must be positive integers")
         self.input_size = int(input_size)
         self.output_size = int(output_size)
-        self.hidden_sizes = tuple(int(size) for size in hidden_sizes)
-        if self.input_size <= 0 or self.output_size <= 0:
-            raise ValueError("input_size and output_size must be positive")
-        if not self.hidden_sizes or any(size <= 0 for size in self.hidden_sizes):
-            raise ValueError("hidden_sizes must contain positive sizes")
+        self.hidden_sizes = tuple(int(size) for size in raw_hidden_sizes)
+        if not self.hidden_sizes:
+            raise ValueError("hidden_sizes must contain positive integer sizes")
 
         dimensions = (self.input_size, *self.hidden_sizes, self.output_size)
         self.layers = nn.ModuleList(
@@ -115,6 +123,8 @@ class PacmanQNetwork(nn.Module):
             tensor = tensor.unsqueeze(0)
         if tensor.shape != (1, self.input_size):
             raise ValueError(f"network_snapshot expects one state with shape ({self.input_size},)")
+        if not torch.isfinite(tensor).all():
+            raise ValueError("network_snapshot state must contain finite values")
 
         was_training = self.training
         self.eval()
@@ -178,6 +188,8 @@ class PacmanQNetwork(nn.Module):
     def save_weights(self, path: str | Path) -> Path:
         """Atomically save model weights."""
 
+        if any(not torch.isfinite(parameter).all() for parameter in self.parameters()):
+            raise ValueError("cannot save non-finite model weights")
         destination = Path(path).expanduser().resolve()
         destination.parent.mkdir(parents=True, exist_ok=True)
         temporary: str | None = None
@@ -199,7 +211,16 @@ class PacmanQNetwork(nn.Module):
             state = torch.load(source, map_location=self.device, weights_only=True)
         except TypeError:  # pragma: no cover - compatibility with older PyTorch
             state = torch.load(source, map_location=self.device)
-        self.load_state_dict(state, strict=strict)
+        if not isinstance(state, Mapping):
+            raise ValueError("model checkpoint must be a state-dict mapping")
+        for name, value in state.items():
+            if not isinstance(value, torch.Tensor):
+                raise ValueError(f"model checkpoint entry {name!r} must be a tensor")
+            if (value.is_floating_point() or value.is_complex()) and not torch.isfinite(value).all():
+                raise ValueError(f"model checkpoint entry {name!r} contains non-finite values")
+        staged = copy.deepcopy(self)
+        staged.load_state_dict(state, strict=strict)
+        self.load_state_dict(staged.state_dict())
 
 
 class LinearQNet(PacmanQNetwork):

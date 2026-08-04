@@ -5,6 +5,7 @@ from __future__ import annotations
 from copy import deepcopy
 from dataclasses import replace
 import math
+from numbers import Real
 import os
 from pathlib import Path
 import random
@@ -15,6 +16,7 @@ import numpy as np
 import torch
 from torch import nn
 
+from ..learning_health import build_learning_health
 from .config import DQNConfig
 from .network import DrivingQNetwork
 from .replay import ReplayBuffer
@@ -61,6 +63,8 @@ class DrivingDQNAgent:
         self.last_predicted_mean = 0.0
         self.last_target_mean = 0.0
         self.last_td_error = 0.0
+        self.gradient_clip_events = 0
+        self.nonfinite_update_rejections = 0
         self.last_action: int | None = None
         self.last_policy = "uninitialized"
         self.last_q_values = np.zeros(self.config.action_size, dtype=np.float32)
@@ -92,7 +96,10 @@ class DrivingDQNAgent:
                 values = self.online_network(torch.from_numpy(array))
         finally:
             self.online_network.train(was_training)
-        return values.detach().cpu().numpy().astype(np.float32, copy=True)
+        result = values.detach().cpu().numpy().astype(np.float32, copy=True)
+        if not np.isfinite(result).all():
+            raise FloatingPointError("driving policy produced non-finite Q-values")
+        return result
 
     def select_action(
         self, observation: Sequence[float] | np.ndarray, *, explore: bool = True
@@ -157,13 +164,34 @@ class DrivingDQNAgent:
         bootstrap = self._bootstrap_values(next_states)
         targets = rewards + (~dones).float() * self.config.gamma * bootstrap
 
+        if not torch.isfinite(predicted).all() or not torch.isfinite(targets).all():
+            self.nonfinite_update_rejections += 1
+            raise FloatingPointError("DQN update produced non-finite values")
+
         self.optimizer.zero_grad(set_to_none=True)
         loss = self.loss_function(predicted, targets)
+        if not torch.isfinite(loss):
+            self.nonfinite_update_rejections += 1
+            raise FloatingPointError("DQN update produced a non-finite loss")
         loss.backward()
         gradient_norm = torch.nn.utils.clip_grad_norm_(
             self.online_network.parameters(), self.config.gradient_clip
         )
+        if not torch.isfinite(gradient_norm):
+            self.optimizer.zero_grad(set_to_none=True)
+            self.nonfinite_update_rejections += 1
+            raise FloatingPointError("DQN update produced non-finite gradients")
+        if float(gradient_norm.detach()) > self.config.gradient_clip:
+            self.gradient_clip_events += 1
         self.optimizer.step()
+        if any(
+            not torch.isfinite(parameter).all()
+            for parameter in self.online_network.parameters()
+        ):
+            self.nonfinite_update_rejections += 1
+            raise FloatingPointError(
+                "DQN optimizer step produced non-finite network parameters"
+            )
 
         self.gradient_steps += 1
         if self.gradient_steps % self.config.target_sync_interval == 0:
@@ -229,6 +257,8 @@ class DrivingDQNAgent:
             clone.last_predicted_mean = self.last_predicted_mean
             clone.last_target_mean = self.last_target_mean
             clone.last_td_error = self.last_td_error
+            clone.gradient_clip_events = self.gradient_clip_events
+            clone.nonfinite_update_rejections = self.nonfinite_update_rejections
             clone._rng.setstate(self._rng.getstate())
         else:
             clone.target_network.load_state_dict(clone.online_network.state_dict())
@@ -245,33 +275,67 @@ class DrivingDQNAgent:
     ) -> dict[str, Any]:
         """Return compact live metrics; full weights live in network_snapshot."""
 
-        q_values = (
-            self.q_values(observation).tolist()
-            if observation is not None
-            else self.last_q_values.astype(float).tolist()
+        telemetry_alerts: list[str] = []
+
+        def finite_metric(name: str, value: object) -> float:
+            try:
+                numeric = float(value)
+            except (TypeError, ValueError):
+                telemetry_alerts.append(f"malformed:{name}")
+                return 0.0
+            if not math.isfinite(numeric):
+                telemetry_alerts.append(f"non_finite:{name}")
+                return 0.0
+            return numeric
+
+        try:
+            q_values = (
+                self.q_values(observation).tolist()
+                if observation is not None
+                else self.last_q_values.astype(float).tolist()
+            )
+        except (FloatingPointError, TypeError, ValueError):
+            q_values = [0.0] * self.config.action_size
+            telemetry_alerts.append("non_finite:q_values")
+        if not all(math.isfinite(float(value)) for value in q_values):
+            q_values = [0.0] * self.config.action_size
+            telemetry_alerts.append("non_finite:q_values")
+        parameter_norm = finite_metric(
+            "parameter_norm",
+            math.sqrt(
+                sum(
+                    float(torch.sum(parameter.detach() ** 2))
+                    for parameter in self.online_network.parameters()
+                )
+            ),
         )
-        parameter_norm = math.sqrt(
+        target_gap = finite_metric(
+            "target_parameter_gap",
             sum(
-                float(torch.sum(parameter.detach() ** 2))
-                for parameter in self.online_network.parameters()
-            )
+                float(torch.mean(torch.abs(online.detach() - target.detach())))
+                for online, target in zip(
+                    self.online_network.parameters(), self.target_network.parameters()
+                )
+            ),
         )
-        target_gap = sum(
-            float(torch.mean(torch.abs(online.detach() - target.detach())))
-            for online, target in zip(
-                self.online_network.parameters(), self.target_network.parameters()
-            )
-        )
-        return {
+        replay = self.replay.stats()
+        learning = {
             "algorithm": self.config.algorithm,
             "environment_steps": self.environment_steps,
             "gradient_steps": self.gradient_steps,
-            "epsilon": self.epsilon,
-            "last_loss": self.last_loss,
-            "gradient_norm": self.last_gradient_norm,
-            "mean_predicted_q": self.last_predicted_mean,
-            "mean_target_q": self.last_target_mean,
-            "mean_absolute_td_error": self.last_td_error,
+            "epsilon": finite_metric("epsilon", self.epsilon),
+            "last_loss": finite_metric("last_loss", self.last_loss),
+            "gradient_norm": finite_metric("gradient_norm", self.last_gradient_norm),
+            "gradient_clip": self.config.gradient_clip,
+            "gradient_clip_events": self.gradient_clip_events,
+            "nonfinite_update_rejections": self.nonfinite_update_rejections,
+            "mean_predicted_q": finite_metric(
+                "mean_predicted_q", self.last_predicted_mean
+            ),
+            "mean_target_q": finite_metric("mean_target_q", self.last_target_mean),
+            "mean_absolute_td_error": finite_metric(
+                "mean_absolute_td_error", self.last_td_error
+            ),
             "last_action": self.last_action,
             "policy": self.last_policy,
             "q_values": q_values,
@@ -282,8 +346,24 @@ class DrivingDQNAgent:
             "parameter_count": self.online_network.parameter_count,
             "parameter_norm": parameter_norm,
             "architecture": list(self.online_network.architecture),
-            "replay": self.replay.stats(),
+            "replay": replay,
         }
+        health = build_learning_health(
+            learning=learning,
+            replay=replay,
+            environment_decisions=self.environment_steps,
+            batch_size=self.config.batch_size,
+            warmup_steps=self.config.warmup_steps,
+            gradient_clip=self.config.gradient_clip,
+        )
+        if telemetry_alerts:
+            health["finite"] = False
+            health["status"] = "critical"
+            health["alerts"] = list(
+                dict.fromkeys([*health["alerts"], *telemetry_alerts])
+            )
+        learning["health"] = health
+        return learning
 
     def state_dict(self) -> dict[str, Any]:
         """Serializable training state (replay contents are intentionally omitted)."""
@@ -303,6 +383,8 @@ class DrivingDQNAgent:
                 "last_predicted_mean": self.last_predicted_mean,
                 "last_target_mean": self.last_target_mean,
                 "last_td_error": self.last_td_error,
+                "gradient_clip_events": self.gradient_clip_events,
+                "nonfinite_update_rejections": self.nonfinite_update_rejections,
                 "last_action": self.last_action,
                 "last_policy": self.last_policy,
                 "last_q_values": self.last_q_values.tolist(),
@@ -314,6 +396,10 @@ class DrivingDQNAgent:
     def load_state_dict(
         self, state: Mapping[str, Any], *, load_optimizer: bool = True
     ) -> None:
+        state = self._validated_checkpoint_payload(
+            state,
+            load_optimizer=load_optimizer,
+        )
         if int(state.get("checkpoint_version", -1)) != self.CHECKPOINT_VERSION:
             raise ValueError("unsupported Driving DQN checkpoint version")
         saved_config = DQNConfig.from_dict(state["config"])
@@ -328,15 +414,30 @@ class DrivingDQNAgent:
         if migrate_legacy_input:
             online_state = self._migrate_legacy_network_state(online_state)
             target_state = self._migrate_legacy_network_state(target_state)
+        optimizer_state = state.get("optimizer")
+        if load_optimizer and migrate_legacy_input:
+            optimizer_state = self._migrate_legacy_optimizer_state(optimizer_state)
+
+        # Preflight every mutating PyTorch loader against independent objects.
+        # A malformed target or optimizer payload therefore cannot leave the
+        # live online network half-restored.
+        candidate_online = deepcopy(self.online_network)
+        candidate_target = deepcopy(self.target_network)
+        candidate_online.load_state_dict(online_state)
+        candidate_target.load_state_dict(target_state)
+        if load_optimizer:
+            candidate_optimizer = torch.optim.Adam(
+                candidate_online.parameters(),
+                lr=self.config.learning_rate,
+                weight_decay=self.config.weight_decay,
+            )
+            candidate_optimizer.load_state_dict(optimizer_state)
+            self._validate_adam_optimizer(candidate_optimizer)
+
         self.online_network.load_state_dict(online_state)
         self.target_network.load_state_dict(target_state)
         self.target_network.eval()
         if load_optimizer:
-            optimizer_state = state["optimizer"]
-            if migrate_legacy_input:
-                optimizer_state = self._migrate_legacy_optimizer_state(
-                    optimizer_state
-                )
             self.optimizer.load_state_dict(optimizer_state)
         self.environment_steps = int(state.get("environment_steps", 0))
         self.gradient_steps = int(state.get("gradient_steps", 0))
@@ -347,6 +448,10 @@ class DrivingDQNAgent:
         self.last_predicted_mean = float(metrics.get("last_predicted_mean", 0.0))
         self.last_target_mean = float(metrics.get("last_target_mean", 0.0))
         self.last_td_error = float(metrics.get("last_td_error", 0.0))
+        self.gradient_clip_events = int(metrics.get("gradient_clip_events", 0))
+        self.nonfinite_update_rejections = int(
+            metrics.get("nonfinite_update_rejections", 0)
+        )
         self.last_action = metrics.get("last_action")
         self.last_policy = str(metrics.get("last_policy", "restored"))
         q_values = np.asarray(
@@ -363,6 +468,191 @@ class DrivingDQNAgent:
         self.action_counts = [int(value) for value in counts]
         if "policy_rng_state" in state:
             self._rng.setstate(state["policy_rng_state"])
+
+    @classmethod
+    def _validated_checkpoint_payload(
+        cls,
+        state: object,
+        *,
+        load_optimizer: bool,
+    ) -> Mapping[str, Any]:
+        """Validate the portable envelope before mutating a live learner."""
+
+        if not isinstance(state, Mapping):
+            raise ValueError("Driving DQN checkpoint must be a mapping")
+        version = state.get("checkpoint_version", -1)
+        if isinstance(version, bool) or not isinstance(version, (int, np.integer)):
+            raise ValueError("Driving DQN checkpoint version must be an integer")
+        if int(version) != cls.CHECKPOINT_VERSION:
+            raise ValueError("unsupported Driving DQN checkpoint version")
+        required = {"config", "online_network", "target_network"}
+        if load_optimizer:
+            required.add("optimizer")
+        missing = sorted(key for key in required if key not in state)
+        if missing:
+            raise ValueError("Driving DQN checkpoint is missing: " + ", ".join(missing))
+        DQNConfig.from_dict(state["config"])
+        for name in ("online_network", "target_network"):
+            payload = state[name]
+            if not isinstance(payload, Mapping):
+                raise ValueError(f"checkpoint {name} must be a mapping")
+            cls._require_finite_tensors(payload, name=name)
+        if load_optimizer:
+            optimizer = state["optimizer"]
+            if not isinstance(optimizer, Mapping):
+                raise ValueError("checkpoint optimizer must be a mapping")
+            cls._require_finite_tensors(optimizer, name="optimizer")
+        for name in ("environment_steps", "gradient_steps", "target_syncs"):
+            cls._checkpoint_counter(name, state.get(name, 0))
+        metrics = state.get("metrics", {})
+        if not isinstance(metrics, Mapping):
+            raise ValueError("checkpoint metrics must be a mapping")
+        for name in (
+            "last_loss",
+            "last_gradient_norm",
+            "last_predicted_mean",
+            "last_target_mean",
+            "last_td_error",
+        ):
+            cls._checkpoint_finite(name, metrics.get(name, 0.0))
+        for name in ("gradient_clip_events", "nonfinite_update_rejections"):
+            cls._checkpoint_counter(name, metrics.get(name, 0))
+        if cls._checkpoint_counter(
+            "gradient_clip_events", metrics.get("gradient_clip_events", 0)
+        ) > cls._checkpoint_counter("gradient_steps", state.get("gradient_steps", 0)):
+            raise ValueError("checkpoint gradient clips cannot exceed gradient steps")
+        last_action = metrics.get("last_action")
+        saved_config = DQNConfig.from_dict(state["config"])
+        if last_action is not None and (
+            isinstance(last_action, bool)
+            or not isinstance(last_action, (int, np.integer))
+            or not 0 <= int(last_action) < saved_config.action_size
+        ):
+            raise ValueError("checkpoint last_action is invalid")
+        q_values = np.asarray(
+            metrics.get("last_q_values", [0.0] * saved_config.action_size),
+            dtype=np.float32,
+        )
+        if (
+            q_values.shape != (saved_config.action_size,)
+            or not np.isfinite(q_values).all()
+        ):
+            raise ValueError("checkpoint action telemetry is malformed or non-finite")
+        counts = metrics.get("action_counts", [0] * saved_config.action_size)
+        if (
+            not isinstance(counts, (list, tuple))
+            or len(counts) != saved_config.action_size
+        ):
+            raise ValueError("checkpoint action telemetry has an incompatible shape")
+        for value in counts:
+            cls._checkpoint_counter("action_counts", value)
+        if "policy_rng_state" in state:
+            probe = random.Random()
+            try:
+                probe.setstate(state["policy_rng_state"])
+            except (TypeError, ValueError) as error:
+                raise ValueError("checkpoint policy RNG state is malformed") from error
+        return state
+
+    @classmethod
+    def _require_finite_tensors(cls, value: object, *, name: str) -> None:
+        if isinstance(value, torch.Tensor):
+            if not torch.isfinite(value).all():
+                raise ValueError(f"checkpoint {name} contains non-finite tensors")
+            return
+        if isinstance(value, Mapping):
+            for key, nested in value.items():
+                cls._require_finite_tensors(nested, name=f"{name}.{key}")
+            return
+        if isinstance(value, (list, tuple)):
+            for index, nested in enumerate(value):
+                cls._require_finite_tensors(nested, name=f"{name}[{index}]")
+            return
+        if isinstance(value, Real) and not isinstance(value, bool):
+            if not math.isfinite(float(value)):
+                raise ValueError(f"checkpoint {name} contains non-finite numbers")
+
+    @staticmethod
+    def _checkpoint_counter(name: str, value: object) -> int:
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, np.integer))
+            or int(value) < 0
+        ):
+            raise ValueError(f"checkpoint {name} must be a non-negative integer")
+        return int(value)
+
+    @staticmethod
+    def _checkpoint_finite(name: str, value: object) -> float:
+        if isinstance(value, bool) or not isinstance(
+            value, (int, float, np.integer, np.floating)
+        ):
+            raise ValueError(f"checkpoint {name} must be finite")
+        numeric = float(value)
+        if not math.isfinite(numeric):
+            raise ValueError(f"checkpoint {name} must be finite")
+        return numeric
+
+    @classmethod
+    def _validate_adam_optimizer(cls, optimizer: torch.optim.Adam) -> None:
+        """Reject Adam payloads PyTorch accepts but cannot safely step."""
+
+        for group_index, group in enumerate(optimizer.param_groups):
+            lr = cls._checkpoint_finite(f"optimizer group {group_index} lr", group.get("lr"))
+            eps = cls._checkpoint_finite(
+                f"optimizer group {group_index} eps", group.get("eps")
+            )
+            weight_decay = cls._checkpoint_finite(
+                f"optimizer group {group_index} weight_decay",
+                group.get("weight_decay"),
+            )
+            if lr <= 0.0 or eps <= 0.0 or weight_decay < 0.0:
+                raise ValueError("checkpoint optimizer hyperparameters are out of range")
+            betas = group.get("betas")
+            if not isinstance(betas, (list, tuple)) or len(betas) != 2:
+                raise ValueError("checkpoint optimizer betas must contain two values")
+            beta_values = [
+                cls._checkpoint_finite(
+                    f"optimizer group {group_index} beta {index}", value
+                )
+                for index, value in enumerate(betas)
+            ]
+            if any(not 0.0 <= value < 1.0 for value in beta_values):
+                raise ValueError("checkpoint optimizer betas must be in [0, 1)")
+
+        for parameter, metrics in optimizer.state.items():
+            if not metrics:
+                continue
+            required = {"step", "exp_avg", "exp_avg_sq"}
+            missing = sorted(required - set(metrics))
+            if missing:
+                raise ValueError(
+                    "checkpoint optimizer state is incomplete: " + ", ".join(missing)
+                )
+            for name in ("exp_avg", "exp_avg_sq", "max_exp_avg_sq"):
+                if name not in metrics:
+                    continue
+                value = metrics[name]
+                if not isinstance(value, torch.Tensor) or value.shape != parameter.shape:
+                    raise ValueError(
+                        "checkpoint optimizer tensor shape is incompatible: "
+                        f"{name} must match {tuple(parameter.shape)}"
+                    )
+                if value.dtype != parameter.dtype:
+                    raise ValueError(
+                        f"checkpoint optimizer {name} dtype must match its parameter"
+                    )
+                if not torch.isfinite(value).all():
+                    raise ValueError(f"checkpoint optimizer {name} is non-finite")
+            step = metrics["step"]
+            if isinstance(step, torch.Tensor):
+                if step.numel() != 1 or not torch.isfinite(step).all():
+                    raise ValueError("checkpoint optimizer step must be one finite scalar")
+                step_value = float(step.detach().cpu())
+            else:
+                step_value = cls._checkpoint_finite("optimizer step", step)
+            if step_value < 0.0:
+                raise ValueError("checkpoint optimizer step must be non-negative")
 
     def save(self, path: str | Path) -> Path:
         """Atomically replace a checkpoint after Torch has written it fully."""
@@ -398,9 +688,7 @@ class DrivingDQNAgent:
         return agent
 
     @classmethod
-    def checkpoint_config_compatible(
-        cls, current: DQNConfig, saved: DQNConfig
-    ) -> bool:
+    def checkpoint_config_compatible(cls, current: DQNConfig, saved: DQNConfig) -> bool:
         """Whether ``saved`` can load directly or through the 5→9 ray bridge."""
 
         observations_match = current.observation_size == saved.observation_size
@@ -416,9 +704,7 @@ class DrivingDQNAgent:
         )
 
     @classmethod
-    def _migrate_legacy_network_state(
-        cls, state: Mapping[str, Any]
-    ) -> dict[str, Any]:
+    def _migrate_legacy_network_state(cls, state: Mapping[str, Any]) -> dict[str, Any]:
         migrated = deepcopy(dict(state))
         key = "layers.0.weight"
         weight = migrated.get(key)
@@ -470,9 +756,12 @@ class DrivingDQNAgent:
         if not checkpoint.is_file():
             raise FileNotFoundError(f"Driving DQN checkpoint not found: {checkpoint}")
         try:
-            return torch.load(checkpoint, map_location="cpu", weights_only=True)
+            payload = torch.load(checkpoint, map_location="cpu", weights_only=True)
         except TypeError:  # pragma: no cover - compatibility with older Torch
-            return torch.load(checkpoint, map_location="cpu")
+            payload = torch.load(checkpoint, map_location="cpu")
+        if not isinstance(payload, Mapping):
+            raise ValueError("Driving DQN checkpoint must contain a mapping")
+        return dict(payload)
 
     # Compatibility for callers written before the checkpoint reader became a
     # public part of the agent API.

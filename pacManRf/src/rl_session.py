@@ -242,6 +242,7 @@ class PacmanRLSession:
         self.completed_episodes = 0
         self.last_episode: dict[str, Any] | None = None
         self.last_info = dict(self.env.last_info)
+        self._recent_termination_reasons: deque[str] = deque(maxlen=64)
         self.history: dict[str, deque] = {
             "rewards": deque(maxlen=500),
             "losses": deque(maxlen=500),
@@ -337,7 +338,8 @@ class PacmanRLSession:
             metrics = None
 
         self.history["rewards"].append(float(reward))
-        self.history["losses"].append(float(self.agent.trainer.last_metrics.loss))
+        if metrics is not None:
+            self.history["losses"].append(float(metrics.loss))
         self.history["scores"].append(float(self.env.game.score))
         self.history["epsilons"].append(float(self.agent.epsilon))
         projectile_data = self.env.game.projectile_telemetry()
@@ -361,6 +363,9 @@ class PacmanRLSession:
                 "steps": self.env.episode_steps,
                 "reason": info.get("termination_reason"),
             }
+            self._recent_termination_reasons.append(
+                str(info.get("termination_reason") or "unknown")
+            )
             self.agent.reset_episode()
             self.state = self.env.reset()
         else:
@@ -419,6 +424,31 @@ class PacmanRLSession:
                 "history": self.history_snapshot(),
             }
         )
+        health = data.get("health")
+        if isinstance(health, dict):
+            reason_counts: dict[str, int] = {}
+            for reason in self._recent_termination_reasons:
+                reason_counts[reason] = reason_counts.get(reason, 0) + 1
+            reward_components = self.last_info.get("reward_components")
+            health["termination"] = {
+                "last_reason": (
+                    self.last_episode.get("reason")
+                    if self.last_episode is not None
+                    else self.last_info.get("termination_reason")
+                ),
+                "recent_count": len(self._recent_termination_reasons),
+                "recent_counts": reason_counts,
+            }
+            health["environment"] = {
+                "last_reward": float(self.agent.last_reward),
+                "last_reward_components": (
+                    dict(reward_components) if isinstance(reward_components, dict) else {}
+                ),
+                "action_blocked": bool(self.last_info.get("action_blocked", False)),
+                "stalled": bool(self.last_info.get("stalled", False)),
+                "life_lost": bool(self.last_info.get("life_lost", False)),
+                "level_cleared": bool(self.last_info.get("level_cleared", False)),
+            }
         return data
 
     def history_snapshot(self) -> dict[str, list[float]]:

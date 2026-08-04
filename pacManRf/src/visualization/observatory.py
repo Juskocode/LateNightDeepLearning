@@ -73,7 +73,9 @@ class PacmanObservatory:
     """
 
     MIN_WIDTH = 620
-    MIN_HEIGHT = 390
+    # The metrics view needs enough room for health, charts, and replay. Below
+    # this threshold an explicit resize state is safer than clipped evidence.
+    MIN_HEIGHT = 580
     HEADER_HEIGHT = 76
     PADDING = 16
 
@@ -636,7 +638,9 @@ class PacmanObservatory:
             columns=6,
         )
 
-        combat_rect = pygame.Rect(inner.x, inner.y + cards_height + 10, inner.width, 62)
+        health_rect = pygame.Rect(inner.x, inner.y + cards_height + 10, inner.width, 66)
+        self._draw_health_strip(surface, health_rect, telemetry)
+        combat_rect = pygame.Rect(inner.x, health_rect.bottom + 9, inner.width, 62)
         self._draw_combat_telemetry(surface, combat_rect, telemetry, compact=False)
         chart_top = combat_rect.bottom + 12
         bottom_height = 108
@@ -665,6 +669,106 @@ class PacmanObservatory:
         right = pygame.Rect(left.right + 12, bottom.y, max(1, bottom.right - left.right - 12), bottom.height)
         self._draw_memory(surface, left, telemetry, history)
         self._draw_replay_meter(surface, right, telemetry)
+
+    def _draw_health_strip(
+        self,
+        surface: pygame.Surface,
+        rect: pygame.Rect,
+        telemetry: Mapping[str, Any],
+    ) -> None:
+        """Render the compact, stable learner-health telemetry contract."""
+
+        pygame.draw.rect(surface, self.theme.panel_alt, rect, border_radius=9)
+        pygame.draw.rect(surface, self.theme.grid, rect, 1, border_radius=9)
+        health = _to_plain(telemetry.get("health"))
+        if not isinstance(health, Mapping):
+            self._section_title(surface, "LEARNER HEALTH", rect.x + 11, rect.y + 8)
+            self._text(
+                surface,
+                "Health telemetry unavailable",
+                (rect.x + 11, rect.y + 35),
+                self.theme.muted,
+                9,
+            )
+            return
+
+        status = str(health.get("status", "unknown")).strip().lower()
+        status_colors = {
+            "healthy": self.theme.green,
+            "warming_up": self.theme.blue,
+            "warning": self.theme.yellow,
+            "critical": self.theme.red,
+        }
+        status_color = status_colors.get(status, self.theme.muted)
+        status_label = status.upper().replace("_", " ")
+        self._text(surface, "LEARNER HEALTH", (rect.x + 11, rect.y + 8), self.theme.text, 8, bold=True)
+        pill = pygame.Rect(rect.x + 112, rect.y + 6, 94, 18)
+        pygame.draw.rect(surface, status_color, pill, border_radius=9)
+        pill_image = self._font(7, bold=True).render(status_label, True, self.theme.background)
+        surface.blit(pill_image, pill_image.get_rect(center=pill.center))
+
+        replay = _to_plain(health.get("replay"))
+        optimization = _to_plain(health.get("optimization"))
+        values = _to_plain(health.get("values"))
+        replay = replay if isinstance(replay, Mapping) else {}
+        optimization = optimization if isinstance(optimization, Mapping) else {}
+        values = values if isinstance(values, Mapping) else {}
+
+        replay_size = _number(replay.get("size"))
+        warmup = _number(replay.get("warmup_threshold"))
+        ready = bool(replay.get("ready", False))
+        updates = _number(optimization.get("updates"))
+        update_ratio = _number(optimization.get("update_to_decision_ratio"))
+        clip_ratio = _number(optimization.get("clip_ratio"))
+        clip_pressure = _number(optimization.get("gradient_to_clip_ratio"))
+        clip_history_complete = bool(
+            optimization.get("clip_history_complete", clip_ratio is not None)
+        )
+        clip_fraction = _number(optimization.get("recent_clip_fraction"))
+        q_abs = _number(values.get("q_abs_max"))
+        td_abs = _number(values.get("td_error_abs_mean"))
+
+        replay_text = "REPLAY  —"
+        if replay_size is not None and warmup is not None:
+            replay_text = f"REPLAY  {int(replay_size):,}/{int(warmup):,}  {'READY' if ready else 'WARMUP'}"
+        update_text = "UPDATES  —"
+        if updates is not None and update_ratio is not None:
+            update_text = f"UPDATES  {int(updates):,}  ·  {update_ratio:.1%}/decision"
+        clip_text = "CLIP  —"
+        if clip_ratio is not None and clip_pressure is not None:
+            clip_text = f"CLIP  {clip_ratio:.0%}  ·  norm {clip_pressure:.2f}×"
+        elif not clip_history_complete and clip_pressure is not None:
+            clip_text = f"CLIP  HISTORY N/A  ·  norm {clip_pressure:.2f}×"
+        elif clip_fraction is not None:
+            clip_text = f"CLIP  recent {clip_fraction:.0%}"
+        value_text = "VALUES  —"
+        if q_abs is not None and td_abs is not None:
+            value_text = f"|Q|max {q_abs:.2f}  ·  |TD|μ {td_abs:.2f}"
+
+        cells = (
+            (replay_text, self.theme.green if ready else self.theme.blue),
+            (update_text, self.theme.cyan),
+            (
+                clip_text,
+                self.theme.orange
+                if (clip_ratio or 0.0) >= 0.5 or (clip_pressure or 0.0) >= 1.0
+                else self.theme.muted,
+            ),
+            (value_text, self.theme.purple),
+        )
+        start_x = rect.x + 11
+        available = rect.width - 22
+        cell_width = max(120, available // len(cells))
+        for index, (label, color) in enumerate(cells):
+            x = start_x + index * cell_width
+            self._text(surface, label, (x, rect.y + 31), color, 8, bold=True)
+
+        raw_alerts = health.get("alerts", ())
+        alerts = list(raw_alerts) if isinstance(raw_alerts, Sequence) and not isinstance(raw_alerts, str) else []
+        if alerts:
+            alert_text = "ALERT  " + " · ".join(str(item).replace("_", " ") for item in alerts[:2])
+            image = self._font(7, bold=True).render(alert_text.upper(), True, status_color)
+            surface.blit(image, (rect.right - image.get_width() - 11, rect.y + 9))
 
     def _draw_network_tab(
         self,

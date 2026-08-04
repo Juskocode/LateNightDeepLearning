@@ -9,7 +9,11 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+import math
+from numbers import Real
+import os
 from pathlib import Path
+import tempfile
 from typing import Sequence
 
 import numpy as np
@@ -25,7 +29,7 @@ from snakeGameQDlearning.src.config.settings import (
 )
 
 from .models import DuelingQNet, LinearQNet
-from .replay import Experience
+from .replay import Experience, validated_experience
 from .trainer import QTrainer
 
 
@@ -83,6 +87,55 @@ class LearningAlgorithm(ABC):
         self.last_target_mean = 0.0
         self.last_predicted_mean = 0.0
         self.last_gradient_norm = 0.0
+        self.last_q_abs_max = 0.0
+        self.last_td_error_abs_mean = 0.0
+        self.last_td_error_abs_max = 0.0
+        self.update_count = 0
+        self.attempted_update_count = 0
+        self.rejected_update_count = 0
+        self.last_batch_size = 0
+        self.last_rejection: str | None = None
+
+    @staticmethod
+    def _validate_epsilon(epsilon: float) -> float:
+        if (
+            isinstance(epsilon, bool)
+            or not isinstance(epsilon, Real)
+            or not math.isfinite(float(epsilon))
+            or not 0.0 <= epsilon <= 1.0
+        ):
+            raise ValueError("epsilon must be a finite number between 0 and 1")
+        return float(epsilon)
+
+    def health_metrics(self, decisions: int) -> dict:
+        ratio = self.update_count / decisions if decisions > 0 else 0.0
+        numeric = (
+            self.last_loss,
+            self.last_target_mean,
+            self.last_predicted_mean,
+            self.last_gradient_norm,
+            self.last_q_abs_max,
+            self.last_td_error_abs_mean,
+            self.last_td_error_abs_max,
+            ratio,
+        )
+        return {
+            "finite": all(math.isfinite(float(value)) for value in numeric),
+            "updates": self.update_count,
+            "attempted_updates": self.attempted_update_count,
+            "rejected_updates": self.rejected_update_count,
+            "update_to_decision_ratio": ratio,
+            "gradient_applicable": False,
+            "gradient_norm": None,
+            "clip_threshold": None,
+            "clip_count": None,
+            "clip_ratio": None,
+            "last_batch_size": self.last_batch_size,
+            "q_abs_max": self.last_q_abs_max,
+            "td_error_abs_mean": self.last_td_error_abs_mean,
+            "td_error_abs_max": self.last_td_error_abs_max,
+            "last_rejection": self.last_rejection,
+        }
 
     @abstractmethod
     def predict(self, state: np.ndarray) -> np.ndarray:
@@ -144,13 +197,19 @@ class DeepQAlgorithm(LearningAlgorithm):
 
     @staticmethod
     def _predict(model, state: np.ndarray) -> np.ndarray:
+        values_array = np.asarray(state, dtype=np.float32)
+        if values_array.shape != (INPUT_SIZE,) or not np.isfinite(values_array).all():
+            raise ValueError(f"state must be a finite {INPUT_SIZE}-feature vector")
         was_training = model.training
         model.eval()
         with torch.no_grad():
-            values = model(torch.as_tensor(state, dtype=torch.float32)).cpu().numpy()
+            values = model(torch.as_tensor(values_array, dtype=torch.float32)).cpu().numpy()
         if was_training:
             model.train()
-        return np.asarray(values, dtype=np.float32)
+        result = np.asarray(values, dtype=np.float32)
+        if result.shape != (OUTPUT_SIZE,) or not np.isfinite(result).all():
+            raise FloatingPointError("network produced invalid Q values")
+        return result
 
     def predict(self, state: np.ndarray) -> np.ndarray:
         return self._predict(self.model, state)
@@ -161,13 +220,16 @@ class DeepQAlgorithm(LearningAlgorithm):
     def train_step(self, experiences: Sequence[Experience], epsilon: float) -> float:
         if not experiences:
             return 0.0
-        states, actions, rewards, next_states, dones = zip(*experiences)
+        self._validate_epsilon(epsilon)
+        validated = [validated_experience(experience) for experience in experiences]
+        states, actions, rewards, next_states, dones = zip(*validated)
         loss = self.trainer.train_step(states, actions, rewards, next_states, dones)
         self._copy_metrics()
         return loss
 
     def train_transition(self, experience: Experience, epsilon: float) -> float:
-        loss = self.trainer.train_step(*experience)
+        self._validate_epsilon(epsilon)
+        loss = self.trainer.train_step(*validated_experience(experience))
         self._copy_metrics()
         return loss
 
@@ -176,6 +238,19 @@ class DeepQAlgorithm(LearningAlgorithm):
         self.last_target_mean = self.trainer.last_target_mean
         self.last_predicted_mean = self.trainer.last_predicted_mean
         self.last_gradient_norm = self.trainer.last_gradient_norm
+        self.last_q_abs_max = self.trainer.last_q_abs_max
+        self.last_td_error_abs_mean = self.trainer.last_td_error_abs_mean
+        self.last_td_error_abs_max = self.trainer.last_td_error_abs_max
+        self.update_count = self.trainer.update_target_counter
+        self.attempted_update_count = self.trainer.attempted_updates
+        self.rejected_update_count = self.trainer.rejected_updates
+        self.last_batch_size = self.trainer.last_batch_size
+        self.last_rejection = self.trainer.last_rejection
+
+    def health_metrics(self, decisions: int) -> dict:
+        metrics = self.trainer.health_metrics(decisions)
+        metrics["gradient_applicable"] = True
+        return metrics
 
     def save(self, filename: str, model_dir: Path) -> None:
         self.model.save(filename, str(model_dir))
@@ -202,8 +277,22 @@ class TabularAlgorithm(LearningAlgorithm):
 
     def __init__(self, name: str, *, learning_rate: float = 0.15, gamma: float = GAMMA):
         super().__init__(name)
-        self.learning_rate = learning_rate
-        self.gamma = gamma
+        if (
+            isinstance(learning_rate, bool)
+            or not isinstance(learning_rate, Real)
+            or not math.isfinite(float(learning_rate))
+            or not 0.0 < learning_rate <= 1.0
+        ):
+            raise ValueError("learning_rate must be finite and in (0, 1]")
+        if (
+            isinstance(gamma, bool)
+            or not isinstance(gamma, Real)
+            or not math.isfinite(float(gamma))
+            or not 0.0 <= gamma <= 1.0
+        ):
+            raise ValueError("gamma must be finite and between 0 and 1")
+        self.learning_rate = float(learning_rate)
+        self.gamma = float(gamma)
         self.table: dict[int, np.ndarray] = {}
         # Compatibility attributes used by existing educational notebooks.
         self.model = self
@@ -217,6 +306,10 @@ class TabularAlgorithm(LearningAlgorithm):
         values = np.asarray(state, dtype=np.float32).reshape(-1)
         if values.shape != (INPUT_SIZE,):
             raise ValueError(f"state must contain {INPUT_SIZE} features")
+        if not np.isfinite(values).all():
+            raise ValueError("state must contain only finite features")
+        if not np.isin(values, (0.0, 1.0)).all():
+            raise ValueError("tabular state features must be binary")
         bits = values > 0.5
         return int(sum(int(bit) << index for index, bit in enumerate(bits)))
 
@@ -244,35 +337,73 @@ class TabularAlgorithm(LearningAlgorithm):
     def train_step(self, experiences: Sequence[Experience], epsilon: float) -> float:
         if not experiences:
             return 0.0
+        epsilon = self._validate_epsilon(epsilon)
+        self.attempted_update_count += 1
+        try:
+            validated = [validated_experience(experience) for experience in experiences]
+        except (TypeError, ValueError) as error:
+            self.rejected_update_count += 1
+            self.last_rejection = str(error)
+            raise
+        table_before = {key: values.copy() for key, values in self.table.items()}
         errors = []
         targets = []
         predictions = []
-        for experience in experiences:
-            action_values = np.asarray(experience.action)
-            if (
-                action_values.shape != (OUTPUT_SIZE,)
-                or not np.isin(action_values, (0, 1)).all()
-                or int(action_values.sum()) != 1
-            ):
-                raise ValueError("actions must be one-hot encoded")
-            row = self._row(experience.state)
-            action_index = int(action_values.argmax())
-            prediction = float(row[action_index])
-            bootstrap = (
-                0.0
-                if experience.done
-                else self._bootstrap(self._row(experience.next_state), epsilon)
-            )
-            target = float(experience.reward) + self.gamma * bootstrap
-            error = target - prediction
-            row[action_index] += self.learning_rate * error
-            errors.append(error)
-            targets.append(target)
-            predictions.append(prediction)
-        self.last_loss = float(np.mean(np.square(errors)))
-        self.last_target_mean = float(np.mean(targets))
-        self.last_predicted_mean = float(np.mean(predictions))
+        try:
+            for experience in validated:
+                action_values = np.asarray(experience.action)
+                row = self._row(experience.state)
+                action_index = int(action_values.argmax())
+                prediction = float(row[action_index])
+                bootstrap = (
+                    0.0
+                    if experience.done
+                    else self._bootstrap(self._row(experience.next_state), epsilon)
+                )
+                target = float(experience.reward) + self.gamma * bootstrap
+                error = target - prediction
+                updated = prediction + self.learning_rate * error
+                if not all(math.isfinite(value) for value in (prediction, target, error, updated)):
+                    raise FloatingPointError("tabular update produced non-finite values")
+                with np.errstate(over="ignore", invalid="ignore"):
+                    stored_update = np.float32(updated)
+                if not np.isfinite(stored_update):
+                    raise FloatingPointError(
+                        "tabular update is outside the learner's float32 range"
+                    )
+                row[action_index] = stored_update
+                errors.append(error)
+                targets.append(target)
+                predictions.append(prediction)
+        except (ValueError, FloatingPointError) as error:
+            self.table = table_before
+            self.rejected_update_count += 1
+            self.last_rejection = str(error)
+            raise
+        derived = {
+            "loss": float(np.mean(np.square(np.asarray(errors, dtype=np.float64)))),
+            "target_mean": float(np.mean(targets)),
+            "predicted_mean": float(np.mean(predictions)),
+            "td_error_abs_mean": float(np.mean(np.abs(errors))),
+            "td_error_abs_max": float(np.max(np.abs(errors))),
+        }
+        if not all(math.isfinite(value) for value in derived.values()):
+            self.table = table_before
+            self.rejected_update_count += 1
+            self.last_rejection = "tabular diagnostics became non-finite"
+            raise FloatingPointError(self.last_rejection)
+        self.last_loss = derived["loss"]
+        self.last_target_mean = derived["target_mean"]
+        self.last_predicted_mean = derived["predicted_mean"]
         self.last_gradient_norm = 0.0
+        self.last_q_abs_max = max(
+            (float(np.max(np.abs(row))) for row in self.table.values()), default=0.0
+        )
+        self.last_td_error_abs_mean = derived["td_error_abs_mean"]
+        self.last_td_error_abs_max = derived["td_error_abs_max"]
+        self.update_count += 1
+        self.last_batch_size = len(validated)
+        self.last_rejection = None
         return self.last_loss
 
     def train_transition(self, experience: Experience, epsilon: float) -> float:
@@ -281,6 +412,15 @@ class TabularAlgorithm(LearningAlgorithm):
     def save(self, filename: str = "model.pth", model_dir: Path | None = None) -> None:
         directory = Path(model_dir) if model_dir is not None else MODEL_DIR
         directory.mkdir(parents=True, exist_ok=True)
+        if not all(
+            isinstance(key, int)
+            and not isinstance(key, bool)
+            and 0 <= key < 2 ** INPUT_SIZE
+            and np.asarray(value).shape == (OUTPUT_SIZE,)
+            and np.isfinite(value).all()
+            for key, value in self.table.items()
+        ):
+            raise ValueError("Q table contains malformed or non-finite rows")
         payload = {
             "algorithm": self.name,
             "learning_rate": self.learning_rate,
@@ -290,19 +430,56 @@ class TabularAlgorithm(LearningAlgorithm):
                 for key, value in self.table.items()
             },
         }
-        torch.save(payload, directory / filename)
-        print(f"Q table saved to {directory / filename}")
+        destination = directory / filename
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{destination.name}.", suffix=".tmp", dir=str(directory)
+        )
+        os.close(descriptor)
+        try:
+            torch.save(payload, temporary_name)
+            os.replace(temporary_name, destination)
+        finally:
+            if os.path.exists(temporary_name):
+                os.unlink(temporary_name)
+        print(f"Q table saved to {destination}")
 
     def load(self, filename: str = "model.pth", model_dir: Path | None = None) -> None:
         directory = Path(model_dir) if model_dir is not None else MODEL_DIR
         path = directory / filename
         payload = torch.load(path, map_location="cpu", weights_only=True)
-        if payload.get("algorithm") != self.name or "q_table" not in payload:
+        if not isinstance(payload, dict) or payload.get("algorithm") != self.name \
+                or not isinstance(payload.get("q_table"), dict):
             raise ValueError(f"checkpoint is not compatible with {self.name}")
-        self.table = {
-            int(key): np.asarray(value, dtype=np.float32)
-            for key, value in payload["q_table"].items()
-        }
+        learning_rate = payload.get("learning_rate", self.learning_rate)
+        gamma = payload.get("gamma", self.gamma)
+        if (
+            isinstance(learning_rate, bool)
+            or not isinstance(learning_rate, Real)
+            or not math.isfinite(float(learning_rate))
+            or not 0.0 < learning_rate <= 1.0
+        ):
+            raise ValueError("checkpoint learning_rate is invalid")
+        if (
+            isinstance(gamma, bool)
+            or not isinstance(gamma, Real)
+            or not math.isfinite(float(gamma))
+            or not 0.0 <= gamma <= 1.0
+        ):
+            raise ValueError("checkpoint gamma is invalid")
+        restored: dict[int, np.ndarray] = {}
+        for raw_key, raw_value in payload["q_table"].items():
+            if isinstance(raw_key, bool) or not isinstance(raw_key, int) \
+                    or not 0 <= raw_key < 2 ** INPUT_SIZE:
+                raise ValueError("checkpoint Q-table key is invalid")
+            value = np.asarray(raw_value, dtype=np.float32)
+            if value.shape != (OUTPUT_SIZE,) or not np.isfinite(value).all():
+                raise ValueError("checkpoint Q-table row is malformed or non-finite")
+            restored[raw_key] = value.copy()
+        # Commit all validated state together; rejected loads leave the live
+        # policy and its hyperparameters unchanged.
+        self.table = restored
+        self.learning_rate = float(learning_rate)
+        self.gamma = float(gamma)
         print(f"Q table loaded from {path}")
 
     @property

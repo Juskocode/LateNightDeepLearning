@@ -97,6 +97,10 @@ def parse_args():
     )
     parser.add_argument("--screenshot", help="Save an inspector PNG and exit")
     args = parser.parse_args()
+    if args.games < 0:
+        parser.error("--games must be non-negative")
+    if args.speed <= 0:
+        parser.error("--speed must be positive")
     if args.eval_every < 0:
         parser.error("--eval-every must be non-negative")
     if args.eval_episodes is not None and args.eval_episodes <= 0:

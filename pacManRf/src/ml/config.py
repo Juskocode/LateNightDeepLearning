@@ -9,6 +9,8 @@ different observation vector without replacing any of the training machinery.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+import math
+from numbers import Integral, Real
 from typing import Any, Literal, Mapping
 
 
@@ -23,6 +25,8 @@ DEFAULT_ACTION_LABELS = ("UP", "DOWN", "LEFT", "RIGHT")
 def normalize_algorithm(value: str) -> Algorithm:
     """Return a canonical algorithm name or raise a helpful error."""
 
+    if not isinstance(value, str):
+        raise ValueError("algorithm must be 'dqn' or 'double_dqn'")
     normalized = value.strip().lower().replace("-", "_").replace(" ", "_")
     if normalized in {"ddqn", "doubleq", "double_q", "double_dqn"}:
         return "double_dqn"
@@ -57,7 +61,13 @@ class DQNConfig:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "algorithm", normalize_algorithm(self.algorithm))
-        object.__setattr__(self, "hidden_sizes", tuple(int(size) for size in self.hidden_sizes))
+        hidden_sizes = tuple(self.hidden_sizes)
+        if not hidden_sizes or any(
+            isinstance(size, bool) or not isinstance(size, Integral) or int(size) <= 0
+            for size in hidden_sizes
+        ):
+            raise ValueError("hidden_sizes must contain positive integer layer sizes")
+        object.__setattr__(self, "hidden_sizes", tuple(int(size) for size in hidden_sizes))
         object.__setattr__(self, "action_labels", tuple(str(label) for label in self.action_labels))
 
         positive_ints = {
@@ -70,12 +80,35 @@ class DQNConfig:
             "epsilon_decay_steps": self.epsilon_decay_steps,
         }
         for name, value in positive_ints.items():
-            if int(value) <= 0:
-                raise ValueError(f"{name} must be positive")
-        if not self.hidden_sizes or any(size <= 0 for size in self.hidden_sizes):
-            raise ValueError("hidden_sizes must contain positive layer sizes")
+            if isinstance(value, bool) or not isinstance(value, Integral) or int(value) <= 0:
+                raise ValueError(f"{name} must be a positive integer")
+        if (
+            isinstance(self.replay_warmup, bool)
+            or not isinstance(self.replay_warmup, Integral)
+        ):
+            raise ValueError("replay_warmup must be an integer")
+        if self.seed is not None and (
+            isinstance(self.seed, bool) or not isinstance(self.seed, Integral)
+        ):
+            raise ValueError("seed must be an integer or None")
         if len(self.action_labels) != self.action_size:
             raise ValueError("action_labels length must equal action_size")
+        if any(not label.strip() for label in self.action_labels):
+            raise ValueError("action_labels cannot contain empty labels")
+        if len(set(self.action_labels)) != len(self.action_labels):
+            raise ValueError("action_labels must be unique")
+
+        finite_numbers = {
+            "learning_rate": self.learning_rate,
+            "gamma": self.gamma,
+            "epsilon_start": self.epsilon_start,
+            "epsilon_end": self.epsilon_end,
+            "gradient_clip": self.gradient_clip,
+            "weight_decay": self.weight_decay,
+        }
+        for name, value in finite_numbers.items():
+            if isinstance(value, bool) or not isinstance(value, Real) or not math.isfinite(float(value)):
+                raise ValueError(f"{name} must be finite")
         if not 0.0 <= self.gamma <= 1.0:
             raise ValueError("gamma must be between 0 and 1")
         if self.learning_rate <= 0:
@@ -88,6 +121,8 @@ class DQNConfig:
             raise ValueError("epsilon values must satisfy 0 <= end <= start <= 1")
         if self.gradient_clip <= 0:
             raise ValueError("gradient_clip must be positive")
+        if not isinstance(self.device, str) or not self.device.strip():
+            raise ValueError("device must be a non-empty string")
 
     def to_dict(self) -> dict[str, Any]:
         """Return a checkpoint-friendly representation."""

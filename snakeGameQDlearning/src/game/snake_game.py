@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import Counter, deque
+from numbers import Integral
 from pathlib import Path
 import random
 from typing import Optional, Sequence, Tuple
@@ -75,6 +76,16 @@ class SnakeGameAI:
         randomize_start: bool = False,
         process_events: bool = True,
     ):
+        for name, value in (("width", width), ("height", height), ("speed", speed)):
+            if isinstance(value, bool) or not isinstance(value, Integral) or value <= 0:
+                raise ValueError(f"{name} must be a positive integer")
+        if seed is not None and (isinstance(seed, bool) or not isinstance(seed, Integral)):
+            raise ValueError("seed must be an integer or None")
+        if not isinstance(render, bool) or not isinstance(randomize_start, bool) \
+                or not isinstance(process_events, bool):
+            raise ValueError("render, randomize_start, and process_events must be booleans")
+        width, height, speed = int(width), int(height), int(speed)
+        seed = None if seed is None else int(seed)
         if width % BLOCK_SIZE or height % BLOCK_SIZE:
             raise ValueError(f"width and height must be multiples of {BLOCK_SIZE}")
         if width < BLOCK_SIZE * 4 or height < BLOCK_SIZE * 3:
@@ -128,9 +139,14 @@ class SnakeGameAI:
     def reset(
         self, *, seed: Optional[int] = None, randomize_start: Optional[bool] = None
     ) -> None:
+        if seed is not None and (isinstance(seed, bool) or not isinstance(seed, Integral)):
+            raise ValueError("seed must be an integer or None")
+        if randomize_start is not None and not isinstance(randomize_start, bool):
+            raise ValueError("randomize_start must be boolean or None")
         if seed is not None:
-            self.rng.seed(seed)
-            self.episode_seed = seed
+            normalized_seed = int(seed)
+            self.rng.seed(normalized_seed)
+            self.episode_seed = normalized_seed
         if randomize_start is None:
             randomize_start = self.default_randomize_start
         columns = self.width // BLOCK_SIZE
@@ -658,13 +674,18 @@ class SnakeGameAI:
 
         self._label("LEARNING SIGNALS", x, y)
         y += 17
+        gradient_value = (
+            f"{float(self.telemetry.get('gradient_norm', 0.0)):.3f}"
+            if self.telemetry.get("algorithm_family") == "deep"
+            else "N/A"
+        )
         metrics = (
             ("EPSILON", f"{float(self.telemetry.get('epsilon', 0.0)):.3f}"),
             ("LOSS", f"{float(self.telemetry.get('loss', 0.0)):.4f}"),
             ("RETURN", f"{float(self.telemetry.get('episode_return', 0.0)):+.1f}"),
             ("EPISODES", str(self.telemetry.get("games", 0))),
             ("STEP", str(self.frame_iteration)),
-            ("GRAD NORM", f"{float(self.telemetry.get('gradient_norm', 0.0)):.3f}"),
+            ("GRAD NORM", gradient_value),
         )
         cell_width = width // 3
         for index, (label, value) in enumerate(metrics):
@@ -674,15 +695,81 @@ class SnakeGameAI:
             self._text(value, bx, by + 10, WHITE, self.tiny_font)
         y += 62
 
-        memory = int(self.telemetry.get("memory", 0))
-        capacity = max(1, int(self.telemetry.get("memory_capacity", 100_000)))
-        self._label("REPLAY MEMORY", x, y)
+        health = dict(self.telemetry.get("health", {}))
+        health_status = str(health.get("status", "warming_up"))
+        health_color = {
+            "healthy": GREEN,
+            "warming_up": BLUE2,
+            "warning": YELLOW,
+            "critical": RED,
+        }.get(health_status, MUTED)
+        self._label("LEARNING HEALTH", x, y)
+        status_text = health_status.upper().replace("_", " ")
+        self._chip(status_text, x + 102, y - 4, health_color)
+        finite_label = "FINITE" if health.get("finite", True) else "NON-FINITE"
         self._text(
-            f"{memory:,} / {capacity:,}", x + width - 97, y, WHITE, self.micro_font
+            finite_label,
+            x + width - 62,
+            y,
+            GREEN if health.get("finite", True) else RED,
+            self.micro_font,
+        )
+        y += 20
+        optimization = dict(health.get("optimization", {}))
+        values_health = dict(health.get("values", {}))
+        terminations = dict(health.get("terminations", {}))
+        update_ratio = float(optimization.get("update_to_decision_ratio", 0.0))
+        clip_ratio = optimization.get("clip_ratio")
+        clip_text = "N/A" if clip_ratio is None else f"{float(clip_ratio):.0%}"
+        td_mean = float(values_health.get("td_error_abs_mean", 0.0))
+        q_max = float(values_health.get("q_abs_max", 0.0))
+        counts = dict(terminations.get("counts", {}))
+        self._text(
+            f"UPD/DEC {update_ratio:.2f}   CLIP {clip_text}   |TD| {td_mean:.2f}   |Q|max {q_max:.1f}",
+            x,
+            y,
+            WHITE,
+            self.micro_font,
+        )
+        y += 14
+        alerts = list(health.get("alerts", []))
+        priority_alert = next(
+            (alert for alert in alerts if not alert.endswith("warming_up")),
+            alerts[0] if alerts else None,
+        )
+        alert_text = (
+            priority_alert.replace("_", " ")
+            if priority_alert is not None
+            else "no active alerts"
+        )
+        ending_text = (
+            f"W {int(counts.get('wall', 0))}  S {int(counts.get('self', 0))}  "
+            f"T {int(counts.get('timeout', 0))}"
+        )
+        self._text(
+            f"{alert_text[:32]}   ·   END {ending_text}",
+            x,
+            y,
+            health_color if alerts else MUTED,
+            self.micro_font,
         )
         y += 16
+
+        replay_health = dict(health.get("replay", {}))
+        replay_applicable = bool(replay_health.get("applicable", True))
+        memory = int(replay_health.get("size") or 0)
+        capacity = max(1, int(replay_health.get("capacity") or 1))
+        self._label("REPLAY MEMORY", x, y)
+        if replay_applicable:
+            readiness = "READY" if replay_health.get("ready") else "WARMING"
+            replay_text = f"{memory:,} / {capacity:,}  {readiness}"
+        else:
+            replay_text = "N/A · ON-POLICY"
+        replay_render = self.micro_font.render(replay_text, True, WHITE)
+        self.display.blit(replay_render, (x + width - replay_render.get_width(), y))
+        y += 16
         pygame.draw.rect(self.display, GRID, (x, y, width, 8), border_radius=4)
-        fill = min(width, round(width * memory / capacity))
+        fill = min(width, round(width * memory / capacity)) if replay_applicable else 0
         if fill:
             pygame.draw.rect(self.display, BLUE2, (x, y, fill, 8), border_radius=4)
         y += 13

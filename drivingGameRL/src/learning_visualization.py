@@ -159,6 +159,24 @@ def _compact_number(value: float) -> str:
     return f"{value:.3f}"
 
 
+def _health_alert_label(value: object) -> str:
+    """Turn one stable alert code into a compact actionable HUD label."""
+
+    code = str(value)
+    if code.startswith("worker_failure:"):
+        return "WORKER FAIL"
+    if code.startswith(("non_finite:", "malformed:", "out_of_range:")):
+        return "INVALID METRIC"
+    labels = {
+        "gradient_clipping": "GRAD CLIPPING",
+        "high_safety_intervention_rate": "SAFETY HIGH",
+        "high_wall_contact_rate": "WALL CONTACT",
+        "collision_loop_termination": "COLLISION LOOP",
+        "nonfinite_update_rejected": "UPDATE REJECT",
+    }
+    return labels.get(code, code.replace("_", " ").upper())
+
+
 class DrivingLearningVisualization:
     """Draw a complete learning observatory onto one reusable Pygame surface."""
 
@@ -1324,9 +1342,7 @@ class DrivingLearningVisualization:
             color=(
                 COLORS["green"]
                 if clearance >= threshold and not closing
-                else COLORS["orange"]
-                if not contact
-                else COLORS["red"]
+                else COLORS["orange"] if not contact else COLORS["red"]
             ),
             bold=True,
         )
@@ -1364,9 +1380,7 @@ class DrivingLearningVisualization:
         elif closing:
             wall_state, wall_color = "WALL CLOSING · GAIN CLEARANCE", COLORS["orange"]
         else:
-            green_fraction = max(
-                0.0, min(1.0, _finite(data.get("green_ray_fraction")))
-            )
+            green_fraction = max(0.0, min(1.0, _finite(data.get("green_ray_fraction"))))
             wall_state = f"CLEAR · GREEN RAYS {green_fraction * 100:.0f}%"
             wall_color = COLORS["green"]
         self._text(
@@ -1385,18 +1399,12 @@ class DrivingLearningVisualization:
             proposed,
         )
         proposed_label = (
-            ACTION_LABELS[proposed]
-            if 0 <= proposed < len(ACTION_LABELS)
-            else "--"
+            ACTION_LABELS[proposed] if 0 <= proposed < len(ACTION_LABELS) else "--"
         )
         executed_label = (
-            ACTION_LABELS[executed]
-            if 0 <= executed < len(ACTION_LABELS)
-            else "--"
+            ACTION_LABELS[executed] if 0 <= executed < len(ACTION_LABELS) else "--"
         )
-        intervened = _flag(
-            safety.get("intervened", data.get("safety_intervened"))
-        )
+        intervened = _flag(safety.get("intervened", data.get("safety_intervened")))
         interventions = max(0, _integer(safety.get("interventions")))
         decisions = max(0, _integer(safety.get("decisions")))
         reason = self._safety_reason_label(safety.get("reason"))
@@ -2000,7 +2008,7 @@ class DrivingLearningVisualization:
             telemetry=data,
         )
         x, top, width, gap = 792, 94, 588, 8
-        card_width = (width - gap * 3) // 4
+        card_width = (width - gap * 4) // 5
         algorithm = (
             str(data.get("algorithm", data.get("method", "DQN + GENETIC")))
             .replace("_", " ")
@@ -2044,6 +2052,40 @@ class DrivingLearningVisualization:
             generation_detail = f"member {member + 1}/{max(1, population_size)}"
         fitness = _finite(data.get("current_fitness", data.get("fitness")))
         epsilon = _finite(data.get("epsilon"))
+        health = _mapping(data.get("health"))
+        health_status = str(health.get("status", "warming_up")).lower()
+        health_colors = {
+            "healthy": COLORS["green"],
+            "warming_up": COLORS["yellow"],
+            "warning": COLORS["orange"],
+            "critical": COLORS["red"],
+        }
+        health_labels = {
+            "healthy": "OK",
+            "warming_up": "WARM",
+            "warning": "WARN",
+            "critical": "FAIL",
+        }
+        health_replay = _mapping(health.get("replay"))
+        health_optimization = _mapping(health.get("optimization"))
+        replay_applicable = _flag(
+            health_replay.get("applicable", health_replay.get("enabled", True))
+        )
+        optimization_applicable = _flag(
+            health_optimization.get("applicable", True)
+        )
+        diagnostic_alerts = [
+            value
+            for value in _sequence(health.get("alerts"))
+            if str(value) != "replay_warming_up"
+        ]
+        alert_count = len(diagnostic_alerts)
+        alert_detail = (
+            f"{_health_alert_label(diagnostic_alerts[0])}"
+            f" +{alert_count - 1 if alert_count > 1 else ''}"
+            if diagnostic_alerts
+            else ""
+        ).rstrip(" +")
         cards = (
             ("ALGORITHM", algorithm, algorithm_detail, COLORS["cyan"]),
             (
@@ -2061,8 +2103,30 @@ class DrivingLearningVisualization:
             (
                 "EXPLORATION",
                 f"{epsilon * 100:05.1f}%",
-                f"loss {_finite(data.get('last_loss', data.get('loss'))):.4f}",
+                (
+                    f"u/d {_finite(health_optimization.get('update_to_decision_ratio')):.2f}"
+                    if optimization_applicable
+                    else "gradient updates N/A"
+                ),
                 COLORS["magenta"],
+            ),
+            (
+                "HEALTH",
+                health_labels.get(health_status, "FAIL"),
+                (
+                    alert_detail
+                    if alert_count
+                    else (
+                        "replay N/A"
+                        if not replay_applicable
+                        else (
+                            "replay ready"
+                            if _flag(health_replay.get("ready"))
+                            else "replay warming"
+                        )
+                    )
+                ),
+                health_colors.get(health_status, COLORS["red"]),
             ),
         )
         for index, (label, value, detail, color) in enumerate(cards):
@@ -2296,44 +2360,113 @@ class DrivingLearningVisualization:
 
     def _learning_stats(self, rect: pygame.Rect, data: Mapping[str, Any]) -> None:
         replay = _mapping(data.get("replay", data.get("memory")))
+        health = _mapping(data.get("health"))
+        health_replay = _mapping(health.get("replay"))
+        optimization = _mapping(health.get("optimization"))
+        values = _mapping(health.get("values"))
+        safety = _mapping(health.get("safety"))
+        replay_applicable = _flag(
+            health_replay.get("applicable", health_replay.get("enabled", True))
+        )
+        optimization_applicable = _flag(optimization.get("applicable", True))
+        td_error_applicable = _flag(values.get("td_error_applicable", True))
         size = _integer(replay.get("size", data.get("replay_size")))
         capacity = max(
             1, _integer(replay.get("capacity", data.get("replay_capacity", 1)), 1)
         )
-        metrics = (
-            ("REPLAY", f"{size:,} / {capacity:,}", size / capacity, COLORS["blue"]),
+        status = str(health.get("status", "warming_up")).lower()
+        status_color = {
+            "healthy": COLORS["green"],
+            "warming_up": COLORS["yellow"],
+            "warning": COLORS["orange"],
+            "critical": COLORS["red"],
+        }.get(status, COLORS["red"])
+        clip_ratio = max(0.0, _finite(optimization.get("clip_ratio")))
+        update_ratio = max(0.0, _finite(optimization.get("update_to_decision_ratio")))
+        intervention_rate = max(0.0, _finite(safety.get("intervention_rate")))
+        contact_rate = max(0.0, _finite(safety.get("wall_contact_rate")))
+        health_alerts = _sequence(health.get("alerts"))
+        priority_alert = next(
             (
-                "EPSILON",
-                f"{_finite(data.get('epsilon')):.3f}",
-                _finite(data.get("epsilon")),
-                COLORS["magenta"],
+                value
+                for value in health_alerts
+                if str(value) != "replay_warming_up"
+            ),
+            health_alerts[0] if health_alerts else None,
+        )
+        alert_label = (
+            _health_alert_label(priority_alert) if priority_alert is not None else "NONE"
+        )
+        metrics = (
+            (
+                "HEALTH",
+                status.replace("_", " ").upper(),
+                1.0,
+                status_color,
             ),
             (
-                "LOSS",
-                f"{_finite(data.get('last_loss', data.get('loss'))):.5f}",
-                min(1.0, _finite(data.get("last_loss", data.get("loss")))),
+                "REPLAY",
+                (
+                    "N/A"
+                    if not replay_applicable
+                    else (
+                        "READY"
+                        if _flag(health_replay.get("ready"))
+                        else f"{size:,}/{capacity:,}"
+                    )
+                ),
+                size / capacity if replay_applicable else 0.0,
+                COLORS["blue"],
+            ),
+            (
+                "UPDATE / DEC",
+                f"{update_ratio:.3f}" if optimization_applicable else "N/A",
+                min(1.0, update_ratio) if optimization_applicable else 0.0,
+                COLORS["green"],
+            ),
+            (
+                "GRAD CLIPPED",
+                f"{clip_ratio * 100:.1f}%" if optimization_applicable else "N/A",
+                min(1.0, clip_ratio) if optimization_applicable else 0.0,
                 COLORS["red"],
             ),
             (
-                "TD ERROR",
-                f"{_finite(data.get('mean_absolute_td_error', data.get('td_error'))):.5f}",
-                min(
-                    1.0,
-                    _finite(data.get("mean_absolute_td_error", data.get("td_error"))),
+                "MAX |Q|",
+                f"{_finite(values.get('q_abs_max')):.4f}",
+                min(1.0, abs(_finite(values.get("q_abs_max"))) / 10.0),
+                COLORS["cyan"],
+            ),
+            (
+                "MEAN |TD|",
+                (
+                    f"{_finite(values.get('td_error_abs_mean')):.4f}"
+                    if td_error_applicable
+                    else "N/A"
+                ),
+                (
+                    min(1.0, _finite(values.get("td_error_abs_mean")))
+                    if td_error_applicable
+                    else 0.0
                 ),
                 COLORS["orange"],
             ),
             (
-                "GRAD STEPS",
-                f"{_integer(data.get('gradient_steps')):,}",
-                1.0,
-                COLORS["green"],
+                "SAFETY FILTER",
+                f"{intervention_rate * 100:.1f}%",
+                intervention_rate,
+                COLORS["yellow"],
             ),
             (
-                "TARGET SYNCS",
-                f"{_integer(data.get('target_syncs')):,}",
-                1.0 if _integer(data.get("target_syncs")) else 0.0,
-                COLORS["cyan"],
+                "WALL CONTACT",
+                f"{contact_rate * 100:.2f}%",
+                min(1.0, contact_rate * 5.0),
+                COLORS["red"],
+            ),
+            (
+                "ALERT",
+                alert_label,
+                1.0 if priority_alert is not None else 0.0,
+                status_color if priority_alert is not None else COLORS["muted"],
             ),
         )
         self._panel(rect, "LEARNING SIGNAL", accent=COLORS["magenta"])
@@ -2407,6 +2540,10 @@ class DrivingLearningVisualization:
     def _buffer_panel(self, rect: pygame.Rect, data: Mapping[str, Any]) -> None:
         self._panel(rect, "EXPERIENCE REPLAY", accent=COLORS["blue"])
         replay = _mapping(data.get("replay", data.get("memory")))
+        health_replay = _mapping(_mapping(data.get("health")).get("replay"))
+        replay_applicable = _flag(
+            health_replay.get("applicable", health_replay.get("enabled", True))
+        )
         size = max(0, _integer(replay.get("size", data.get("replay_size"))))
         capacity = max(
             1, _integer(replay.get("capacity", data.get("replay_capacity", 1)), 1)
@@ -2438,8 +2575,24 @@ class DrivingLearningVisualization:
             )
         stats = (
             ("FILL", f"{ratio * 100:.1f}%"),
-            ("MEAN R", f"{_finite(replay.get('mean_reward')):+.3f}"),
-            ("TERMINAL", f"{_integer(replay.get('terminal')):,}"),
+            (
+                "STATE",
+                (
+                    "N/A"
+                    if not replay_applicable
+                    else (
+                        "READY" if _flag(health_replay.get("ready")) else "WARMING"
+                    )
+                ),
+            ),
+            (
+                "NEEDED",
+                (
+                    f"{_integer(health_replay.get('readiness_threshold')):,}"
+                    if replay_applicable
+                    else "N/A"
+                ),
+            ),
             (
                 "BATCH",
                 f"{_integer(data.get('batch_size', replay.get('batch_size'))):,}",

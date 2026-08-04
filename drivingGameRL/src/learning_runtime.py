@@ -20,6 +20,7 @@ import numpy as np
 import torch
 
 from .environment import DrivingAction, DrivingEnv, StepResult
+from .learning_health import build_learning_health
 from .ml import (
     DQNConfig,
     DrivingDQNAgent,
@@ -54,7 +55,9 @@ class LearningRuntimeConfig:
 
     def __post_init__(self) -> None:
         if self.algorithm not in ("dqn", "double_dqn", "genetic", "genetic_dqn"):
-            raise ValueError(f"Unsupported driving learning algorithm: {self.algorithm}")
+            raise ValueError(
+                f"Unsupported driving learning algorithm: {self.algorithm}"
+            )
         integer_fields = (
             "seed",
             "evaluation_steps",
@@ -78,12 +81,20 @@ class LearningRuntimeConfig:
             raise ValueError("tournament_size must be in [1, population_size]")
         if self.crossover not in ("uniform", "blend"):
             raise ValueError("crossover must be 'uniform' or 'blend'")
+        if not isinstance(self.circuit, str) or not self.circuit.strip():
+            raise ValueError("circuit must be a non-empty string")
         for name in ("crossover_rate", "mutation_rate"):
-            value = float(getattr(self, name))
+            raw_value = getattr(self, name)
+            if isinstance(raw_value, bool) or not isinstance(raw_value, (int, float)):
+                raise ValueError(f"{name} must be finite and in [0, 1]")
+            value = float(raw_value)
             if not math.isfinite(value) or not 0.0 <= value <= 1.0:
                 raise ValueError(f"{name} must be in [0, 1]")
         for name in ("blend_alpha", "mutation_std"):
-            value = float(getattr(self, name))
+            raw_value = getattr(self, name)
+            if isinstance(raw_value, bool) or not isinstance(raw_value, (int, float)):
+                raise ValueError(f"{name} must be finite and non-negative")
+            value = float(raw_value)
             if not math.isfinite(value) or value < 0.0:
                 raise ValueError(f"{name} must be finite and non-negative")
         if self.parallel_workers is not None and (
@@ -118,6 +129,12 @@ class DrivingLearningSession:
         self._loss_history: deque[float] = deque(maxlen=300)
         self._epsilon_history: deque[float] = deque(maxlen=300)
         self._environment_decisions = 0
+        self._health_decision_origin = 0
+        self._health_update_origin = 0
+        self._health_clip_origin = 0
+        self._health_nonfinite_origin = 0
+        self._wall_contact_decisions = 0
+        self._collision_loop_terminations = 0
         self.clearance_policy = SensorClearancePolicy()
         self._safety_stats = SensorClearanceStats()
 
@@ -316,7 +333,13 @@ class DrivingLearningSession:
         executed_action = safety_decision.executed_action
         result = self.env.step(executed_action)
         self._environment_decisions += 1
+        self._wall_contact_decisions += int(
+            bool(result.info.get("wall_contact_active", False))
+        )
         done = result.terminated or result.truncated
+        self._collision_loop_terminations += int(
+            done and bool(result.info.get("collision_looped", False))
+        )
         # Replay receives the action that caused the transition. Crediting an
         # overridden unsafe proposal with the safety prior's reward would teach
         # the wrong Q-value and invite reliance on the filter.
@@ -396,9 +419,7 @@ class DrivingLearningSession:
         if math.isfinite(loss):
             self._loss_history.append(loss)
         epsilon = (
-            0.0
-            if self.config.algorithm == "genetic"
-            else float(self.agent.epsilon)
+            0.0 if self.config.algorithm == "genetic" else float(self.agent.epsilon)
         )
         if math.isfinite(epsilon):
             self._epsilon_history.append(epsilon)
@@ -469,9 +490,7 @@ class DrivingLearningSession:
         linear_start = min(schedule_step, decay)
         linear_stop = min(schedule_step + lifetime, decay)
         linear_count = max(0, linear_stop - linear_start)
-        progress_sum = (
-            linear_count * (linear_start + linear_stop - 1) / (2.0 * decay)
-        )
+        progress_sum = linear_count * (linear_start + linear_stop - 1) / (2.0 * decay)
         progress_sum += lifetime - linear_count
         mean_epsilon = config.epsilon_start + (
             config.epsilon_end - config.epsilon_start
@@ -524,9 +543,9 @@ class DrivingLearningSession:
                             or (
                                 "evaluating"
                                 if index in active_indices
-                                else "evaluated"
-                                if member.get("evaluated")
-                                else "queued"
+                                else (
+                                    "evaluated" if member.get("evaluated") else "queued"
+                                )
                             )
                         ),
                         "elite": False,
@@ -625,7 +644,11 @@ class DrivingLearningSession:
             # Auto-evolution normally installs generation zero's successor in
             # the same step. This fallback protects custom non-auto trainers.
             self.agent = self._population_trainer.champion_agent()
-        agent_learning = self.agent.telemetry(observation)
+        agent_learning = (
+            dict(learning)
+            if self.is_population and isinstance(learning, Mapping)
+            else self.agent.telemetry(observation)
+        )
         # The visualizer receives the exact network. It may down-sample nodes and
         # edges for legibility, but never invents values.
         network = self.agent.network_snapshot(observation)
@@ -650,6 +673,12 @@ class DrivingLearningSession:
         )
         executed_action = safety.get("executed_action", proposed_action)
         epsilon_schedule = self._epsilon_schedule_telemetry()
+        environment_value = snapshot.get("environment")
+        environment_snapshot = (
+            dict(environment_value)
+            if isinstance(environment_value, Mapping)
+            else self.env.telemetry()
+        )
         snapshot.update(
             {
                 "mode": "population" if self.is_population else "episode",
@@ -698,9 +727,57 @@ class DrivingLearningSession:
                 "epsilon_history": list(self._epsilon_history),
                 "fitness": snapshot.get("current_fitness", 0.0),
                 "network": network,
-                "environment": self.env.telemetry(),
+                "environment": environment_snapshot,
             }
         )
+        if self.is_population:
+            raw_health = snapshot.get("health")
+            health = dict(raw_health) if isinstance(raw_health, Mapping) else {}
+        else:
+            session_learning = dict(agent_learning)
+            session_learning["nonfinite_update_rejections"] = max(
+                0,
+                self.agent.nonfinite_update_rejections
+                - self._health_nonfinite_origin,
+            )
+            health = build_learning_health(
+                learning=session_learning,
+                replay=replay,
+                safety=safety,
+                environment=snapshot["environment"],
+                throughput={"workers": 1},
+                environment_decisions=max(
+                    0, self.environment_decisions - self._health_decision_origin
+                ),
+                batch_size=self.agent.config.batch_size,
+                warmup_steps=self.agent.config.warmup_steps,
+                gradient_clip=self.agent.config.gradient_clip,
+                optimization_updates=max(
+                    0, self.agent.gradient_steps - self._health_update_origin
+                ),
+                gradient_clip_events=max(
+                    0,
+                    self.agent.gradient_clip_events - self._health_clip_origin,
+                ),
+                wall_contact_decisions=self._wall_contact_decisions,
+                collision_loop_terminations=self._collision_loop_terminations,
+            )
+            agent_health = agent_learning.get("health")
+            if isinstance(agent_health, Mapping) and not bool(
+                agent_health.get("finite", True)
+            ):
+                health["finite"] = False
+                health["status"] = "critical"
+                health["alerts"] = list(
+                    dict.fromkeys(
+                        [
+                            *health["alerts"],
+                            *(str(value) for value in agent_health.get("alerts", ())),
+                        ]
+                    )
+                )
+        snapshot["health"] = health
+        snapshot["learning_status"] = health.get("status", "critical")
         return snapshot
 
     def save(self, path: str | Path) -> Path:
@@ -737,9 +814,6 @@ class DrivingLearningSession:
 
     def load(self, path: str | Path) -> None:
         checkpoint = Path(path).expanduser().resolve()
-        # The policy is stateless and its counters are observability only, so
-        # loading never mutates or extends the checkpoint payload.
-        self._safety_stats = SensorClearanceStats()
         if self.is_population:
             self._population_trainer.load(checkpoint)
             self.env = self._population_trainer.env
@@ -747,10 +821,36 @@ class DrivingLearningSession:
             self.observation = self._population_trainer.observation
         else:
             state = self.agent.read_checkpoint(checkpoint)
+            curriculum_state = state.get("environment_curriculum", {})
+            if not isinstance(curriculum_state, Mapping):
+                raise ValueError("checkpoint environment_curriculum must be a mapping")
+            curriculum_value = curriculum_state.get(
+                "unlocked", curriculum_state.get("ready", False)
+            )
+            if not isinstance(curriculum_value, bool):
+                raise ValueError(
+                    "checkpoint curriculum unlocked state must be a boolean"
+                )
+            rng_state = state.get("environment_rng_state")
+            if rng_state is not None:
+                import random
+
+                rng_probe = random.Random()
+                try:
+                    rng_probe.setstate(rng_state)
+                except (TypeError, ValueError) as error:
+                    raise ValueError(
+                        "checkpoint environment RNG state is malformed"
+                    ) from error
             self.agent.load_state_dict(state)
             self._environment_decisions = int(self.agent.environment_steps)
-            self.env.load_curriculum_state(state.get("environment_curriculum", {}))
-            rng_state = state.get("environment_rng_state")
+            self._health_decision_origin = self._environment_decisions
+            self._health_update_origin = int(self.agent.gradient_steps)
+            self._health_clip_origin = int(self.agent.gradient_clip_events)
+            self._health_nonfinite_origin = int(
+                self.agent.nonfinite_update_rejections
+            )
+            self.env.load_curriculum_state(curriculum_state)
             if rng_state is None:
                 # Backward-compatible checkpoints predate the environment RNG
                 # payload, so retain their former deterministic seed behavior.
@@ -766,6 +866,12 @@ class DrivingLearningSession:
             # new complete evaluation is available, its loaded policy is the
             # honest best-available opponent for the P race.
             self._champion = self.agent.clone(seed=self.config.seed + 1)
+        # These session-window diagnostics reset only after the checkpoint and
+        # its nested state have loaded successfully. A rejected load therefore
+        # leaves both the learner and its observability window unchanged.
+        self._safety_stats = SensorClearanceStats()
+        self._wall_contact_decisions = 0
+        self._collision_loop_terminations = 0
         self._checkpoint_path = checkpoint
         self._last_event = "checkpoint_loaded"
 

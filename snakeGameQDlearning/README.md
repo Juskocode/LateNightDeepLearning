@@ -114,3 +114,22 @@ flags, and four food-direction flags. This compact representation makes the
 tabular algorithms possible, but it is partially observable: it cannot describe
 the entire body layout. Comparing the methods is therefore an exercise in both
 RL algorithms and representation limits.
+
+## Live learner health
+
+The inspector labels each run `HEALTHY`, `WARMING UP`, `WARNING`, or `CRITICAL`
+and shows the first actionable alert. Its health row reports replay readiness,
+optimizer updates per training decision, gradient clipping, maximum absolute Q
+value, mean absolute TD error, and wall/self/timeout/win counts. Held-out
+evaluation availability and the train–evaluation gap remain separate evidence.
+
+Signals keep their mathematical meaning across backends. Expected SARSA marks
+replay `N/A`; both tabular methods mark gradient diagnostics `N/A` while still
+reporting their real Q and TD values. Evaluation decisions are counted
+separately and never dilute the training update ratio.
+
+Transitions are validated before replay or Q-table mutation, including
+float32-range checks. Neural and tabular checkpoints validate complete payloads
+before committing a policy, and model plus JSON metadata writes use atomic
+replacement. Corrupt files are skipped cleanly; supported legacy MLP migration
+remains available.

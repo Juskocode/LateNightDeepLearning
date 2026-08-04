@@ -294,9 +294,7 @@ class DrivingLearningGame:
                 "training_speed": self.steps_per_frame,
                 "training_speed_label": self.speed_label,
                 "requested_training_steps_per_frame": self.steps_per_frame,
-                "effective_training_steps_per_frame": (
-                    self._last_training_slice_steps
-                ),
+                "effective_training_steps_per_frame": (self._last_training_slice_steps),
                 "frame_training_steps": self._last_training_slice_steps,
                 "training_slice_capped": self._training_slice_capped,
                 "training_frame_budget_ms": self.training_frame_budget_ms,
@@ -320,6 +318,24 @@ class DrivingLearningGame:
                 "population_preview_count": len(rollouts),
             }
         )
+        health_value = data.get("health")
+        if isinstance(health_value, dict):
+            health = dict(health_value)
+            throughput = dict(health.get("throughput", {}))
+            throughput.update(
+                {
+                    "decisions_per_second": max(
+                        0.0, float(self._environment_decisions_per_second)
+                    ),
+                    "ticks_per_second": max(
+                        0.0, float(self._training_ticks_per_second)
+                    ),
+                    "frame_time_ms": max(0.0, float(self._frame_time_ms)),
+                    "render_fps": max(0.0, float(self._render_fps)),
+                }
+            )
+            health["throughput"] = throughput
+            data["health"] = health
         return data
 
     def _advance_training_slice(
@@ -392,8 +408,7 @@ class DrivingLearningGame:
             self._estimated_training_tick_ms = (
                 sample_tick_ms
                 if self._estimated_training_tick_ms <= 0.0
-                else self._estimated_training_tick_ms * 0.70
-                + sample_tick_ms * 0.30
+                else self._estimated_training_tick_ms * 0.70 + sample_tick_ms * 0.30
             )
             self.training_steps += completed
             advanced += completed

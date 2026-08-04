@@ -10,9 +10,10 @@ results do not depend on the host machine's frame rate.
 from __future__ import annotations
 
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from enum import IntEnum
-from numbers import Integral
+import math
+from numbers import Integral, Real
 from typing import Sequence
 
 import numpy as np
@@ -78,6 +79,16 @@ class RewardConfig:
     game_over: float = -25.0
     level_cleared: float = 500.0
 
+    def __post_init__(self) -> None:
+        for reward_field in fields(self):
+            value = getattr(self, reward_field.name)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, Real)
+                or not math.isfinite(float(value))
+            ):
+                raise ValueError(f"reward {reward_field.name} must be a finite number")
+
 
 @dataclass
 class _PendingStep:
@@ -128,10 +139,21 @@ class PacmanEnv:
         max_episode_steps: int | None = None,
         rewards: RewardConfig | None = None,
     ) -> None:
-        if not 0 < frame_dt <= 0.05:
+        if (
+            isinstance(frame_dt, bool)
+            or not isinstance(frame_dt, Real)
+            or not math.isfinite(float(frame_dt))
+            or not 0 < frame_dt <= 0.05
+        ):
             raise ValueError("frame_dt must be in the interval (0, 0.05]")
-        if max_episode_steps is not None and max_episode_steps < 1:
-            raise ValueError("max_episode_steps must be positive or None")
+        if isinstance(seed, bool) or not isinstance(seed, Integral):
+            raise ValueError("seed must be an integer")
+        if max_episode_steps is not None and (
+            isinstance(max_episode_steps, bool)
+            or not isinstance(max_episode_steps, Integral)
+            or max_episode_steps < 1
+        ):
+            raise ValueError("max_episode_steps must be a positive integer or None")
 
         self.seed = int(seed)
         self.frame_dt = float(frame_dt)
@@ -181,6 +203,8 @@ class PacmanEnv:
         """
 
         if seed is not None:
+            if isinstance(seed, bool) or not isinstance(seed, Integral):
+                raise ValueError("seed must be an integer or None")
             self.seed = int(seed)
             self.game.rng.seed(self.seed)
         self.game.running = True
@@ -441,7 +465,7 @@ class PacmanEnv:
 
     @staticmethod
     def _coerce_action(action: int | Sequence[int | float]) -> int:
-        if isinstance(action, Integral):
+        if isinstance(action, Integral) and not isinstance(action, (bool, np.bool_)):
             index = int(action)
         else:
             values = np.asarray(action, dtype=np.float32)
@@ -520,6 +544,10 @@ class PacmanEnv:
         observation = np.asarray(values, dtype=np.float32)
         if observation.shape != (self.observation_size,):
             raise RuntimeError(f"observation contract changed unexpectedly: {observation.shape}")
+        if not np.isfinite(observation).all():
+            raise RuntimeError("observation contract produced non-finite values")
+        if not np.all((0.0 <= observation) & (observation <= 1.0)):
+            raise RuntimeError("observation contract produced values outside [0, 1]")
         return observation
 
     def _directional_proximity(

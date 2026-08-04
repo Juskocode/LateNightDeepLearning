@@ -18,7 +18,7 @@ from collections import deque
 from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import asdict, dataclass, field, fields, replace
 import math
 import os
 from pathlib import Path
@@ -30,6 +30,7 @@ import numpy as np
 import torch
 
 from ..environment import DrivingAction, DrivingEnv, StepResult
+from ..learning_health import build_learning_health
 from ..sensor_clearance import (
     SensorClearanceDecision,
     SensorClearancePolicy,
@@ -116,7 +117,18 @@ class EvolutionConfig:
 
     @classmethod
     def from_dict(cls, values: Mapping[str, Any]) -> "EvolutionConfig":
-        return cls(**dict(values))
+        if not isinstance(values, Mapping):
+            raise ValueError("EvolutionConfig payload must be a mapping")
+        allowed = {item.name for item in fields(cls)}
+        unexpected = sorted(set(values) - allowed)
+        if unexpected:
+            raise ValueError(
+                "EvolutionConfig contains unexpected fields: " + ", ".join(unexpected)
+            )
+        try:
+            return cls(**dict(values))
+        except (TypeError, ValueError) as error:
+            raise ValueError(f"invalid EvolutionConfig payload: {error}") from error
 
     @staticmethod
     def _positive_int(name: str, value: object) -> None:
@@ -157,12 +169,42 @@ class EvaluationResult:
     mean_loss: float = 0.0
     training_updates: int = 0
 
+    def __post_init__(self) -> None:
+        for name in (
+            "generation",
+            "member_id",
+            "steps",
+            "laps",
+            "collisions",
+            "training_updates",
+        ):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"{name} must be a non-negative integer")
+        for name in ("fitness", "total_reward", "progress", "mean_loss"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError(f"{name} must be finite")
+            if not math.isfinite(float(value)):
+                raise ValueError(f"{name} must be finite")
+        if not 0.0 <= float(self.progress) <= 1.0:
+            raise ValueError("progress must be in [0, 1]")
+        if not isinstance(self.terminated, bool) or not isinstance(
+            self.truncated, bool
+        ):
+            raise ValueError("terminated and truncated must be booleans")
+
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
     @classmethod
     def from_dict(cls, values: Mapping[str, Any]) -> "EvaluationResult":
-        return cls(**dict(values))
+        if not isinstance(values, Mapping):
+            raise ValueError("EvaluationResult payload must be a mapping")
+        try:
+            return cls(**dict(values))
+        except (TypeError, ValueError) as error:
+            raise ValueError(f"invalid EvaluationResult payload: {error}") from error
 
 
 # Both terms are useful in educational material.  Keep them as one concrete
@@ -214,6 +256,32 @@ class GenerationRecord:
     population_size: int
     genome_diversity: float
 
+    def __post_init__(self) -> None:
+        for name in ("generation", "champion_id", "population_size"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"{name} must be a non-negative integer")
+        if self.population_size < 1:
+            raise ValueError("population_size must be positive")
+        if not isinstance(self.elite_ids, tuple) or any(
+            isinstance(value, bool) or not isinstance(value, int) or value < 0
+            for value in self.elite_ids
+        ):
+            raise ValueError("elite_ids must contain non-negative integers")
+        for name in (
+            "best_fitness",
+            "mean_fitness",
+            "median_fitness",
+            "worst_fitness",
+            "fitness_std",
+            "genome_diversity",
+        ):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError(f"{name} must be finite")
+            if not math.isfinite(float(value)):
+                raise ValueError(f"{name} must be finite")
+
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
         data["elite_ids"] = list(self.elite_ids)
@@ -221,9 +289,14 @@ class GenerationRecord:
 
     @classmethod
     def from_dict(cls, values: Mapping[str, Any]) -> "GenerationRecord":
+        if not isinstance(values, Mapping):
+            raise ValueError("GenerationRecord payload must be a mapping")
         data = dict(values)
-        data["elite_ids"] = tuple(data["elite_ids"])
-        return cls(**data)
+        try:
+            data["elite_ids"] = tuple(data["elite_ids"])
+            return cls(**data)
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError(f"invalid GenerationRecord payload: {error}") from error
 
 
 GenerationStats = GenerationRecord
@@ -238,6 +311,26 @@ class ChampionSnapshot:
     fitness: float
     result: EvaluationResult
 
+    def __post_init__(self) -> None:
+        for name in ("generation", "member_id"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"{name} must be a non-negative integer")
+        if (
+            isinstance(self.fitness, bool)
+            or not isinstance(self.fitness, (int, float))
+            or not math.isfinite(float(self.fitness))
+        ):
+            raise ValueError("fitness must be finite")
+        if not isinstance(self.result, EvaluationResult):
+            raise ValueError("result must be an EvaluationResult")
+        if self.member_id != self.result.member_id:
+            raise ValueError("champion member_id must match its result")
+        if self.generation != self.result.generation:
+            raise ValueError("champion generation must match its result")
+        if float(self.fitness) != float(self.result.fitness):
+            raise ValueError("champion fitness must match its result")
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "generation": self.generation,
@@ -248,16 +341,21 @@ class ChampionSnapshot:
 
     @classmethod
     def from_dict(cls, values: Mapping[str, Any]) -> "ChampionSnapshot":
+        if not isinstance(values, Mapping):
+            raise ValueError("ChampionSnapshot payload must be a mapping")
         data = dict(values)
-        result = data["result"]
-        if not isinstance(result, EvaluationResult):
-            result = EvaluationResult.from_dict(result)
-        return cls(
-            generation=int(data["generation"]),
-            member_id=int(data["member_id"]),
-            fitness=float(data["fitness"]),
-            result=result,
-        )
+        try:
+            result = data["result"]
+            if not isinstance(result, EvaluationResult):
+                result = EvaluationResult.from_dict(result)
+            return cls(
+                generation=data["generation"],
+                member_id=data["member_id"],
+                fitness=data["fitness"],
+                result=result,
+            )
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError(f"invalid ChampionSnapshot payload: {error}") from error
 
 
 @dataclass(frozen=True, slots=True)
@@ -318,6 +416,8 @@ class _MemberAdvance:
     budget_reached: bool
     done: bool
     loss: float | None
+    gradient_updated: bool
+    gradient_clipped: bool
 
 
 class PopulationTrainer:
@@ -375,6 +475,10 @@ class PopulationTrainer:
         self._closed = False
         self._worker_failure: BaseException | None = None
         self._environment_decisions = 0
+        self._optimization_updates = 0
+        self._gradient_clip_events = 0
+        self._wall_contact_decisions = 0
+        self._collision_loop_terminations = 0
         self._last_tick_member_count = 0
         self._last_batch_ticks = 0
         self._last_batch_decisions = 0
@@ -763,6 +867,15 @@ class PopulationTrainer:
             runtime.total_reward += float(advance.env_result.reward)
             runtime.last_reward = float(advance.env_result.reward)
             runtime.last_info = dict(advance.env_result.info)
+            self._optimization_updates += int(advance.gradient_updated)
+            self._gradient_clip_events += int(advance.gradient_clipped)
+            self._wall_contact_decisions += int(
+                bool(advance.env_result.info.get("wall_contact_active", False))
+            )
+            self._collision_loop_terminations += int(
+                advance.done
+                and bool(advance.env_result.info.get("collision_looped", False))
+            )
             if advance.loss is not None and math.isfinite(advance.loss):
                 runtime.losses.append(advance.loss)
             if bool(advance.env_result.info.get("curriculum_lap_completed", False)):
@@ -1011,6 +1124,13 @@ class PopulationTrainer:
         learning = None if member is None else member.agent.telemetry(self._observation)
         replay_size = sum(len(item.agent.replay) for item in self.population)
         replay_capacity = sum(item.agent.replay.capacity for item in self.population)
+        replay_readiness = max(
+            self.dqn_config.batch_size,
+            self.dqn_config.warmup_steps,
+        )
+        replay_ready_members = sum(
+            len(item.agent.replay) >= replay_readiness for item in self.population
+        )
         population = []
         active_indices = self.active_member_indices
         active_set = set(active_indices)
@@ -1075,11 +1195,76 @@ class PopulationTrainer:
             "population_decisions": safety_decisions,
             "population_interventions": safety_interventions,
             "population_intervention_rate": (
-                safety_interventions / safety_decisions
-                if safety_decisions
-                else 0.0
+                safety_interventions / safety_decisions if safety_decisions else 0.0
             ),
         }
+        environment_snapshot = self.env.telemetry()
+        health_learning = dict(learning or {})
+        if self.population:
+            gradient_norms = [
+                float(item.agent.last_gradient_norm) for item in self.population
+            ]
+            health_learning["gradient_norm"] = (
+                max(gradient_norms)
+                if all(math.isfinite(value) for value in gradient_norms)
+                else math.nan
+            )
+        health = build_learning_health(
+            learning=health_learning,
+            replay={
+                "size": replay_size,
+                "capacity": replay_capacity,
+                "ready": (
+                    self.config.algorithm == "genetic"
+                    or replay_ready_members == len(self.population)
+                ),
+                "ready_members": replay_ready_members,
+                "member_count": len(self.population),
+            },
+            safety=safety_snapshot,
+            environment=environment_snapshot,
+            throughput={
+                "decision_throughput": self._decision_throughput,
+                "tick_throughput": self._tick_throughput,
+                "last_batch_ms": self._last_batch_ms,
+                "parallel_workers": self.parallel_workers,
+            },
+            environment_decisions=self._environment_decisions,
+            batch_size=self.dqn_config.batch_size * len(self.population),
+            warmup_steps=max(
+                self.dqn_config.batch_size,
+                self.dqn_config.warmup_steps,
+            )
+            * len(self.population),
+            gradient_clip=self.dqn_config.gradient_clip,
+            optimization_updates=self._optimization_updates,
+            gradient_clip_events=self._gradient_clip_events,
+            wall_contact_decisions=self._wall_contact_decisions,
+            collision_loop_terminations=self._collision_loop_terminations,
+            worker_failed=self._worker_failure is not None,
+            worker_failure_type=(
+                None
+                if self._worker_failure is None
+                else type(self._worker_failure).__name__
+            ),
+            replay_enabled=self.config.algorithm == "genetic_dqn",
+        )
+        learning_health = (
+            learning.get("health") if isinstance(learning, Mapping) else None
+        )
+        if isinstance(learning_health, Mapping) and not bool(
+            learning_health.get("finite", True)
+        ):
+            health["finite"] = False
+            health["status"] = "critical"
+            health["alerts"] = list(
+                dict.fromkeys(
+                    [
+                        *health["alerts"],
+                        *(str(value) for value in learning_health.get("alerts", ())),
+                    ]
+                )
+            )
         return {
             "algorithm": self.config.algorithm,
             "dqn_algorithm": self.dqn_config.algorithm,
@@ -1151,7 +1336,8 @@ class PopulationTrainer:
                 "generation_ready": self._generation_curriculum_ready,
                 "pending_unlock": self._pending_curriculum_unlock,
             },
-            "environment": self.env.telemetry(),
+            "environment": environment_snapshot,
+            "health": health,
         }
 
     def state_dict(self) -> dict[str, Any]:
@@ -1173,6 +1359,12 @@ class PopulationTrainer:
             "generation": self.generation,
             "next_member_id": self._next_member_id,
             "environment_decisions": self._environment_decisions,
+            "health_counters": {
+                "optimization_updates": self._optimization_updates,
+                "gradient_clip_events": self._gradient_clip_events,
+                "wall_contact_decisions": self._wall_contact_decisions,
+                "collision_loop_terminations": self._collision_loop_terminations,
+            },
             "rng_state": deepcopy(self._rng.bit_generator.state),
             "population": [
                 {
@@ -1199,8 +1391,24 @@ class PopulationTrainer:
         """Restore a population and restart its first unfinished evaluation."""
 
         self._require_usable()
-        if int(state.get("checkpoint_version", -1)) != self.CHECKPOINT_VERSION:
+        if not isinstance(state, Mapping):
+            raise ValueError("population checkpoint must be a mapping")
+        version = state.get("checkpoint_version", -1)
+        if isinstance(version, bool) or not isinstance(version, (int, np.integer)):
+            raise ValueError("population checkpoint version must be an integer")
+        if int(version) != self.CHECKPOINT_VERSION:
             raise ValueError("unsupported population checkpoint version")
+        required = {
+            "evolution_config",
+            "dqn_config",
+            "generation",
+            "next_member_id",
+            "rng_state",
+            "population",
+        }
+        missing = sorted(key for key in required if key not in state)
+        if missing:
+            raise ValueError("population checkpoint is missing: " + ", ".join(missing))
         saved_evolution = EvolutionConfig.from_dict(state["evolution_config"])
         saved_dqn = DQNConfig.from_dict(state["dqn_config"])
         if saved_evolution != self.config:
@@ -1215,16 +1423,37 @@ class PopulationTrainer:
         ):
             raise ValueError("population checkpoint DQN architecture is incompatible")
 
-        population_payload = list(state["population"])
+        raw_population = state["population"]
+        if not isinstance(raw_population, (list, tuple)):
+            raise ValueError("population checkpoint population must be a sequence")
+        population_payload = list(raw_population)
         if len(population_payload) != self.config.population_size:
             raise ValueError("population checkpoint has an unexpected member count")
+        generation = self._checkpoint_counter("generation", state["generation"])
+        next_member_id = self._checkpoint_counter(
+            "next_member_id", state["next_member_id"]
+        )
         population: list[PopulationMember] = []
         for item in population_payload:
-            member_id = int(item["member_id"])
+            if not isinstance(item, Mapping):
+                raise ValueError("population checkpoint member must be a mapping")
+            for name in ("member_id", "birth_generation", "parent_ids", "agent"):
+                if name not in item:
+                    raise ValueError(f"population checkpoint member is missing {name}")
+            member_id = self._checkpoint_counter("member_id", item["member_id"])
+            birth_generation = self._checkpoint_counter(
+                "birth_generation", item["birth_generation"]
+            )
+            raw_parents = item["parent_ids"]
+            if not isinstance(raw_parents, (list, tuple)):
+                raise ValueError("population checkpoint parent_ids must be a sequence")
+            parent_ids = tuple(
+                self._checkpoint_counter("parent_id", value) for value in raw_parents
+            )
             agent = DrivingDQNAgent(
                 replace(
                     self.dqn_config,
-                    seed=self._member_seed(member_id, int(state["generation"])),
+                    seed=self._member_seed(member_id, generation),
                 )
             )
             agent.load_state_dict(item["agent"])
@@ -1233,8 +1462,8 @@ class PopulationTrainer:
                 PopulationMember(
                     member_id=member_id,
                     agent=agent,
-                    birth_generation=int(item["birth_generation"]),
-                    parent_ids=tuple(int(value) for value in item["parent_ids"]),
+                    birth_generation=birth_generation,
+                    parent_ids=parent_ids,
                     result=(
                         None
                         if result_payload is None
@@ -1242,11 +1471,25 @@ class PopulationTrainer:
                     ),
                 )
             )
+        member_ids = [member.member_id for member in population]
+        if len(set(member_ids)) != len(member_ids):
+            raise ValueError("population checkpoint member IDs must be unique")
+        if member_ids and next_member_id <= max(member_ids):
+            raise ValueError("population checkpoint next_member_id is not ahead")
+        for member in population:
+            if member.result is None:
+                continue
+            if member.result.member_id != member.member_id:
+                raise ValueError(
+                    "population checkpoint result member_id does not match its member"
+                )
+            if member.result.generation != generation:
+                raise ValueError(
+                    "population checkpoint result generation does not match the population"
+                )
 
-        self.population = population
-        self.generation = int(state["generation"])
-        self._next_member_id = int(state["next_member_id"])
-        self._environment_decisions = int(
+        environment_decisions = self._checkpoint_counter(
+            "environment_decisions",
             state.get(
                 "environment_decisions",
                 sum(
@@ -1254,8 +1497,91 @@ class PopulationTrainer:
                     for member in population
                     if member.result is not None
                 ),
-            )
+            ),
         )
+        health_counters = state.get("health_counters", {})
+        if not isinstance(health_counters, Mapping):
+            raise ValueError("population checkpoint health_counters must be a mapping")
+        optimization_updates = self._checkpoint_counter(
+            "optimization_updates",
+            health_counters.get(
+                "optimization_updates",
+                sum(member.agent.gradient_steps for member in population),
+            ),
+        )
+        gradient_clip_events = self._checkpoint_counter(
+            "gradient_clip_events",
+            health_counters.get(
+                "gradient_clip_events",
+                sum(member.agent.gradient_clip_events for member in population),
+            ),
+        )
+        wall_contact_decisions = self._checkpoint_counter(
+            "wall_contact_decisions",
+            health_counters.get("wall_contact_decisions", 0),
+        )
+        collision_loop_terminations = self._checkpoint_counter(
+            "collision_loop_terminations",
+            health_counters.get("collision_loop_terminations", 0),
+        )
+        if gradient_clip_events > optimization_updates:
+            raise ValueError("population checkpoint clips cannot exceed updates")
+        if optimization_updates > environment_decisions:
+            raise ValueError("population checkpoint updates cannot exceed decisions")
+        if wall_contact_decisions > environment_decisions:
+            raise ValueError("population checkpoint contacts cannot exceed decisions")
+        if collision_loop_terminations > environment_decisions:
+            raise ValueError(
+                "population checkpoint collision loops cannot exceed decisions"
+            )
+        try:
+            probe_rng = np.random.default_rng()
+            probe_rng.bit_generator.state = deepcopy(state["rng_state"])
+        except (TypeError, ValueError) as error:
+            raise ValueError("population checkpoint RNG state is malformed") from error
+        raw_history = state.get("history", ())
+        if not isinstance(raw_history, (list, tuple)):
+            raise ValueError("population checkpoint history must be a sequence")
+        history = deque(
+            (GenerationRecord.from_dict(item) for item in raw_history),
+            maxlen=self.config.history_capacity,
+        )
+        best_champion, best_champion_agent = self._restore_champion(
+            state.get("best_champion")
+        )
+        race_champion, race_champion_agent = self._restore_champion(
+            state.get("race_champion")
+        )
+        raw_curriculum = state.get("environment_curriculum", {})
+        if not isinstance(raw_curriculum, Mapping):
+            raise ValueError(
+                "population checkpoint environment_curriculum must be a mapping"
+            )
+        curriculum = dict(raw_curriculum)
+        generation_curriculum_ready = curriculum.get(
+            "generation_ready",
+            curriculum.get("unlocked", curriculum.get("ready", False)),
+        )
+        pending_curriculum_unlock = curriculum.get("pending_unlock", False)
+        if not isinstance(generation_curriculum_ready, bool):
+            raise ValueError(
+                "population checkpoint curriculum readiness must be a boolean"
+            )
+        if not isinstance(pending_curriculum_unlock, bool):
+            raise ValueError(
+                "population checkpoint pending curriculum state must be a boolean"
+            )
+
+        # Commit only after the complete envelope, every nested agent, history,
+        # champion, RNG, and optional v1 extension has passed validation.
+        self.population = population
+        self.generation = generation
+        self._next_member_id = next_member_id
+        self._environment_decisions = environment_decisions
+        self._optimization_updates = optimization_updates
+        self._gradient_clip_events = gradient_clip_events
+        self._wall_contact_decisions = wall_contact_decisions
+        self._collision_loop_terminations = collision_loop_terminations
         self._last_tick_member_count = 0
         self._last_batch_ticks = 0
         self._last_batch_decisions = 0
@@ -1267,27 +1593,16 @@ class PopulationTrainer:
         self._safety_stats = SensorClearanceStats()
         self._last_safety_decision = None
         self._rng.bit_generator.state = deepcopy(state["rng_state"])
-        self.history = deque(
-            (GenerationRecord.from_dict(item) for item in state.get("history", ())),
-            maxlen=self.config.history_capacity,
-        )
-        self._best_champion, self._best_champion_agent = self._restore_champion(
-            state.get("best_champion")
-        )
-        self._race_champion, self._race_champion_agent = self._restore_champion(
-            state.get("race_champion")
-        )
+        self.history = history
+        self._best_champion = best_champion
+        self._best_champion_agent = best_champion_agent
+        self._race_champion = race_champion
+        self._race_champion_agent = race_champion_agent
         self._current_champion = None
         self._current_champion_agent = None
         self._refresh_champions()
-        curriculum = dict(state.get("environment_curriculum", {}))
-        self._generation_curriculum_ready = bool(
-            curriculum.get(
-                "generation_ready",
-                curriculum.get("unlocked", curriculum.get("ready", False)),
-            )
-        )
-        self._pending_curriculum_unlock = bool(curriculum.get("pending_unlock", False))
+        self._generation_curriculum_ready = generation_curriculum_ready
+        self._pending_curriculum_unlock = pending_curriculum_unlock
         # Version-one checkpoints never stored partial environment contexts.
         # Keep that portable contract: retain completed results and restart all
         # unfinished members from the generation's one common scenario seed.
@@ -1352,6 +1667,18 @@ class PopulationTrainer:
             )
         )
         return PopulationMember(member_id, agent, self.generation)
+
+    @staticmethod
+    def _checkpoint_counter(name: str, value: object) -> int:
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, np.integer))
+            or int(value) < 0
+        ):
+            raise ValueError(
+                f"population checkpoint {name} must be a non-negative integer"
+            )
+        return int(value)
 
     def _take_member_id(self) -> int:
         member_id = self._next_member_id
@@ -1534,6 +1861,8 @@ class PopulationTrainer:
         explore = self.config.algorithm == "genetic_dqn"
         advances: list[_MemberAdvance] = []
         for _ in range(max_ticks):
+            gradient_steps_before = member.agent.gradient_steps
+            clip_events_before = member.agent.gradient_clip_events
             proposed_action = member.agent.select_action(state, explore=explore)
             safety_decision = self.clearance_policy.decide(
                 state,
@@ -1544,9 +1873,7 @@ class PopulationTrainer:
             next_state = np.asarray(env_result.observation, dtype=np.float32)
             completed_steps += 1
             budget_reached = completed_steps >= self.config.evaluation_steps
-            done = bool(
-                env_result.terminated or env_result.truncated or budget_reached
-            )
+            done = bool(env_result.terminated or env_result.truncated or budget_reached)
             loss: float | None = None
             if self.config.algorithm == "genetic_dqn":
                 observed_loss = member.agent.observe(
@@ -1568,6 +1895,12 @@ class PopulationTrainer:
                     budget_reached=budget_reached,
                     done=done,
                     loss=loss,
+                    gradient_updated=(
+                        member.agent.gradient_steps > gradient_steps_before
+                    ),
+                    gradient_clipped=(
+                        member.agent.gradient_clip_events > clip_events_before
+                    ),
                 )
             )
             state = next_state
@@ -1694,6 +2027,10 @@ class PopulationTrainer:
     ) -> tuple[ChampionSnapshot | None, DrivingDQNAgent | None]:
         if payload is None:
             return None, None
+        if not isinstance(payload, Mapping):
+            raise ValueError("population checkpoint champion must be a mapping")
+        if "snapshot" not in payload or "agent" not in payload:
+            raise ValueError("population checkpoint champion is incomplete")
         snapshot = ChampionSnapshot.from_dict(payload["snapshot"])
         agent = DrivingDQNAgent(
             replace(
