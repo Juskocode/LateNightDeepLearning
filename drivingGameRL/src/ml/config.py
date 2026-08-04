@@ -9,6 +9,11 @@ from typing import Any, Literal, Mapping
 
 Algorithm = Literal["dqn", "double_dqn"]
 
+POPULATION_EPSILON_START = 0.30
+POPULATION_EPSILON_END = 0.05
+POPULATION_REPLAY_WARMUP_STEPS = 96
+POPULATION_TRAIN_INTERVAL = 4
+
 
 @dataclass(frozen=True, slots=True)
 class DQNConfig:
@@ -124,3 +129,39 @@ class DQNConfig:
         numeric = float(value)
         if not math.isfinite(numeric) or not low <= numeric <= high:
             raise ValueError(f"{name} must be in the [{low}, {high}] interval")
+
+
+def default_population_dqn_config(
+    *,
+    evaluation_steps: int,
+    seed: int,
+    algorithm: Algorithm = "double_dqn",
+) -> DQNConfig:
+    """Return defaults scaled to one bounded population-member lifetime."""
+
+    if (
+        isinstance(evaluation_steps, bool)
+        or not isinstance(evaluation_steps, int)
+        or evaluation_steps <= 0
+    ):
+        raise ValueError("evaluation_steps must be a positive integer")
+    return DQNConfig(
+        algorithm=algorithm,
+        warmup_steps=POPULATION_REPLAY_WARMUP_STEPS,
+        train_interval=POPULATION_TRAIN_INTERVAL,
+        epsilon_start=POPULATION_EPSILON_START,
+        epsilon_end=POPULATION_EPSILON_END,
+        epsilon_decay_steps=evaluation_steps,
+        seed=seed,
+    )
+
+
+__all__ = (
+    "Algorithm",
+    "DQNConfig",
+    "POPULATION_EPSILON_END",
+    "POPULATION_EPSILON_START",
+    "POPULATION_REPLAY_WARMUP_STEPS",
+    "POPULATION_TRAIN_INTERVAL",
+    "default_population_dqn_config",
+)

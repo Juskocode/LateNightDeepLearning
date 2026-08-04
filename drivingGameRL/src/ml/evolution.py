@@ -30,7 +30,12 @@ import numpy as np
 import torch
 
 from ..environment import DrivingAction, DrivingEnv, StepResult
-from .config import DQNConfig
+from ..sensor_clearance import (
+    SensorClearanceDecision,
+    SensorClearancePolicy,
+    SensorClearanceStats,
+)
+from .config import DQNConfig, default_population_dqn_config
 from .dqn import DrivingDQNAgent
 
 
@@ -281,6 +286,10 @@ class PopulationStep:
     info: dict[str, object]
     member_results: tuple[EvaluationResult, ...] = ()
     active_member_indices: tuple[int, ...] = ()
+    proposed_action: int | None = None
+    executed_action: int | None = None
+    safety_intervened: bool = False
+    safety_reason: str = "not_evaluated"
 
 
 @dataclass(slots=True)
@@ -294,6 +303,7 @@ class _EvaluationRuntime:
     losses: list[float] = field(default_factory=list)
     last_reward: float = 0.0
     last_info: dict[str, object] = field(default_factory=dict)
+    safety: SensorClearanceStats = field(default_factory=SensorClearanceStats)
 
 
 @dataclass(frozen=True, slots=True)
@@ -302,7 +312,7 @@ class _MemberAdvance:
 
     index: int
     state: np.ndarray
-    action: int
+    safety_decision: SensorClearanceDecision
     env_result: StepResult
     next_state: np.ndarray
     budget_reached: bool
@@ -332,7 +342,13 @@ class PopulationTrainer:
         if env is not None and env_factory is not None:
             raise ValueError("provide env or env_factory, not both")
         self.config = evolution_config or EvolutionConfig()
-        self.dqn_config = dqn_config or DQNConfig(seed=self.config.seed)
+        self.dqn_config = dqn_config or default_population_dqn_config(
+            evaluation_steps=self.config.evaluation_steps,
+            seed=self.config.seed,
+        )
+        # Stateless and read-only: one instance is safe to share across member
+        # workers. Per-member intervention statistics remain coordinator-owned.
+        self.clearance_policy = SensorClearancePolicy()
         if self.dqn_config.action_size != len(DrivingAction):
             raise ValueError(
                 f"DrivingEnv has {len(DrivingAction)} actions, but DQNConfig has "
@@ -365,6 +381,8 @@ class PopulationTrainer:
         self._last_batch_ms = 0.0
         self._decision_throughput = 0.0
         self._tick_throughput = 0.0
+        self._safety_stats = SensorClearanceStats()
+        self._last_safety_decision: SensorClearanceDecision | None = None
         self._rng = np.random.default_rng(self.config.seed)
         self._next_member_id = 0
         self.generation = 0
@@ -418,6 +436,13 @@ class PopulationTrainer:
             raise ValueError(
                 "DrivingEnv observation size does not match DQNConfig: "
                 f"{len(initial_observation)} != {self.dqn_config.observation_size}"
+            )
+        expected_safety_observation_size = len(DrivingEnv.OBSERVATION_LABELS)
+        if len(initial_observation) != expected_safety_observation_size:
+            raise ValueError(
+                "sensor-clearance policy requires the exact "
+                f"{expected_safety_observation_size}-value driving observation; "
+                f"received {len(initial_observation)}"
             )
 
         self.population = [
@@ -514,21 +539,28 @@ class PopulationTrainer:
         """Cheap aligned status rows for renderers and runtime facades."""
 
         active = set(self.active_member_indices)
-        return tuple(
-            {
-                "index": index,
-                "member_id": member.member_id,
-                "status": "active" if index in active else "evaluated",
-                "evaluation_step": runtime.steps,
-                "evaluation_return": runtime.total_reward,
-                "last_reward": runtime.last_reward,
-                "action": member.agent.last_action,
-                "result": member.result,
-            }
-            for index, (member, runtime) in enumerate(
-                zip(self.population, self._member_runtimes)
+        rows: list[dict[str, object]] = []
+        for index, (member, runtime) in enumerate(
+            zip(self.population, self._member_runtimes)
+        ):
+            safety = runtime.safety.snapshot()
+            rows.append(
+                {
+                    "index": index,
+                    "member_id": member.member_id,
+                    "status": "active" if index in active else "evaluated",
+                    "evaluation_step": runtime.steps,
+                    "evaluation_return": runtime.total_reward,
+                    "last_reward": runtime.last_reward,
+                    "action": safety["executed_action"],
+                    "raw_action": safety["proposed_action"],
+                    "executed_action": safety["executed_action"],
+                    "safety_intervened": safety["intervened"],
+                    "safety": safety,
+                    "result": member.result,
+                }
             )
-        )
+        return tuple(rows)
 
     @property
     def generation_complete(self) -> bool:
@@ -724,6 +756,8 @@ class PopulationTrainer:
         focal_result: EvaluationResult | None = None
         for advance in advances:
             runtime = self._member_runtimes[advance.index]
+            runtime.safety.observe(advance.safety_decision)
+            self._safety_stats.observe(advance.safety_decision)
             runtime.observation = advance.next_state
             runtime.steps += 1
             runtime.total_reward += float(advance.env_result.reward)
@@ -754,6 +788,7 @@ class PopulationTrainer:
             report_result = self.population[report_index].result
         report_member = self.population[report_index]
         report_advance = advances_by_index[report_index]
+        self._last_safety_decision = report_advance.safety_decision
         if generation_completed and self.auto_evolve:
             generation_record = self.evolve()
             evolved = True
@@ -768,7 +803,7 @@ class PopulationTrainer:
             member_id=report_member.member_id,
             member_index=report_index,
             observation=tuple(float(value) for value in report_advance.state),
-            action=report_advance.action,
+            action=report_advance.safety_decision.executed_action,
             reward=float(report_advance.env_result.reward),
             next_observation=tuple(float(value) for value in report_advance.next_state),
             terminated=bool(report_advance.env_result.terminated),
@@ -783,6 +818,10 @@ class PopulationTrainer:
             info=dict(report_advance.env_result.info),
             member_results=tuple(completed_results),
             active_member_indices=active_indices,
+            proposed_action=report_advance.safety_decision.proposed_action,
+            executed_action=report_advance.safety_decision.executed_action,
+            safety_intervened=report_advance.safety_decision.intervened,
+            safety_reason=report_advance.safety_decision.reason,
         )
 
     def tournament_select(
@@ -975,10 +1014,15 @@ class PopulationTrainer:
         population = []
         active_indices = self.active_member_indices
         active_set = set(active_indices)
+        safety_decisions = 0
+        safety_interventions = 0
         for index, (item, runtime) in enumerate(
             zip(self.population, self._member_runtimes)
         ):
             summary = item.summary()
+            safety = runtime.safety.snapshot()
+            safety_decisions += runtime.safety.decisions
+            safety_interventions += runtime.safety.interventions
             summary.update(
                 {
                     "index": index,
@@ -986,13 +1030,56 @@ class PopulationTrainer:
                     "evaluation_step": runtime.steps,
                     "evaluation_return": runtime.total_reward,
                     "last_reward": runtime.last_reward,
-                    "action": item.agent.last_action,
+                    "action": safety["executed_action"],
+                    "raw_action": safety["proposed_action"],
+                    "executed_action": safety["executed_action"],
+                    "safety_intervened": safety["intervened"],
+                    "safety": safety,
                     "observation": [float(value) for value in runtime.observation],
                     "curriculum_qualified": runtime.env.curriculum_ready,
                     "curriculum_generation_ready": (self._generation_curriculum_ready),
                 }
             )
             population.append(summary)
+        aggregate_safety = self._safety_stats.snapshot()
+        current_index = self.current_member_index
+        if current_index is not None:
+            # The coordinator's last merged decision can belong to a member
+            # that completed on this tick. Keep aggregate counters, but source
+            # the visible decision from the member now selected everywhere
+            # else in telemetry so action, observation, and network agree.
+            current_safety = self._member_runtimes[current_index].safety.snapshot()
+            for key in (
+                "proposed_action",
+                "executed_action",
+                "intervened",
+                "dangerous",
+                "reason",
+                "speed_ratio",
+                "forward_clearance",
+                "danger_threshold",
+                "critical_clearance",
+                "boundary_threshold",
+                "projected_offset",
+                "left_open_space",
+                "right_open_space",
+                "left_utility",
+                "right_utility",
+                "ray_clearances",
+            ):
+                aggregate_safety[key] = current_safety[key]
+        elif self._last_safety_decision is not None:
+            aggregate_safety.update(self._last_safety_decision.to_dict())
+        safety_snapshot = {
+            **aggregate_safety,
+            "population_decisions": safety_decisions,
+            "population_interventions": safety_interventions,
+            "population_intervention_rate": (
+                safety_interventions / safety_decisions
+                if safety_decisions
+                else 0.0
+            ),
+        }
         return {
             "algorithm": self.config.algorithm,
             "dqn_algorithm": self.dqn_config.algorithm,
@@ -1023,6 +1110,10 @@ class PopulationTrainer:
             / self.config.evaluation_steps,
             "evaluation_return": self._evaluation_return,
             "last_reward": self._last_reward,
+            "proposed_action": safety_snapshot["proposed_action"],
+            "executed_action": safety_snapshot["executed_action"],
+            "safety_intervened": safety_snapshot["intervened"],
+            "safety_prior": safety_snapshot,
             "population": population,
             "fitness": {
                 "best": None if not len(fitnesses) else float(fitnesses.max()),
@@ -1171,6 +1262,10 @@ class PopulationTrainer:
         self._last_batch_ms = 0.0
         self._decision_throughput = 0.0
         self._tick_throughput = 0.0
+        # Safety telemetry is intentionally ephemeral and absent from the
+        # checkpoint schema; resumed policies start a fresh observability window.
+        self._safety_stats = SensorClearanceStats()
+        self._last_safety_decision = None
         self._rng.bit_generator.state = deepcopy(state["rng_state"])
         self.history = deque(
             (GenerationRecord.from_dict(item) for item in state.get("history", ())),
@@ -1439,8 +1534,13 @@ class PopulationTrainer:
         explore = self.config.algorithm == "genetic_dqn"
         advances: list[_MemberAdvance] = []
         for _ in range(max_ticks):
-            action = member.agent.select_action(state, explore=explore)
-            env_result = runtime.env.step(action)
+            proposed_action = member.agent.select_action(state, explore=explore)
+            safety_decision = self.clearance_policy.decide(
+                state,
+                proposed_action,
+            )
+            executed_action = safety_decision.executed_action
+            env_result = runtime.env.step(executed_action)
             next_state = np.asarray(env_result.observation, dtype=np.float32)
             completed_steps += 1
             budget_reached = completed_steps >= self.config.evaluation_steps
@@ -1451,7 +1551,7 @@ class PopulationTrainer:
             if self.config.algorithm == "genetic_dqn":
                 observed_loss = member.agent.observe(
                     state,
-                    action,
+                    executed_action,
                     env_result.reward,
                     next_state,
                     done,
@@ -1462,7 +1562,7 @@ class PopulationTrainer:
                 _MemberAdvance(
                     index=index,
                     state=state,
-                    action=action,
+                    safety_decision=safety_decision,
                     env_result=env_result,
                     next_state=next_state,
                     budget_reached=budget_reached,

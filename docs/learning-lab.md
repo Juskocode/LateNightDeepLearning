@@ -564,39 +564,87 @@ reported terms:
 Let `p` be signed normalized progress, `v+` and `v-` be normalized forward
 and reverse speed, `a` be forward heading alignment, `c` be the center-track
 factor, `q` be the minimum normalized clearance of the three forward rays,
-`o` be normalized track offset, and `h` be the close-barrier hazard derived
-from `q`. The implemented terms are:
+`o` be normalized track offset, `h` be the close-barrier hazard derived from
+`q`, `m` be absolute normalized speed, and `u` be usable green clearance. Each
+ray first maps `[0.18, 1]` onto `[0, 1]`; `u` combines 65% of the minimum front
+three with 35% of the weighted nine-ray fan. The center ray has weight 1.0,
+then weights fall symmetrically through 0.75, 0.45, 0.25, and 0.15. The
+implemented terms are:
 
 ```text
 progress        = 300 * p
 pace            = +0.045 * v+ * a * c * q
+green_clearance = +0.025 * green_ray_fraction * v+ * a * c
 road            = 0 on road, otherwise -0.12
 alignment       = -0.05 * v+ * (1 - a)
 track_offset    = -0.04 * v+ * o^2
 slip            = -0.04 * abs(lateral_speed) / max_speed
-clearance       = -0.14 * v+ * h^2
+clearance       = -0.55 * v+ * h^2
+clearance_gain  = +6 * max(u_t - u_(t-1), 0) * m
+wall_closing    = -32 * max(u_(t-1) - u_t, 0) * (0.35 + 0.65m)
 reverse         = -0.16 * v-
-barrier_contact = -0.10 on every colliding tick
-collision       = -2 - min(6, 0.08 * impact_speed) on contact start
+barrier_contact = -1.25 on every active contact tick
+collision       = -6 - min(12, 0.12 * impact_speed) on contact start
 stagnation      = ramps from 0 to -0.12 after 90 non-progress ticks
 lap             = +75 after one valid gated forward circuit
 ```
 
 There is deliberately no positive survival reward. Meaningful forward movement
 resets stagnation; otherwise the penalty grows after 90 ticks and the episode is
-truncated at 240. This prevents a stationary or oscillating genome from beating
-a cautious progressing driver, while the forward-clearance term makes an
-otherwise identical approach less fit when it is aimed at an imminent barrier.
+truncated at 240. Increasing clearance cannot be farmed while stationary because
+its positive term is multiplied by motion, and closing clearance is more than
+five times as costly as opening it is rewarding. Persistent scraping also
+cannot survive an entire evaluation: 45 continuous contact ticks, or four
+collision entries within the latest 180 ticks, truncate the run as a collision
+loop.
 
 The `info` dictionary exposes the active terrain, on-road flag, absolute
 `progress`, origin-relative `episode_lap_progress`, spawn mode and origin,
 curriculum readiness, completed laps, `lap_completed`, current/last/best lap
-time, persistent-contact `collided`, one-shot `collision_started`, impact speed,
-heading alignment, forward clearance, stagnation count and reason, every reward
-term, and vehicle telemetry. Episodes do not terminate from damage or collision.
-Curriculum learning episodes terminate on a valid loop; all modes truncate at
-their configured step limit or the stagnation limit. The general step limit
-defaults to 10,800 steps (three minutes at 60 Hz).
+time, current-tick barrier penetration in `collided`, one-shot
+`collision_started`, persistent `wall_contact_active`, impact speed,
+heading alignment, forward and usable clearance, clearance delta, green-ray
+fraction, wall-closing state, contact streak, recent collision entries,
+stagnation count, exact cutoff constants, every reward term, and vehicle
+telemetry. Curriculum learning episodes terminate on a valid loop; all modes
+truncate at their configured step limit, stagnation limit, or collision-loop
+limit. The general step limit defaults to 10,800 steps (three minutes at 60 Hz).
+
+### Observable sensor-clearance policy
+
+Learning and champion evaluation apply a deterministic action filter after the
+network proposes an action and before the environment advances. It is a compact
+safety prior, not a hidden controller:
+
+1. Clear forward rays preserve the proposed action exactly.
+2. A speed-aware danger threshold looks farther ahead as velocity increases.
+3. In a closing corridor, weighted left and right ray scores select the greener
+   escape side; a critically blocked corridor brakes first.
+4. Fully symmetric ties use a stable rule, so worker scheduling cannot change a
+   run.
+
+The look-ahead is deliberately inspectable. With speed `s` clamped to `[0,1]`,
+lateral speed `l`, normalized heading error `e`, and signed track offset `o`:
+
+```text
+lookahead          = 0.45 + 0.55s
+projected_offset   = o + e * lookahead + 0.25l
+forward_danger     = min(front three rays) <= 0.44 + 0.12s
+boundary_danger    = abs(projected_offset) >= 0.58 - 0.08s
+critical_blockage  = max(front three rays) <= 0.08 and speed >= 0.45
+```
+
+Each side utility is its weighted ray clearance plus `0.12 × green-ray weight`
+for readings at least 0.55. A `0.70 × projected_offset` correction favors the
+center-returning corridor. Critical blockage brakes; other danger steers toward
+the higher utility. Thus “green” is an explicit policy term as well as an
+environment reward and a dashboard measurement.
+
+The transition stores the executed action, because that action caused the next
+state and reward. Telemetry separately exposes `proposed_action`,
+`executed_action`, `safety_intervened`, the decision reason, left/right scores,
+thresholds, counts, and intervention rate. This keeps the neural policy's raw
+behavior inspectable without teaching Q-values from a falsely labelled action.
 
 ### Driving value network and replay
 
@@ -720,7 +768,12 @@ For automatically configured population members, replay updates begin after 96
 decisions and run every fourth transition. This replaces the former 512-step
 warm-up/every-tick update pattern: useful TD feedback begins within a short
 evaluation while optimizer work no longer monopolizes every frame. Explicit
-programmatic `DQNConfig` values remain unchanged.
+programmatic `DQNConfig` values remain unchanged. Population-created hybrid
+members also use epsilon `0.30 → 0.05` across exactly `evaluation_steps`. For a
+900-step lifetime, the linear schedule averages about 17.5% exploratory and
+82.5% greedy proposals. The former generic 40,000-step decay restarted every
+short-lived member near epsilon 1.0, leaving only about ten greedy choices in a
+default evaluation. Standalone DQN retains its generic schedule.
 
 ### Live dashboard and the `P` champion race
 
@@ -729,14 +782,16 @@ synthesize training state.
 
 | Tab | What it answers |
 |---|---|
-| Overview | Which real scored members are driving in parallel, their episode origins, observations, choices and rays, cars per tick and worker count, and how current/best/mean fitness changes across generations |
+| Overview | Which real scored members are driving in parallel, their episode origins, exact rays, usable green clearance and delta, contact/collision-loop state, neural proposal → executed safety action, cars per tick and worker count, and how fitness changes across generations |
 | Network | Which real layers and connections produced the current Q-values; colors and intensity come from current activations and weights |
 | Memory | How full replay is, whether action selection explored, and what loss, TD error, gradient steps, action counts, and target synchronization are doing |
 
 Pressing `P` pauses accelerated training and creates two private environments on
 the current circuit. One receives continuous human controls; the other receives
-greedy actions from an isolated, frozen clone of the current generation's best
-available policy. Both advance at a fixed 60 Hz for one lap. Press `P` again to
+actions from an isolated, frozen clone of the current generation's best
+available policy through the same deterministic sensor-clearance filter used
+during learning. Human input remains direct. Both advance at a fixed 60 Hz for
+one lap; the first driver truncated by a collision loop loses. Press `P` again to
 return to training. The clone cannot write replay, update gradients, change
 generation fitness, or participate in selection, so the race is observational
 rather than an extra training episode.

@@ -7,6 +7,7 @@ policy clone so its optional comparison view cannot alter replay or gradients.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -304,6 +305,10 @@ def scored_population_telemetry(
         q_values = tuple(float(value) for value in member.agent.q_values(observation))
         action_value = row.get("action")
         action = int(np.argmax(q_values) if action_value is None else action_value)
+        raw_action_value = row.get("raw_action")
+        raw_action = int(action if raw_action_value is None else raw_action_value)
+        safety_value = row.get("safety")
+        safety = dict(safety_value) if isinstance(safety_value, Mapping) else {}
         rays = _sensor_rays(env) if include_rays else []
         status = row.get("status")
         if status == "active":
@@ -346,6 +351,28 @@ def scored_population_telemetry(
             "spawn_progress": float(env_snapshot["spawn_progress"]),
             "lap_origin_progress": float(env_snapshot["lap_origin_progress"]),
             "action": action,
+            "raw_action": raw_action,
+            "proposed_action": raw_action,
+            "executed_action": action,
+            "safety_intervened": bool(row.get("safety_intervened", False)),
+            "safety": safety,
+            "usable_clearance": float(env_snapshot["usable_clearance"]),
+            "previous_usable_clearance": float(
+                env_snapshot["previous_usable_clearance"]
+            ),
+            "clearance_delta": float(env_snapshot["clearance_delta"]),
+            "green_ray_fraction": float(env_snapshot["green_ray_fraction"]),
+            "wall_closing": bool(env_snapshot["wall_closing"]),
+            "wall_contact_active": bool(env_snapshot["wall_contact_active"]),
+            "wall_contact_steps": int(env_snapshot["wall_contact_steps"]),
+            "wall_contact_limit": int(env_snapshot["wall_contact_limit"]),
+            "recent_collision_entries": int(
+                env_snapshot["recent_collision_entries"]
+            ),
+            "collision_entry_limit": int(env_snapshot["collision_entry_limit"]),
+            "collision_looped": bool(env_snapshot["collision_looped"]),
+            "truncation_reason": env_snapshot["truncation_reason"],
+            "reward_terms": dict(env_snapshot["reward_terms"]),
             "q_values": list(q_values),
             "observation": [float(value) for value in observation],
             "rays": rays,

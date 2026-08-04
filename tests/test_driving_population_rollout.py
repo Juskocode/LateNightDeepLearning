@@ -203,7 +203,10 @@ class PopulationRolloutManagerTests(unittest.TestCase):
         session.step()
 
         car = manager.telemetry(include_rays=True)[0]
-        member = session._population_trainer.population[0]
+        trainer = session._population_trainer
+        member = trainer.population[0]
+        runtime_row = trainer.member_runtime[0]
+        environment = trainer.member_environments[0].telemetry()
         sensor_count = len(DrivingEnv.SENSOR_RELATIVE_ANGLES)
 
         self.assertEqual(len(car["sensor_rays"]), sensor_count)
@@ -224,7 +227,30 @@ class PopulationRolloutManagerTests(unittest.TestCase):
             )
         expected_q_values = member.agent.q_values(car["observation"])
         np.testing.assert_allclose(car["q_values"], expected_q_values)
-        self.assertEqual(car["action"], int(np.argmax(expected_q_values)))
+        self.assertEqual(car["action"], runtime_row["executed_action"])
+        self.assertEqual(car["executed_action"], runtime_row["executed_action"])
+        self.assertEqual(car["raw_action"], runtime_row["raw_action"])
+        self.assertEqual(car["proposed_action"], runtime_row["raw_action"])
+        self.assertEqual(
+            car["safety_intervened"], runtime_row["safety_intervened"]
+        )
+        self.assertEqual(car["safety"], runtime_row["safety"])
+        for key in (
+            "usable_clearance",
+            "previous_usable_clearance",
+            "clearance_delta",
+            "green_ray_fraction",
+            "wall_closing",
+            "wall_contact_active",
+            "wall_contact_steps",
+            "wall_contact_limit",
+            "recent_collision_entries",
+            "collision_entry_limit",
+            "collision_looped",
+            "truncation_reason",
+            "reward_terms",
+        ):
+            self.assertEqual(car[key], environment[key])
 
     def test_rollouts_refresh_automatically_when_generation_changes(self):
         session = _tiny_session(population_size=3, evaluation_steps=2)

@@ -1237,6 +1237,182 @@ class DrivingLearningVisualization:
 
         self._draw_population_legend(viewport, population)
 
+    @staticmethod
+    def _safety_reason_label(value: object) -> str:
+        """Turn the safety prior's stable reason code into a compact lesson."""
+
+        labels = {
+            "clear_road": "CLEAR ROAD",
+            "danger_brake": "BRAKE FOR WALL",
+            "critical_brake": "EMERGENCY BRAKE",
+            "danger_steer_left": "OPEN SPACE LEFT",
+            "danger_steer_right": "OPEN SPACE RIGHT",
+            "danger_steer_left_tiebreak": "LEFT RAY TIEBREAK",
+            "danger_steer_right_tiebreak": "RIGHT RAY TIEBREAK",
+            "danger_equal_space_keep_steer": "KEEP ESCAPE STEER",
+            "danger_equal_space_left_tiebreak": "EQUAL SPACE · LEFT",
+            "not_evaluated": "WAITING FOR POLICY",
+        }
+        reason = str(value or "not_evaluated").strip().lower()
+        return labels.get(reason, reason.replace("_", " ").upper())
+
+    def _draw_clearance_hud(
+        self,
+        viewport: pygame.Rect,
+        data: Mapping[str, Any],
+    ) -> None:
+        """Explain the green-clearance objective and any safety intervention."""
+
+        if not any(
+            key in data
+            for key in (
+                "usable_clearance",
+                "clearance_delta",
+                "wall_contact_active",
+                "safety_prior",
+            )
+        ):
+            return
+        safety = _mapping(data.get("safety_prior", data.get("safety")))
+        clearance = max(0.0, min(1.0, _finite(data.get("usable_clearance"), 1.0)))
+        raw_green_threshold = max(
+            0.0,
+            min(1.0, _finite(data.get("clearance_green_threshold"), 0.55)),
+        )
+        objective = _mapping(data.get("clearance_objective"))
+        usable_floor = max(
+            0.0,
+            min(0.999, _finite(objective.get("usable_floor"), 0.18)),
+        )
+        # The displayed value is the transformed/composite usable clearance,
+        # while the environment's green threshold is expressed in raw ray
+        # units. Convert the marker into the bar's coordinate system.
+        threshold = max(
+            0.0,
+            min(
+                1.0,
+                (raw_green_threshold - usable_floor) / (1.0 - usable_floor),
+            ),
+        )
+        delta = _finite(data.get("clearance_delta"))
+        contact = _flag(data.get("wall_contact_active"))
+        closing = _flag(data.get("wall_closing"))
+        looped = _flag(data.get("collision_looped"))
+        panel = pygame.Rect(viewport.x + 8, viewport.y + 8, 306, 76)
+        pygame.draw.rect(self.surface, COLORS["background"], panel, border_radius=7)
+        pygame.draw.rect(
+            self.surface,
+            COLORS["red"] if contact or looped else COLORS["green"],
+            panel,
+            1,
+            border_radius=7,
+        )
+
+        self._text(
+            "GREEN CLEARANCE",
+            (panel.x + 9, panel.y + 7),
+            size=8,
+            color=COLORS["muted"],
+            bold=True,
+        )
+        delta_arrow = "↑" if delta > 1e-9 else ("↓" if delta < -1e-9 else "→")
+        self._right_text(
+            f"{clearance * 100:04.1f}%  {delta_arrow} {delta * 100:+.2f}%",
+            panel.right - 9,
+            panel.y + 5,
+            size=10,
+            color=(
+                COLORS["green"]
+                if clearance >= threshold and not closing
+                else COLORS["orange"]
+                if not contact
+                else COLORS["red"]
+            ),
+            bold=True,
+        )
+        bar = pygame.Rect(panel.x + 9, panel.y + 23, panel.width - 18, 5)
+        pygame.draw.rect(self.surface, COLORS["grid"], bar, border_radius=3)
+        fill = bar.copy()
+        fill.width = max(1, round(bar.width * clearance))
+        pygame.draw.rect(
+            self.surface,
+            COLORS["green"] if clearance >= threshold else COLORS["yellow"],
+            fill,
+            border_radius=3,
+        )
+        target_x = round(bar.x + bar.width * threshold)
+        pygame.draw.line(
+            self.surface,
+            COLORS["text"],
+            (target_x, bar.y - 2),
+            (target_x, bar.bottom + 2),
+            1,
+        )
+
+        contact_steps = max(0, _integer(data.get("wall_contact_steps")))
+        contact_limit = max(1, _integer(data.get("wall_contact_limit"), 1))
+        entries = max(0, _integer(data.get("recent_collision_entries")))
+        entry_limit = max(1, _integer(data.get("collision_entry_limit"), 1))
+        if looped:
+            wall_state, wall_color = "COLLISION LOOP · RESET", COLORS["red"]
+        elif contact:
+            wall_state = (
+                f"WALL CONTACT {contact_steps}/{contact_limit} · "
+                f"HITS {entries}/{entry_limit}"
+            )
+            wall_color = COLORS["red"]
+        elif closing:
+            wall_state, wall_color = "WALL CLOSING · GAIN CLEARANCE", COLORS["orange"]
+        else:
+            green_fraction = max(
+                0.0, min(1.0, _finite(data.get("green_ray_fraction")))
+            )
+            wall_state = f"CLEAR · GREEN RAYS {green_fraction * 100:.0f}%"
+            wall_color = COLORS["green"]
+        self._text(
+            wall_state,
+            (panel.x + 9, panel.y + 34),
+            size=8,
+            color=wall_color,
+            bold=True,
+        )
+
+        proposed = _integer(
+            safety.get("proposed_action", data.get("proposed_action")), -1
+        )
+        executed = _integer(
+            safety.get("executed_action", data.get("executed_action", proposed)),
+            proposed,
+        )
+        proposed_label = (
+            ACTION_LABELS[proposed]
+            if 0 <= proposed < len(ACTION_LABELS)
+            else "--"
+        )
+        executed_label = (
+            ACTION_LABELS[executed]
+            if 0 <= executed < len(ACTION_LABELS)
+            else "--"
+        )
+        intervened = _flag(
+            safety.get("intervened", data.get("safety_intervened"))
+        )
+        interventions = max(0, _integer(safety.get("interventions")))
+        decisions = max(0, _integer(safety.get("decisions")))
+        reason = self._safety_reason_label(safety.get("reason"))
+        shield = (
+            f"SHIELD {proposed_label} → {executed_label} · {reason} · {interventions}/{decisions}"
+            if intervened
+            else f"SHIELD PASS {executed_label} · {interventions}/{decisions}"
+        )
+        self._text(
+            self._fit_text(shield, panel.width - 18, 8, True),
+            (panel.x + 9, panel.y + 53),
+            size=8,
+            color=COLORS["cyan"] if intervened else COLORS["muted"],
+            bold=intervened,
+        )
+
     def _draw_curriculum_origin(
         self,
         viewport: pygame.Rect,
@@ -1373,6 +1549,28 @@ class DrivingLearningVisualization:
                 round(viewport.y + y * scale_y),
             )
             self._draw_car(center, heading, color, label=label)
+        # Environment diagnostics are nested in real session telemetry, while
+        # the safety prior is top-level.  When a scored population member is
+        # selected, prefer that car's forwarded clearance/safety snapshot so
+        # the lesson follows the same highlighted body and rays.
+        clearance_data: dict[str, Any] = {
+            **_mapping(data.get("environment")),
+            **data,
+        }
+        selected = next(
+            (
+                visual.rollout
+                for visual in population
+                if visual.member_key == self.selected_population_member
+            ),
+            None,
+        )
+        if isinstance(selected, Mapping):
+            clearance_data.update(selected)
+            selected_safety = _mapping(selected.get("safety"))
+            if selected_safety:
+                clearance_data["safety_prior"] = selected_safety
+        self._draw_clearance_hud(viewport, clearance_data)
         terrain = str(snapshot.get("terrain", "unknown")).replace("_", " ").upper()
         if _flag(snapshot.get("random_start_curriculum")):
             loop_progress = max(

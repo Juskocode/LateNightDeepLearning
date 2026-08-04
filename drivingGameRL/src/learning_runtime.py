@@ -8,6 +8,7 @@ same fixed-step simulation.
 from __future__ import annotations
 
 from collections import deque
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 import math
 import os
@@ -19,7 +20,12 @@ import numpy as np
 import torch
 
 from .environment import DrivingAction, DrivingEnv, StepResult
-from .ml import DQNConfig, DrivingDQNAgent
+from .ml import (
+    DQNConfig,
+    DrivingDQNAgent,
+    default_population_dqn_config,
+)
+from .sensor_clearance import SensorClearancePolicy, SensorClearanceStats
 from .vehicle import CarBuild, DriverControls
 
 
@@ -108,9 +114,12 @@ class DrivingLearningSession:
         self._last_event = "session_started"
         self._checkpoint_path: Path | None = None
         self._population_trainer: Any | None = None
+        self._uses_population_default_dqn = False
         self._loss_history: deque[float] = deque(maxlen=300)
         self._epsilon_history: deque[float] = deque(maxlen=300)
         self._environment_decisions = 0
+        self.clearance_policy = SensorClearancePolicy()
+        self._safety_stats = SensorClearanceStats()
 
         if self.config.algorithm in ("genetic", "genetic_dqn"):
             self._init_population(dqn_config)
@@ -149,13 +158,16 @@ class DrivingLearningSession:
             # collecting without learning, then trains every frame. Start
             # replay early and spread updates across four transitions instead:
             # better early feedback with substantially lower interactive CPU
-            # cost. Explicit caller configurations remain untouched.
-            dqn_config = DQNConfig(
+            # cost. Population exploration also needs its own lifetime scale:
+            # the generic 40k decay would make each freshly cloned 900-step
+            # member almost entirely random. Explicit caller configurations
+            # remain untouched.
+            dqn_config = default_population_dqn_config(
                 algorithm=base_algorithm,
-                warmup_steps=96,
-                train_interval=4,
+                evaluation_steps=self.config.evaluation_steps,
                 seed=self.config.seed,
             )
+            self._uses_population_default_dqn = True
         evolution = EvolutionConfig(
             algorithm=self.config.algorithm,
             population_size=self.config.population_size,
@@ -298,11 +310,23 @@ class DrivingLearningSession:
             return result
 
         state = self.observation
-        action = self.agent.select_action(state, explore=True)
-        result = self.env.step(action)
+        proposed_action = self.agent.select_action(state, explore=True)
+        safety_decision = self.clearance_policy.decide(state, proposed_action)
+        self._safety_stats.observe(safety_decision)
+        executed_action = safety_decision.executed_action
+        result = self.env.step(executed_action)
         self._environment_decisions += 1
         done = result.terminated or result.truncated
-        self.agent.observe(state, action, result.reward, result.observation, done)
+        # Replay receives the action that caused the transition. Crediting an
+        # overridden unsafe proposal with the safety prior's reward would teach
+        # the wrong Q-value and invite reliance on the filter.
+        self.agent.observe(
+            state,
+            executed_action,
+            result.reward,
+            result.observation,
+            done,
+        )
         self.episode_return += result.reward
         self.observation = result.observation
         self._last_event = "training_step"
@@ -432,6 +456,43 @@ class DrivingLearningSession:
             include_rays=include_rays,
         )
 
+    def _epsilon_schedule_telemetry(self) -> dict[str, Any]:
+        """Describe the effective proposal-exploration schedule analytically."""
+
+        config = self.agent.config
+        lifetime = max(1, int(self.config.evaluation_steps))
+        decay = max(1, int(config.epsilon_decay_steps))
+        schedule_step = max(0, int(self.agent.environment_steps))
+        # Forecast the next evaluation-sized horizon from the learner's actual
+        # schedule position. Sum clamped linear progress without allocating a
+        # per-frame list on every dashboard refresh.
+        linear_start = min(schedule_step, decay)
+        linear_stop = min(schedule_step + lifetime, decay)
+        linear_count = max(0, linear_stop - linear_start)
+        progress_sum = (
+            linear_count * (linear_start + linear_stop - 1) / (2.0 * decay)
+        )
+        progress_sum += lifetime - linear_count
+        mean_epsilon = config.epsilon_start + (
+            config.epsilon_end - config.epsilon_start
+        ) * (progress_sum / lifetime)
+        exploration_enabled = self.config.algorithm != "genetic"
+        expected_exploration = mean_epsilon if exploration_enabled else 0.0
+        current_epsilon = float(self.agent.epsilon) if exploration_enabled else 0.0
+        return {
+            "enabled": exploration_enabled,
+            "population_default": bool(self._uses_population_default_dqn),
+            "start": float(config.epsilon_start),
+            "end": float(config.epsilon_end),
+            "decay_steps": decay,
+            "schedule_step": schedule_step,
+            "evaluation_lifetime_steps": lifetime,
+            "decay_scaled_to_lifetime": decay == lifetime,
+            "current": current_epsilon,
+            "expected_exploration_fraction": expected_exploration,
+            "expected_greedy_fraction": 1.0 - expected_exploration,
+        }
+
     def telemetry(self) -> dict[str, Any]:
         """Merge environment, learning, replay, and real-network state."""
 
@@ -474,6 +535,13 @@ class DrivingLearningSession:
                         "parents": member.get("parent_ids", ()),
                         "evaluation_step": member.get("evaluation_step", 0),
                         "evaluation_return": member.get("evaluation_return", 0.0),
+                        "action": member.get("action"),
+                        "raw_action": member.get("raw_action"),
+                        "executed_action": member.get("executed_action"),
+                        "safety_intervened": bool(
+                            member.get("safety_intervened", False)
+                        ),
+                        "safety": member.get("safety", {}),
                     }
                 )
             history = [
@@ -570,6 +638,18 @@ class DrivingLearningSession:
             }
             for item in list(self.agent.replay)[-12:]
         ]
+        safety_value = snapshot.get("safety_prior")
+        safety = (
+            dict(safety_value)
+            if isinstance(safety_value, Mapping)
+            else self._safety_stats.snapshot()
+        )
+        proposed_action = safety.get(
+            "proposed_action",
+            agent_learning.get("last_action"),
+        )
+        executed_action = safety.get("executed_action", proposed_action)
+        epsilon_schedule = self._epsilon_schedule_telemetry()
         snapshot.update(
             {
                 "mode": "population" if self.is_population else "episode",
@@ -578,13 +658,29 @@ class DrivingLearningSession:
                 "observation_labels": list(DrivingEnv.OBSERVATION_LABELS),
                 "action_labels": list(ACTION_LABELS),
                 "q_values": agent_learning["q_values"],
-                "selected_action": agent_learning.get("last_action"),
-                "last_action": agent_learning.get("last_action"),
+                # The network view highlights its raw proposal; last_action is
+                # the command that actually produced the visible transition.
+                "selected_action": proposed_action,
+                "last_action": executed_action,
+                "proposed_action": proposed_action,
+                "executed_action": executed_action,
+                "safety_intervened": bool(safety.get("intervened", False)),
+                "safety_prior": safety,
                 "epsilon": (
                     0.0
                     if self.config.algorithm == "genetic"
                     else agent_learning["epsilon"]
                 ),
+                "epsilon_start": epsilon_schedule["start"],
+                "epsilon_end": epsilon_schedule["end"],
+                "epsilon_decay_steps": epsilon_schedule["decay_steps"],
+                "expected_exploration_fraction": epsilon_schedule[
+                    "expected_exploration_fraction"
+                ],
+                "expected_greedy_fraction": epsilon_schedule[
+                    "expected_greedy_fraction"
+                ],
+                "epsilon_schedule": epsilon_schedule,
                 "loss": agent_learning["last_loss"],
                 "td_error": agent_learning["mean_absolute_td_error"],
                 "gradient_steps": agent_learning["gradient_steps"],
@@ -641,6 +737,9 @@ class DrivingLearningSession:
 
     def load(self, path: str | Path) -> None:
         checkpoint = Path(path).expanduser().resolve()
+        # The policy is stateless and its counters are observability only, so
+        # loading never mutates or extends the checkpoint payload.
+        self._safety_stats = SensorClearanceStats()
         if self.is_population:
             self._population_trainer.load(checkpoint)
             self.env = self._population_trainer.env
@@ -707,11 +806,16 @@ class ChampionRace:
         self.human_env = DrivingEnv(self.circuit, build=self.build, seed=self.seed)
         self.champion_env = DrivingEnv(self.circuit, build=self.build, seed=self.seed)
         self.champion_observation = self.champion_env.observation()
+        # The race reproduces the evaluated learning policy, including its
+        # deterministic safety prior. Human controls remain completely direct.
+        self.clearance_policy = SensorClearancePolicy()
+        self._champion_safety_stats = SensorClearanceStats()
         self.steps = 0
         self.winner: str | None = None
         self.human_finish_time: float | None = None
         self.champion_finish_time: float | None = None
         self.last_champion_action = int(DrivingAction.COAST)
+        self.last_champion_proposed_action = int(DrivingAction.COAST)
 
     @property
     def elapsed(self) -> float:
@@ -726,7 +830,13 @@ class ChampionRace:
             raise RuntimeError("race is finished; create a rematch before stepping")
         human_result = self.human_env.step_controls(human_controls)
         q_values = self.agent.q_values(self.champion_observation)
-        self.last_champion_action = int(np.argmax(q_values))
+        self.last_champion_proposed_action = int(np.argmax(q_values))
+        safety_decision = self.clearance_policy.decide(
+            self.champion_observation,
+            self.last_champion_proposed_action,
+        )
+        self._champion_safety_stats.observe(safety_decision)
+        self.last_champion_action = safety_decision.executed_action
         champion_result = self.champion_env.step(self.last_champion_action)
         self.champion_observation = champion_result.observation
         self.steps += 1
@@ -748,24 +858,30 @@ class ChampionRace:
                 self.winner = "human"
             else:
                 self.winner = "champion"
-        elif human_result.truncated and champion_result.truncated:
-            human_progress = self.human_env.laps + float(
-                human_result.info.get("progress", 0.0)
-            )
-            champion_progress = self.champion_env.laps + float(
-                champion_result.info.get("progress", 0.0)
-            )
-            if abs(human_progress - champion_progress) <= 1e-9:
-                self.winner = "tie"
-            elif human_progress > champion_progress:
+        elif human_result.truncated or champion_result.truncated:
+            if human_result.truncated and not champion_result.truncated:
+                self.winner = "champion"
+            elif champion_result.truncated and not human_result.truncated:
                 self.winner = "human"
             else:
-                self.winner = "champion"
+                human_progress = self.human_env.laps + float(
+                    human_result.info.get("progress", 0.0)
+                )
+                champion_progress = self.champion_env.laps + float(
+                    champion_result.info.get("progress", 0.0)
+                )
+                if abs(human_progress - champion_progress) <= 1e-9:
+                    self.winner = "tie"
+                elif human_progress > champion_progress:
+                    self.winner = "human"
+                else:
+                    self.winner = "champion"
         return human_result, champion_result
 
     def telemetry(self) -> dict[str, Any]:
         human = self.human_env.telemetry()
         champion = self.champion_env.telemetry()
+        safety = self._champion_safety_stats.snapshot()
         return {
             "mode": "race",
             "elapsed": self.elapsed,
@@ -776,6 +892,12 @@ class ChampionRace:
             "champion_progress": champion["laps"] + champion["progress"],
             "human_speed": human["speed"],
             "champion_speed": champion["speed"],
+            "champion_proposed_action": self.last_champion_proposed_action,
+            "champion_proposed_action_label": ACTION_LABELS[
+                self.last_champion_proposed_action
+            ],
             "champion_action": self.last_champion_action,
             "champion_action_label": ACTION_LABELS[self.last_champion_action],
+            "champion_safety_intervened": bool(safety["intervened"]),
+            "champion_safety": safety,
         }

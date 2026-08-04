@@ -19,7 +19,7 @@ from drivingGameRL.src.learning_runtime import (
     DrivingLearningSession,
     LearningRuntimeConfig,
 )
-from drivingGameRL.src.ml import DQNConfig
+from drivingGameRL.src.ml import DQNConfig, DrivingDQNAgent
 from drivingGameRL.src.population_rollout import PopulationRolloutManager
 from drivingGameRL.src.vehicle import DriverControls
 
@@ -77,6 +77,9 @@ class DrivingLearningSessionTests(unittest.TestCase):
 
         self.assertEqual(automatic.agent.config.warmup_steps, 96)
         self.assertEqual(automatic.agent.config.train_interval, 4)
+        self.assertEqual(automatic.agent.config.epsilon_start, 0.30)
+        self.assertEqual(automatic.agent.config.epsilon_end, 0.05)
+        self.assertEqual(automatic.agent.config.epsilon_decay_steps, 900)
         self.assertEqual(
             explicit.agent.config.warmup_steps,
             explicit_config.warmup_steps,
@@ -89,9 +92,166 @@ class DrivingLearningSessionTests(unittest.TestCase):
             explicit.agent.config.hidden_sizes,
             explicit_config.hidden_sizes,
         )
+        self.assertEqual(
+            explicit.agent.config.epsilon_start,
+            explicit_config.epsilon_start,
+        )
+        self.assertEqual(
+            explicit.agent.config.epsilon_end,
+            explicit_config.epsilon_end,
+        )
+        self.assertEqual(
+            explicit.agent.config.epsilon_decay_steps,
+            explicit_config.epsilon_decay_steps,
+        )
         telemetry = automatic.telemetry()
         self.assertEqual(telemetry["warmup_steps"], 96)
         self.assertEqual(telemetry["train_interval"], 4)
+        self.assertEqual(telemetry["epsilon_start"], 0.30)
+        self.assertEqual(telemetry["epsilon_end"], 0.05)
+        self.assertEqual(telemetry["epsilon_decay_steps"], 900)
+        self.assertTrue(telemetry["epsilon_schedule"]["population_default"])
+        self.assertTrue(
+            telemetry["epsilon_schedule"]["decay_scaled_to_lifetime"]
+        )
+        self.assertAlmostEqual(
+            telemetry["expected_exploration_fraction"],
+            0.1751388888888889,
+        )
+        self.assertAlmostEqual(
+            telemetry["expected_greedy_fraction"],
+            0.8248611111111112,
+        )
+
+    def test_default_population_lifetime_is_majority_policy_driven(self):
+        session = DrivingLearningSession(
+            LearningRuntimeConfig(
+                algorithm="genetic_dqn",
+                population_size=2,
+                elite_count=1,
+                evaluation_steps=900,
+                seed=101,
+            )
+        )
+        self.addCleanup(session.close)
+        config = session.agent.config
+        first = DrivingDQNAgent(config)
+        second = DrivingDQNAgent(config)
+        observation = np.zeros(config.observation_size, dtype=np.float32)
+
+        first_policies: list[str] = []
+        second_policies: list[str] = []
+        for step in range(900):
+            first.environment_steps = step
+            second.environment_steps = step
+            first.select_action(observation, explore=True)
+            second.select_action(observation, explore=True)
+            first_policies.append(first.last_policy)
+            second_policies.append(second.last_policy)
+
+        self.assertEqual(first_policies, second_policies)
+        exploratory = first_policies.count("explore")
+        greedy = first_policies.count("greedy")
+        self.assertGreater(exploratory, 100)
+        self.assertLess(exploratory, 230)
+        self.assertGreater(greedy, 3 * exploratory)
+
+    def test_population_decay_scales_and_evolved_members_restart_below_half(self):
+        session = DrivingLearningSession(
+            LearningRuntimeConfig(
+                algorithm="genetic_dqn",
+                population_size=2,
+                elite_count=1,
+                evaluation_steps=3,
+                seed=103,
+            )
+        )
+        self.addCleanup(session.close)
+
+        self.assertEqual(session.agent.config.epsilon_decay_steps, 3)
+        session.step_many(3, stop_after_generation=True)
+
+        self.assertEqual(session.current_generation, 1)
+        self.assertTrue(
+            all(
+                member.agent.config.epsilon_start == 0.30
+                and member.agent.epsilon == 0.30
+                for member in session._population_trainer.population
+            )
+        )
+
+    def test_standalone_default_exploration_contract_is_unchanged(self):
+        session = DrivingLearningSession(
+            LearningRuntimeConfig(
+                algorithm="double_dqn",
+                population_size=2,
+                elite_count=1,
+                seed=107,
+            )
+        )
+        self.addCleanup(session.close)
+
+        self.assertEqual(session.agent.config.epsilon_start, 1.0)
+        self.assertEqual(session.agent.config.epsilon_end, 0.05)
+        self.assertEqual(session.agent.config.epsilon_decay_steps, 40_000)
+        telemetry = session.telemetry()
+        self.assertFalse(telemetry["epsilon_schedule"]["population_default"])
+        self.assertFalse(
+            telemetry["epsilon_schedule"]["decay_scaled_to_lifetime"]
+        )
+
+        session.agent.environment_steps = (
+            session.agent.config.epsilon_decay_steps + 12_345
+        )
+        decayed = session.telemetry()
+        self.assertAlmostEqual(decayed["epsilon"], 0.05)
+        self.assertAlmostEqual(decayed["expected_exploration_fraction"], 0.05)
+        self.assertEqual(
+            decayed["epsilon_schedule"]["schedule_step"],
+            session.agent.environment_steps,
+        )
+
+    def test_default_population_schedule_survives_checkpoint_and_continuation(self):
+        config = LearningRuntimeConfig(
+            algorithm="genetic_dqn",
+            evaluation_steps=2,
+            population_size=2,
+            elite_count=1,
+            parallel_workers=2,
+            seed=109,
+        )
+        source = DrivingLearningSession(config)
+        restored = DrivingLearningSession(config)
+        self.addCleanup(source.close)
+        self.addCleanup(restored.close)
+        source.step_many(2, stop_after_generation=True)
+        with tempfile.TemporaryDirectory() as directory:
+            checkpoint = Path(directory) / "population.pth"
+            source.save(checkpoint)
+            restored.load(checkpoint)
+
+        source_step = source.step()
+        restored_step = restored.step()
+
+        self.assertEqual(restored.agent.config.epsilon_start, 0.30)
+        self.assertEqual(restored.agent.config.epsilon_end, 0.05)
+        self.assertEqual(restored.agent.config.epsilon_decay_steps, 2)
+        self.assertEqual(source_step.proposed_action, restored_step.proposed_action)
+        self.assertEqual(source_step.executed_action, restored_step.executed_action)
+        self.assertAlmostEqual(source_step.reward, restored_step.reward)
+        np.testing.assert_array_equal(
+            source_step.next_observation,
+            restored_step.next_observation,
+        )
+        for source_member, restored_member in zip(
+            source._population_trainer.population,
+            restored._population_trainer.population,
+        ):
+            for source_parameter, restored_parameter in zip(
+                source_member.agent.online_network.parameters(),
+                restored_member.agent.online_network.parameters(),
+            ):
+                self.assertTrue(torch.equal(source_parameter, restored_parameter))
 
     def test_population_step_many_stops_exactly_and_counts_all_car_decisions(self):
         session = DrivingLearningSession(

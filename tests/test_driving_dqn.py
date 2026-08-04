@@ -12,6 +12,7 @@ from drivingGameRL.src.ml import (
     DrivingDQNAgent,
     DrivingQNetwork,
     ReplayBuffer,
+    default_population_dqn_config,
 )
 
 
@@ -56,6 +57,28 @@ class DQNConfigTests(unittest.TestCase):
         for changes in invalid:
             with self.subTest(changes=changes), self.assertRaises(ValueError):
                 DQNConfig(**changes)
+
+    def test_population_factory_scales_exploration_without_changing_defaults(self):
+        standalone = DQNConfig(seed=5)
+        population = default_population_dqn_config(
+            evaluation_steps=321,
+            seed=5,
+        )
+
+        self.assertEqual(standalone.epsilon_start, 1.0)
+        self.assertEqual(standalone.epsilon_decay_steps, 40_000)
+        self.assertEqual(population.epsilon_start, 0.30)
+        self.assertEqual(population.epsilon_end, 0.05)
+        self.assertEqual(population.epsilon_decay_steps, 321)
+        self.assertEqual(population.warmup_steps, 96)
+        self.assertEqual(population.train_interval, 4)
+        for invalid in (True, 0, -1, 1.5):
+            with self.subTest(evaluation_steps=invalid):
+                with self.assertRaisesRegex(ValueError, "positive integer"):
+                    default_population_dqn_config(
+                        evaluation_steps=invalid,
+                        seed=5,
+                    )
 
 
 class DrivingQNetworkTests(unittest.TestCase):

@@ -135,6 +135,51 @@ class DrivingParallelEvolutionTests(unittest.TestCase):
         self.addCleanup(trainer.close)
         return trainer
 
+    def test_direct_population_default_uses_lifetime_scaled_exploration(self):
+        trainer = self._track(
+            PopulationTrainer(
+                _evolution(evaluation_steps=321),
+                parallel_workers=1,
+            )
+        )
+
+        self.assertEqual(trainer.dqn_config.epsilon_start, 0.30)
+        self.assertEqual(trainer.dqn_config.epsilon_end, 0.05)
+        self.assertEqual(trainer.dqn_config.epsilon_decay_steps, 321)
+        self.assertEqual(trainer.dqn_config.warmup_steps, 96)
+        self.assertEqual(trainer.dqn_config.train_interval, 4)
+
+    def test_legacy_high_epsilon_population_checkpoint_remains_loadable(self):
+        config = _evolution(evaluation_steps=321)
+        legacy = self._track(
+            PopulationTrainer(
+                config,
+                DQNConfig(seed=config.seed),
+                parallel_workers=1,
+            )
+        )
+        restored = self._track(
+            PopulationTrainer(
+                config,
+                parallel_workers=1,
+            )
+        )
+
+        restored.load_state_dict(deepcopy(legacy.state_dict()))
+
+        self.assertEqual(legacy.dqn_config.epsilon_start, 1.0)
+        self.assertEqual(restored.dqn_config.epsilon_start, 0.30)
+        self.assertEqual(restored.dqn_config.epsilon_decay_steps, 321)
+        for legacy_member, restored_member in zip(
+            legacy.population,
+            restored.population,
+        ):
+            for legacy_parameter, restored_parameter in zip(
+                legacy_member.agent.online_network.parameters(),
+                restored_member.agent.online_network.parameters(),
+            ):
+                self.assertTrue(torch.equal(legacy_parameter, restored_parameter))
+
     def test_worker_resolution_is_bounded_and_explicit_workers_can_oversubscribe(self):
         config = _evolution(population_size=4)
         with patch("drivingGameRL.src.ml.evolution.os.cpu_count", return_value=1):

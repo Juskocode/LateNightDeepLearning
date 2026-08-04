@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from bisect import bisect_right
+from collections import deque
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import IntEnum
@@ -99,6 +100,32 @@ class DrivingEnv:
     STAGNATION_GRACE_STEPS = 90
     STAGNATION_LIMIT_STEPS = 240
     STAGNATION_PROGRESS_DISTANCE = 0.04
+    CLEARANCE_USABLE_FLOOR = 0.18
+    CLEARANCE_GREEN_THRESHOLD = 0.55
+    CLEARANCE_FRONT_SHARE = 0.65
+    CLEARANCE_RAY_WEIGHTS = (
+        0.15,
+        0.25,
+        0.45,
+        0.75,
+        1.0,
+        0.75,
+        0.45,
+        0.25,
+        0.15,
+    )
+    CLEARANCE_GAIN_REWARD_SCALE = 6.0
+    GREEN_DENSITY_REWARD_SCALE = 0.025
+    CLEARANCE_CLOSING_PENALTY_SCALE = 32.0
+    CLEARANCE_HAZARD_THRESHOLD = 0.42
+    CLEARANCE_HAZARD_PENALTY_SCALE = 0.55
+    WALL_CONTACT_PENALTY = 1.25
+    COLLISION_ENTRY_PENALTY = 6.0
+    COLLISION_IMPACT_PENALTY_SCALE = 0.12
+    COLLISION_IMPACT_PENALTY_CAP = 12.0
+    WALL_CONTACT_TRUNCATION_STEPS = 45
+    COLLISION_LOOP_ENTRY_LIMIT = 4
+    COLLISION_LOOP_WINDOW_STEPS = 180
     NORMAL_START_PROBABILITY = 0.80
     SENSOR_RELATIVE_ANGLES = (
         -math.pi / 2,
@@ -175,6 +202,18 @@ class DrivingEnv:
         self._lap_progress = 0.0
         self.previous_progress = 0.0
         self._stagnation_steps = 0
+        self._wall_contact_steps = 0
+        self._collision_entry_steps: deque[int] = deque()
+        self._recent_collision_entries = 0
+        self._steps_since_collision = self.COLLISION_LOOP_WINDOW_STEPS
+        self._collision_looped = False
+        self._last_truncation_reason: str | None = None
+        self._usable_clearance = 0.0
+        self._previous_usable_clearance = 0.0
+        self._clearance_delta = 0.0
+        self._green_ray_fraction = 0.0
+        self._wall_closing = False
+        self._clearance_motion_ratio = 0.0
         self.last_projection: TrackProjection | None = None
         self.last_reward_terms: dict[str, float] = {}
         # Observation, telemetry, and rendering often request the same rays in
@@ -214,12 +253,25 @@ class DrivingEnv:
         self.last_projection = self.circuit.project(position)
         self.previous_progress = self.last_projection.progress
         self._stagnation_steps = 0
+        self._wall_contact_steps = 0
+        self._collision_entry_steps.clear()
+        self._recent_collision_entries = 0
+        self._steps_since_collision = self.COLLISION_LOOP_WINDOW_STEPS
+        self._collision_looped = False
+        self._last_truncation_reason = None
         self._spawn_progress = self.last_projection.progress
         self._lap_origin_progress = self.last_projection.progress
         self._episode_lap_progress = 0.0
         self._last_curriculum_lap_completed = False
         self.last_reward_terms = {}
         self._reset_lap_recording()
+        self._usable_clearance, self._green_ray_fraction = self._clearance_snapshot(
+            self.sensor_rays()
+        )
+        self._previous_usable_clearance = self._usable_clearance
+        self._clearance_delta = 0.0
+        self._wall_closing = False
+        self._clearance_motion_ratio = 0.0
         return self.observation()
 
     @property
@@ -528,6 +580,71 @@ class DrivingEnv:
             raise ValueError("max_distance must be finite and positive")
         return self._sensor_ray(angle, float(max_distance)).normalized_distance
 
+    @classmethod
+    def _clearance_snapshot(
+        cls, rays: tuple[SensorRay, ...]
+    ) -> tuple[float, float]:
+        """Compress the full fan into usable clearance and green-ray density.
+
+        Clearance below ``CLEARANCE_USABLE_FLOOR`` is not useful escape room.
+        The front three rays dominate the objective, while every side ray
+        still contributes to choosing a direction around an approaching wall.
+        """
+
+        if len(rays) != len(cls.CLEARANCE_RAY_WEIGHTS):
+            raise RuntimeError("clearance weights must match the policy ray fan")
+        normalized = tuple(
+            clamp(ray.normalized_distance, 0.0, 1.0) for ray in rays
+        )
+        usable = tuple(
+            clamp(
+                (reading - cls.CLEARANCE_USABLE_FLOOR)
+                / (1.0 - cls.CLEARANCE_USABLE_FLOOR),
+                0.0,
+                1.0,
+            )
+            for reading in normalized
+        )
+        weighted_clearance = sum(
+            weight * reading
+            for weight, reading in zip(cls.CLEARANCE_RAY_WEIGHTS, usable)
+        ) / sum(cls.CLEARANCE_RAY_WEIGHTS)
+        middle = len(usable) // 2
+        forward_clearance = min(usable[middle - 1 : middle + 2])
+        combined = (
+            cls.CLEARANCE_FRONT_SHARE * forward_clearance
+            + (1.0 - cls.CLEARANCE_FRONT_SHARE) * weighted_clearance
+        )
+        green_fraction = sum(
+            reading >= cls.CLEARANCE_GREEN_THRESHOLD for reading in normalized
+        ) / len(normalized)
+        return clamp(combined, 0.0, 1.0), green_fraction
+
+    @classmethod
+    def _clearance_objective_config(
+        cls,
+    ) -> dict[str, float | int | tuple[float, ...]]:
+        """Expose the exact educational reward and cutoff constants."""
+
+        return {
+            "usable_floor": cls.CLEARANCE_USABLE_FLOOR,
+            "green_threshold": cls.CLEARANCE_GREEN_THRESHOLD,
+            "front_share": cls.CLEARANCE_FRONT_SHARE,
+            "ray_weights": cls.CLEARANCE_RAY_WEIGHTS,
+            "gain_scale": cls.CLEARANCE_GAIN_REWARD_SCALE,
+            "green_density_scale": cls.GREEN_DENSITY_REWARD_SCALE,
+            "closing_penalty_scale": cls.CLEARANCE_CLOSING_PENALTY_SCALE,
+            "hazard_threshold": cls.CLEARANCE_HAZARD_THRESHOLD,
+            "hazard_penalty_scale": cls.CLEARANCE_HAZARD_PENALTY_SCALE,
+            "wall_contact_penalty": cls.WALL_CONTACT_PENALTY,
+            "collision_entry_penalty": cls.COLLISION_ENTRY_PENALTY,
+            "collision_impact_scale": cls.COLLISION_IMPACT_PENALTY_SCALE,
+            "collision_impact_cap": cls.COLLISION_IMPACT_PENALTY_CAP,
+            "wall_contact_limit": cls.WALL_CONTACT_TRUNCATION_STEPS,
+            "collision_entry_limit": cls.COLLISION_LOOP_ENTRY_LIMIT,
+            "collision_window_steps": cls.COLLISION_LOOP_WINDOW_STEPS,
+        }
+
     def step(self, action: int | DrivingAction | DriverControls) -> StepResult:
         if isinstance(action, DriverControls):
             controls = action
@@ -557,6 +674,35 @@ class DrivingEnv:
             telemetry = self.vehicle.last_telemetry
         elif after.distance < self.circuit.collision_radius - 4.0:
             self._collision_contact = False
+
+        if self._collision_contact:
+            self._wall_contact_steps += 1
+        else:
+            self._wall_contact_steps = 0
+
+        # Keep exact entry timestamps rather than a reset-on-idle counter. The
+        # active set is therefore a true sliding window: an entry expires as
+        # soon as it is 180 simulation ticks old, independent of later hits.
+        collision_step = self.steps
+        while (
+            self._collision_entry_steps
+            and collision_step - self._collision_entry_steps[0]
+            >= self.COLLISION_LOOP_WINDOW_STEPS
+        ):
+            self._collision_entry_steps.popleft()
+        if collision_started:
+            self._collision_entry_steps.append(collision_step)
+        self._recent_collision_entries = len(self._collision_entry_steps)
+        if self._collision_entry_steps:
+            self._steps_since_collision = (
+                collision_step - self._collision_entry_steps[-1]
+            )
+        else:
+            self._steps_since_collision = self.COLLISION_LOOP_WINDOW_STEPS
+        self._collision_looped = (
+            self._wall_contact_steps >= self.WALL_CONTACT_TRUNCATION_STEPS
+            or self._recent_collision_entries >= self.COLLISION_LOOP_ENTRY_LIMIT
+        )
 
         raw_delta_progress = after.progress - self.previous_progress
         delta_progress = raw_delta_progress
@@ -672,12 +818,49 @@ class DrivingEnv:
         forward_clearance = min(
             ray.normalized_distance for ray in rays[middle - 1 : middle + 2]
         )
-        clearance_hazard = clamp((0.38 - forward_clearance) / 0.38, 0.0, 1.0)
+        clearance_hazard = clamp(
+            (self.CLEARANCE_HAZARD_THRESHOLD - forward_clearance)
+            / self.CLEARANCE_HAZARD_THRESHOLD,
+            0.0,
+            1.0,
+        )
+        previous_usable_clearance = self._usable_clearance
+        usable_clearance, green_ray_fraction = self._clearance_snapshot(rays)
+        clearance_delta = usable_clearance - previous_usable_clearance
+        motion_ratio = clamp(telemetry.speed / max_speed, 0.0, 1.0)
+        clearance_gain = (
+            max(0.0, clearance_delta)
+            * self.CLEARANCE_GAIN_REWARD_SCALE
+            * motion_ratio
+        )
+        closing_amount = max(0.0, -clearance_delta)
+        wall_closing_penalty = -(
+            closing_amount
+            * self.CLEARANCE_CLOSING_PENALTY_SCALE
+            * (0.35 + 0.65 * motion_ratio)
+        )
+        self._previous_usable_clearance = previous_usable_clearance
+        self._usable_clearance = usable_clearance
+        self._clearance_delta = clearance_delta
+        self._green_ray_fraction = green_ray_fraction
+        self._wall_closing = closing_amount > 1e-9
+        self._clearance_motion_ratio = motion_ratio
         productive_speed = (
             forward_speed_ratio
             * forward_alignment
             * center_factor
             * forward_clearance
+        )
+        # This small state reward distinguishes a broadly open green fan from
+        # the same front corridor with blocked side escape routes. Forward
+        # motion, alignment, and centering gate it, so a parked car earns zero;
+        # its 0.025 ceiling also leaves signed progress as the dominant signal.
+        green_clearance_reward = (
+            self.GREEN_DENSITY_REWARD_SCALE
+            * green_ray_fraction
+            * forward_speed_ratio
+            * forward_alignment
+            * center_factor
         )
         stagnation_excess = max(
             0, self._stagnation_steps - self.STAGNATION_GRACE_STEPS
@@ -690,19 +873,30 @@ class DrivingEnv:
             # Speed is useful only while aligned, centered, and looking into
             # clear track. Standing still can never farm this term.
             "pace": 0.045 * productive_speed,
+            "green_clearance": green_clearance_reward,
             "road": 0.0 if on_road else -0.12,
             "alignment": -0.05
             * forward_speed_ratio
             * (1.0 - forward_alignment),
             "track_offset": -0.04 * forward_speed_ratio * offset_ratio**2,
             "slip": -0.04 * abs(telemetry.lateral_speed) / max_speed,
-            "clearance": -0.14
+            "clearance": -self.CLEARANCE_HAZARD_PENALTY_SCALE
             * forward_speed_ratio
             * clearance_hazard**2,
+            "clearance_gain": clearance_gain,
+            "wall_closing": wall_closing_penalty,
             "reverse": -0.16 * reverse_speed_ratio,
-            "barrier_contact": -0.10 if collided else 0.0,
+            "barrier_contact": (
+                -self.WALL_CONTACT_PENALTY
+                if self._collision_contact
+                else 0.0
+            ),
             "collision": (
-                -2.0 - min(6.0, impact_speed * 0.08)
+                -self.COLLISION_ENTRY_PENALTY
+                - min(
+                    self.COLLISION_IMPACT_PENALTY_CAP,
+                    impact_speed * self.COLLISION_IMPACT_PENALTY_SCALE,
+                )
                 if collision_started
                 else 0.0
             ),
@@ -715,14 +909,20 @@ class DrivingEnv:
         self.previous_progress = after.progress
         self.last_projection = after
         stagnated = self._stagnation_steps >= self.STAGNATION_LIMIT_STEPS
-        truncated = self.steps >= self.max_steps or stagnated
-        truncation_reason = (
-            "stagnation"
-            if stagnated
-            else "step_limit"
-            if self.steps >= self.max_steps
-            else None
+        truncated = (
+            self.steps >= self.max_steps
+            or stagnated
+            or self._collision_looped
         )
+        if self._collision_looped:
+            truncation_reason = "collision_loop"
+        elif stagnated:
+            truncation_reason = "stagnation"
+        elif self.steps >= self.max_steps:
+            truncation_reason = "step_limit"
+        else:
+            truncation_reason = None
+        self._last_truncation_reason = truncation_reason
         info: dict[str, object] = {
             "circuit": self.circuit.slug,
             "terrain": active_terrain.kind.value,
@@ -748,6 +948,22 @@ class DrivingEnv:
             "impact_speed": impact_speed,
             "heading_alignment": heading_alignment,
             "forward_clearance": forward_clearance,
+            "usable_clearance": self._usable_clearance,
+            "previous_usable_clearance": self._previous_usable_clearance,
+            "clearance_delta": self._clearance_delta,
+            "green_ray_fraction": self._green_ray_fraction,
+            "wall_closing": self._wall_closing,
+            "clearance_motion_ratio": self._clearance_motion_ratio,
+            "clearance_green_threshold": self.CLEARANCE_GREEN_THRESHOLD,
+            "wall_contact_active": self._collision_contact,
+            "wall_contact_steps": self._wall_contact_steps,
+            "wall_contact_limit": self.WALL_CONTACT_TRUNCATION_STEPS,
+            "recent_collision_entries": self._recent_collision_entries,
+            "collision_entry_limit": self.COLLISION_LOOP_ENTRY_LIMIT,
+            "collision_loop_window_steps": self.COLLISION_LOOP_WINDOW_STEPS,
+            "steps_since_collision": self._steps_since_collision,
+            "collision_looped": self._collision_looped,
+            "clearance_objective": self._clearance_objective_config(),
             "stagnation_steps": self._stagnation_steps,
             "stagnated": stagnated,
             "truncation_reason": truncation_reason,
@@ -813,6 +1029,23 @@ class DrivingEnv:
                     + 2
                 ]
             ),
+            "usable_clearance": self._usable_clearance,
+            "previous_usable_clearance": self._previous_usable_clearance,
+            "clearance_delta": self._clearance_delta,
+            "green_ray_fraction": self._green_ray_fraction,
+            "wall_closing": self._wall_closing,
+            "clearance_motion_ratio": self._clearance_motion_ratio,
+            "clearance_green_threshold": self.CLEARANCE_GREEN_THRESHOLD,
+            "wall_contact_active": self._collision_contact,
+            "wall_contact_steps": self._wall_contact_steps,
+            "wall_contact_limit": self.WALL_CONTACT_TRUNCATION_STEPS,
+            "recent_collision_entries": self._recent_collision_entries,
+            "collision_entry_limit": self.COLLISION_LOOP_ENTRY_LIMIT,
+            "collision_loop_window_steps": self.COLLISION_LOOP_WINDOW_STEPS,
+            "steps_since_collision": self._steps_since_collision,
+            "collision_looped": self._collision_looped,
+            "truncation_reason": self._last_truncation_reason,
+            "clearance_objective": self._clearance_objective_config(),
             "stagnation_steps": self._stagnation_steps,
             "stagnation_limit_steps": self.STAGNATION_LIMIT_STEPS,
             "damage": state.damage,

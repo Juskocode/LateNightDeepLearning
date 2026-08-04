@@ -208,6 +208,77 @@ class DrivingLearningVisualizationTests(unittest.TestCase):
         )
         self.assertEqual(self.env.telemetry(), before)
 
+    def test_clearance_hud_explains_contact_and_safety_intervention_read_only(self):
+        before = self.env.telemetry()
+        contact = {
+            **self.telemetry,
+            "environment": {
+                "usable_clearance": 0.21,
+                "clearance_delta": -0.031,
+                "green_ray_fraction": 2 / 9,
+                "clearance_green_threshold": 0.58,
+                "wall_closing": True,
+                "wall_contact_active": True,
+                "wall_contact_steps": 12,
+                "wall_contact_limit": 45,
+                "recent_collision_entries": 3,
+                "collision_entry_limit": 4,
+                "collision_looped": False,
+            },
+            "safety_prior": {
+                "proposed_action": int(DrivingAction.ACCELERATE),
+                "executed_action": int(DrivingAction.BRAKE),
+                "intervened": True,
+                "reason": "critical_brake",
+                "interventions": 7,
+                "decisions": 120,
+            },
+        }
+
+        contact_surface = self.visualization.draw(telemetry=contact).copy()
+        rendered_labels = {key[0] for key in self.visualization._text_surfaces}
+
+        self.assertIn("GREEN CLEARANCE", rendered_labels)
+        self.assertIn("WALL CONTACT 12/45 · HITS 3/4", rendered_labels)
+        self.assertTrue(
+            any(
+                label.startswith("SHIELD THROTTLE → BRAKE · EMERGENCY BRAKE · 7/120")
+                for label in rendered_labels
+            )
+        )
+
+        clear_surface = self.visualization.draw(
+            telemetry={
+                **contact,
+                "environment": {
+                    **contact["environment"],
+                    "usable_clearance": 0.74,
+                    "clearance_delta": 0.018,
+                    "green_ray_fraction": 7 / 9,
+                    "wall_closing": False,
+                    "wall_contact_active": False,
+                    "wall_contact_steps": 0,
+                    "recent_collision_entries": 0,
+                },
+                "safety_prior": {
+                    "proposed_action": int(DrivingAction.STEER_LEFT),
+                    "executed_action": int(DrivingAction.STEER_LEFT),
+                    "intervened": False,
+                    "reason": "clear_road",
+                    "interventions": 2,
+                    "decisions": 200,
+                },
+            }
+        ).copy()
+        rendered_labels = {key[0] for key in self.visualization._text_surfaces}
+        self.assertIn("CLEAR · GREEN RAYS 78%", rendered_labels)
+        self.assertIn("SHIELD PASS LEFT · 2/200", rendered_labels)
+        self.assertNotEqual(
+            pygame.image.tostring(contact_surface, "RGB"),
+            pygame.image.tostring(clear_surface, "RGB"),
+        )
+        self.assertEqual(self.env.telemetry(), before)
+
     def test_curriculum_view_marks_the_random_episode_origin_read_only(self):
         env = DrivingEnv("canyon_maze", seed=29, random_start_curriculum=True)
         before = env.telemetry()

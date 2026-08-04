@@ -4,7 +4,7 @@ Playable arcade environments for watching reinforcement learning from the inside
 
 - **Pacman** supports manual play plus real DQN and Double-DQN training with a four-tab live observatory.
 - **Snake** compares six deep and tabular value-learning methods with held-out seed evaluation, curriculum randomization, and live generalization metrics.
-- **Driving Lab** combines deterministic top-down vehicle physics with DQN, Double DQN, genetic neuroevolution, and a hybrid genetic-DQN population lab. A random-origin lap curriculum reduces start-line memorization; the live dashboard exposes its true origin gate alongside the real network, replay memory, and generation fitness, and `P` starts a one-lap race against the current champion.
+- **Driving Lab** combines deterministic top-down vehicle physics with DQN, Double DQN, genetic neuroevolution, and a hybrid genetic-DQN population lab. A random-origin curriculum reduces start-line memorization; dense nine-ray clearance shaping and an observable safety policy teach wall avoidance; and `P` starts a one-lap race against the current champion.
 
 ![Pacman Double-DQN observatory cycling through the game, vision, metrics, and neural-network views](assets/gifs/pacman-dqn-observatory.gif)
 
@@ -379,6 +379,14 @@ member and are not inherited by children, so ancestry transfers network weights
 rather than stale transitions. Pure `genetic` mode is a useful control because
 it has the same population operators without replay, targets, or TD learning.
 
+Every learned policy also passes through a small deterministic sensor-clearance
+policy. On open road it leaves the neural action untouched. As the forward fan
+closes, it looks farther ahead with speed, steers toward the side with more
+weighted green clearance, and brakes for a critically blocked corridor.
+Telemetry retains the neural proposal, executed action, reason, ray scores, and
+intervention rate. Replay stores the executed action—the one that actually
+caused the transition—so its label remains truthful.
+
 Population evaluation is synchronous and concurrent. Each unfinished member
 owns a private environment, car, policy, replay buffer, and optimizer. The
 trainer submits one short chunk per member to a bounded thread pool, then merges
@@ -440,7 +448,7 @@ The 1,400×760 learning dashboard is fed only by live telemetry:
 
 | Tab | Live evidence |
 |---|---|
-| Overview | Real scored cars and circuit, exact rays, episode-origin gates and relative loop progress, generation-wide cars-per-tick and worker count, population fitness, best/mean history, observations, selected actions, and Q-values |
+| Overview | Real scored cars and circuit, exact rays, green-clearance value and delta, wall/contact state, proposed → executed safety actions, episode-origin gates, generation-wide cars-per-tick and worker count, population fitness, observations, and Q-values |
 | Network | The current network's actual architecture, activations, parameter count, and sampled connection weights |
 | Memory | Replay occupancy, epsilon, loss, TD error, gradient updates, action use, target synchronization, and recent learning state |
 
@@ -487,19 +495,26 @@ environment decisions, so the dashboard reports trainer ticks/s, environment
 decisions/s, worker count, and render FPS separately. Auto-configured hybrid
 members start replay learning after 96 decisions and update every fourth
 transition, producing earlier feedback with less optimizer contention than the
-old 512-step/every-tick schedule. No scored transition is dropped or reordered,
-and headless training still runs exact requested batches at full throughput.
+old 512-step/every-tick schedule. Their population-specific epsilon schedule is
+`0.30 → 0.05` over exactly one evaluation lifetime—about 17.5% exploratory and
+82.5% greedy proposals for the default 900 steps—instead of restarting each
+generation near entirely random behavior. Standalone DQN and explicit
+programmatic configurations keep their own schedules. No scored transition is
+dropped or reordered, and headless training still runs exact requested batches.
 Vectorized immutable circuit geometry evaluates the denser ray fan in one batch,
 and same-pose ray snapshots are reused across panels instead of being recomputed.
 
-Fitness now rewards signed centerline progress symmetrically, gates the small
-pace bonus by alignment, centering, and forward clearance, and applies explicit
-penalties for track offset, slip, reversing, low clearance, barrier contact,
-collision impact, and prolonged stagnation. There is no positive idle/survival
-term: an agent that fails to make meaningful progress is increasingly penalized
-after 90 ticks and truncated at 240. A valid gated loop earns +75. These terms,
-forward clearance, heading alignment, stagnation count, and truncation reason
-are exposed directly in telemetry for inspection.
+Fitness rewards signed centerline progress symmetrically and treats the ray fan
+as a dense potential: increasing usable green clearance earns a motion-scaled
+bonus, while closing it is penalized more than five times as strongly. Barrier
+contact costs `-1.25` on every contact tick, and a new impact costs at least
+`-6` plus its speed-scaled component. Forty-five continuous contact ticks or
+four collision entries inside a 180-tick window end that unproductive
+evaluation early. Track offset, slip, reversing, low clearance, and stagnation
+remain explicit costs. There is no positive idle/survival term; stagnation
+starts after 90 ticks and truncates at 240, while a valid loop earns `+75`.
+Telemetry exposes every reward term, clearance value/delta, contact counter,
+safety intervention, and truncation reason.
 
 Older 12-input driving checkpoints remain loadable. Their five legacy ray
 columns map onto the matching angles in the nine-ray fan; new input columns and
@@ -509,8 +524,9 @@ migration time.
 The race always advances at a fixed 60 simulation steps per second, regardless
 of the accelerated training setting. Drive with arrows or `WASD` and brake with
 `Space`. The opponent is an isolated, frozen clone of the current generation's
-best available policy, and the human and champion receive independent but
-identically configured environments. Race actions cannot add replay items,
+best available policy with the same deterministic sensor-clearance filter used
+during evaluation; human input remains direct. The human and champion receive
+independent but identically configured environments. Race actions cannot add replay items,
 perform optimizer steps, change fitness, or alter selection. This makes `P` a
 direct qualitative check rather than another source of training data.
 
