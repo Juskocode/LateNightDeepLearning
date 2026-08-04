@@ -405,7 +405,7 @@ actions. Deep modes use an inspectable network:
 | `dqn` | Replay-based TD updates with an online and target network | The same learner continues into the next episode |
 | `double_dqn` | The online network selects the bootstrap action; the target network evaluates it | The same learner continues into the next episode |
 | `genetic` | Nothing: each weight genome drives greedily and earns fitness | Strict elites survive; tournament-selected parents create crossed-over, Gaussian-mutated children |
-| `genetic_dqn` | Every member explores, stores transitions, and performs Double-DQN updates during its lifetime | Learned weights then undergo the same elitism, crossover, and mutation cycle |
+| `genetic_dqn` | New children explore, store transitions, and perform Double-DQN updates; protected elites run frozen and greedily | Learned child weights then undergo the same elitism, crossover, and mutation cycle |
 
 `genetic_dqn` is a population-based training hybrid: gradient descent can refine
 a policy within one evaluation, while selection can retain useful changes and
@@ -417,10 +417,21 @@ it has the same population operators without replay, targets, or TD learning.
 Every learned policy also passes through a small deterministic sensor-clearance
 policy. On open road it leaves the neural action untouched. As the forward fan
 closes, it looks farther ahead with speed, steers toward the side with more
-weighted green clearance, and brakes for a critically blocked corridor.
+weighted green clearance, brakes for a critically blocked corridor, and uses
+the same brake action as low-speed reverse when the nose is pinned at a wall.
 Telemetry retains the neural proposal, executed action, reason, ray scores, and
 intervention rate. Replay stores the executed action—the one that actually
-caused the transition—so its label remains truthful.
+caused the transition—so its label remains truthful. Population fitness also
+charges a small safety-intervention reliance cost, preventing an unsafe genome
+from receiving the same rank as a policy that drove the corrected path itself.
+
+A wall impact is penalized immediately, but it is no longer an automatic death.
+Entry hysteresis is separate from real barrier penetration, and only genuine
+penetration raises collision pressure. Twelve clean, on-road, forward-progress
+ticks confirm a recovery, clear that incident's pressure, and preserve the
+ordered lap candidate. A car is truncated only after sustained penetration or
+repeated unrecovered impacts; the Overview shows recovery state, pressure,
+successful recoveries, and each member's best lap frontier.
 
 Population evaluation is synchronous and concurrent. Each unfinished member
 owns a private environment, car, policy, replay buffer, and optimizer. The
@@ -438,9 +449,10 @@ Every learning algorithm starts with the same anti-memorization curriculum:
 
 1. Before qualification, every evaluation spawns at a seeded random point on
    the track centerline, facing the local forward tangent.
-2. The 25%, 50%, and 75% safety gates rotate with that episode's origin. A full
-   ordered loop back to the origin earns the `+75` lap reward and ends
-   the evaluation; crossing the permanent grid line is not a shortcut.
+2. The 25%, 50%, and 75% safety gates rotate with that episode's origin. Each
+   ordered gate pays a one-time `+15`; a full loop back to the origin earns the
+   `+300` lap reward and ends the evaluation. Crossing the permanent grid line
+   is not a shortcut.
 3. After the learner proves one random-origin loop, resets use the normal start
    line 80% of the time and another random origin 20% of the time.
 
@@ -450,6 +462,14 @@ members are not ranked on an easier distribution. Manual driving and the `P`
 champion race remain on the normal grid, and random-origin completions never
 replace the normal-start best-lap ghost. Checkpoints preserve both curriculum
 readiness and deterministic spawn continuation.
+
+The default evaluation budget is 1,800 fixed ticks (30 simulated seconds),
+which is long enough for a real Harbor Loop attempt; the former 900-tick cap
+was shorter than a typical clean lap. Completed laps, stagnation, and failed
+recovery still end an evaluation early, so weak policies need not consume the
+full ceiling. In hybrid mode, exact inherited elites are scored greedily without
+optimizer writes while children continue to explore and learn, preserving at
+least one bit-identical policy across each generation boundary.
 
 ```bash
 # Standard and Double-DQN episode learners
@@ -478,12 +498,16 @@ late-night-driving-rl --algorithm genetic_dqn \
 When `--checkpoint` names an existing compatible file, the full policy or
 population ancestry is restored; a clean exit saves back to that path. Use
 `--fresh` to ignore an existing file or `--no-save` to leave it unchanged.
+Driving checkpoints use semantic contract v2. Version-1 files are intentionally
+rejected because action 2 changed from hard brake to brake-then-reverse and the
+milestone/lap reward scale changed; mixing those semantics would corrupt policy
+behavior or population ranking. Start that experiment again with `--fresh`.
 
 The 1,400×760 learning dashboard is fed only by live telemetry:
 
 | Tab | Live evidence |
 |---|---|
-| Overview | Health status and alert reason, real scored cars and circuit, exact rays, green-clearance value and delta, wall/contact state, proposed → executed safety actions, episode-origin gates, generation-wide cars-per-tick and worker count, population fitness, observations, and Q-values |
+| Overview | Health status and alert reason, real scored cars and circuit, exact rays, green-clearance value and delta, collision recovery/pressure, proposed → executed safety actions, current and maximum lap progress, completion and near-finish evidence, end reasons, episode-origin gates, generation-wide cars-per-tick and worker count, raw return and selection fitness, observations, and Q-values |
 | Network | The current network's actual architecture, activations, parameter count, and sampled connection weights |
 | Memory | Replay readiness, update/decision ratio, clipping frequency, Q/TD scale, safety/contact rates, epsilon, action use, target synchronization, and recent learning state; pure genetic mode marks replay/gradient/TD fields `N/A` |
 
@@ -532,9 +556,11 @@ members start replay learning after 96 decisions and update every fourth
 transition, producing earlier feedback with less optimizer contention than the
 old 512-step/every-tick schedule. Their population-specific epsilon schedule is
 `0.30 → 0.05` over exactly one evaluation lifetime—about 17.5% exploratory and
-82.5% greedy proposals for the default 900 steps—instead of restarting each
+82.5% greedy proposals for the default 1,800 steps—instead of restarting each
 generation near entirely random behavior. Standalone DQN and explicit
-programmatic configurations keep their own schedules. No scored transition is
+programmatic configurations keep their own schedules. A protected elite's card
+instead reads **GREEDY / frozen**, because its rollout has no epsilon exploration
+or optimizer writes. No scored transition is
 dropped or reordered, and headless training still runs exact requested batches.
 Vectorized immutable circuit geometry evaluates the denser ray fan in one batch,
 and same-pose ray snapshots are reused across panels instead of being recomputed.
@@ -542,19 +568,23 @@ and same-pose ray snapshots are reused across panels instead of being recomputed
 Fitness rewards signed centerline progress symmetrically and treats the ray fan
 as a dense potential: increasing usable green clearance earns a motion-scaled
 bonus, while closing it is penalized more than five times as strongly. Barrier
-contact costs `-1.25` on every contact tick, and a new impact costs at least
-`-6` plus its speed-scaled component. Forty-five continuous contact ticks or
-four collision entries inside a 180-tick window end that unproductive
-evaluation early. Track offset, slip, reversing, low clearance, and stagnation
-remain explicit costs. There is no positive idle/survival term; stagnation
-starts after 90 ticks and truncates at 240, while a valid loop earns `+75`.
-Telemetry exposes every reward term, clearance value/delta, contact counter,
-safety intervention, and truncation reason.
+penetration costs `-1.25` on each real contact tick, and a new impact costs at
+least `-6` plus its speed-scaled component. Forty-five penetration ticks or
+four entries without a confirmed recovery end that unproductive incident;
+clean recovery clears its pressure. Track offset, slip, reversing, low
+clearance, and stagnation remain explicit costs. There is no positive
+idle/survival term; stagnation starts after 90 ticks and truncates at 240. Each
+ordered gate pays `+15`, and a valid loop earns `+300`. Telemetry exposes every
+reward term, current and maximum progress, recovery pressure, successful
+recoveries, safety interventions, the live safety penalty, raw return, selection
+fitness, and the final termination reason. Hybrid update/decision ratios count
+only decisions from trainable children; frozen-elite driving still remains in
+environment throughput and safety rates.
 
-Older 12-input driving checkpoints remain loadable. Their five legacy ray
-columns map onto the matching angles in the nine-ray fan; new input columns and
-optimizer moments begin at zero, preserving the legacy policy's predictions at
-migration time.
+Within the current v2 semantic contract, a compatible 12-input tensor payload
+can still use the five-to-nine-ray shape bridge: old ray columns map onto matching
+angles while new input columns and optimizer moments begin at zero. This shape
+migration does not override the explicit rejection of pre-v2 driving semantics.
 
 The race always advances at a fixed 60 simulation steps per second, regardless
 of the accelerated training setting. Drive with arrows or `WASD` and brake with
@@ -665,13 +695,13 @@ python -m drivingGameRL.main \
 
 python -m drivingGameRL.main \
   --learn --algorithm genetic_dqn --population 4 --elite-count 1 \
-  --evaluation-steps 600 --workers 4 --seed 19 --steps 1150 \
+  --evaluation-steps 1800 --workers 4 --seed 7 --generations 2 \
   --preview-cars 8 \
-  --screenshot assets/screenshots/driving-learning.png
+  --screenshot assets/screenshots/driving-learning.png --no-save
 
 python -m drivingGameRL.main \
   --learn --algorithm genetic_dqn --population 4 --elite-count 1 \
-  --evaluation-steps 600 --workers 4 --seed 19 \
+  --evaluation-steps 1800 --workers 4 --seed 7 --generations 2 \
   --preview-cars 8 \
   --gif assets/gifs/driving-genetic-dqn.gif --no-save
 ```

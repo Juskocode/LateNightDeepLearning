@@ -67,6 +67,10 @@ class SensorClearancePolicy:
     SPEED_LOOKAHEAD_GAIN = 0.12
     CRITICAL_CLEARANCE = 0.08
     BRAKE_SPEED_RATIO = 0.45
+    RECOVERY_CLEARANCE = 0.10
+    RECOVERY_SPEED_RATIO = 0.30
+    RECOVERY_RELEASE_OFFSET = 0.48
+    RECOVERY_INWARD_ALIGNMENT = -0.15
     GREEN_BONUS = 0.12
     LOOKAHEAD_BASE = 0.45
     LOOKAHEAD_SPEED_GAIN = 0.55
@@ -169,9 +173,25 @@ class SensorClearancePolicy:
             forward_clearance <= danger_threshold
             or abs(projected_offset) >= boundary_threshold
         )
+        front_fan_max = max(rays[middle - 1 : middle + 2])
         critical = (
-            max(rays[middle - 1 : middle + 2]) <= self.CRITICAL_CLEARANCE
+            front_fan_max <= self.CRITICAL_CLEARANCE
             and speed_ratio >= self.BRAKE_SPEED_RATIO
+        )
+        if abs(track_offset) <= self.SCORE_EPSILON:
+            inward_alignment = 1.0
+        else:
+            inward_direction = -math.copysign(math.pi / 2.0, track_offset)
+            inward_alignment = math.cos(
+                heading_error * math.pi - inward_direction
+            )
+        nose_faces_outward = (
+            abs(track_offset) >= self.RECOVERY_RELEASE_OFFSET
+            and inward_alignment <= self.RECOVERY_INWARD_ALIGNMENT
+        )
+        reverse_recovery = (
+            (front_fan_max <= self.RECOVERY_CLEARANCE or nose_faces_outward)
+            and speed_ratio <= self.RECOVERY_SPEED_RATIO
         )
         if not dangerous:
             executed = proposed
@@ -179,6 +199,13 @@ class SensorClearancePolicy:
         elif critical:
             executed = DrivingAction.BRAKE
             reason = "critical_brake"
+        elif reverse_recovery:
+            # BRAKE is an arcade brake-then-reverse action. At a nearly stopped,
+            # fully blocked nose it creates the backwards motion needed for
+            # steering to become effective instead of feeding throttle into the
+            # same barrier until the recovery budget expires.
+            executed = DrivingAction.BRAKE
+            reason = "blocked_reverse_recovery"
         else:
             executed, reason = self._open_side_action(
                 proposed,
@@ -309,6 +336,14 @@ class SensorClearanceStats:
                 SensorClearancePolicy.BOUNDARY_SPEED_TIGHTENING
             ),
             "brake_speed_ratio": SensorClearancePolicy.BRAKE_SPEED_RATIO,
+            "recovery_clearance": SensorClearancePolicy.RECOVERY_CLEARANCE,
+            "recovery_speed_ratio": SensorClearancePolicy.RECOVERY_SPEED_RATIO,
+            "recovery_release_offset": (
+                SensorClearancePolicy.RECOVERY_RELEASE_OFFSET
+            ),
+            "recovery_inward_alignment": (
+                SensorClearancePolicy.RECOVERY_INWARD_ALIGNMENT
+            ),
         }
 
 

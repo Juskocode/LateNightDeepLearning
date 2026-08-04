@@ -25,7 +25,10 @@ from .replay import ReplayBuffer
 class DrivingDQNAgent:
     """CPU DQN learner with replay, target network, and observable internals."""
 
-    CHECKPOINT_VERSION = 1
+    # Version 2 deliberately invalidates policies trained against the former
+    # hard-brake action. Action 2 is now brake-then-reverse, so accepting a v1
+    # tensor payload would preserve numbers while silently changing behavior.
+    CHECKPOINT_VERSION = 2
     LEGACY_OBSERVATION_SIZE = 12
     CURRENT_OBSERVATION_SIZE = 16
     OBSERVATION_BASE_FEATURES = 7
@@ -484,6 +487,11 @@ class DrivingDQNAgent:
         if isinstance(version, bool) or not isinstance(version, (int, np.integer)):
             raise ValueError("Driving DQN checkpoint version must be an integer")
         if int(version) != cls.CHECKPOINT_VERSION:
+            if int(version) == 1:
+                raise ValueError(
+                    "Driving DQN checkpoint v1 uses the legacy driving action "
+                    "contract; start a fresh learner with --fresh"
+                )
             raise ValueError("unsupported Driving DQN checkpoint version")
         required = {"config", "online_network", "target_network"}
         if load_optimizer:

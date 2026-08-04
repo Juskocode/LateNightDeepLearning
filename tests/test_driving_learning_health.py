@@ -58,6 +58,22 @@ def _evolution(**changes) -> EvolutionConfig:
 
 
 class LearningHealthContractTests(unittest.TestCase):
+    def test_optimizer_ratio_can_exclude_frozen_policy_decisions(self):
+        health = build_learning_health(
+            learning={"gradient_steps": 2, "q_values": [0.0]},
+            replay={"size": 8, "capacity": 16},
+            environment_decisions=10,
+            optimization_decisions=5,
+            optimization_updates=2,
+            wall_contact_decisions=2,
+        )
+
+        self.assertEqual(health["optimization"]["decisions"], 5)
+        self.assertAlmostEqual(
+            health["optimization"]["update_to_decision_ratio"], 0.4
+        )
+        self.assertAlmostEqual(health["safety"]["wall_contact_rate"], 0.2)
+
     def test_health_contract_is_finite_stable_and_reports_readiness(self):
         warming = build_learning_health(
             learning={
@@ -129,6 +145,14 @@ class LearningHealthContractTests(unittest.TestCase):
 
 
 class DrivingDQNHealthTests(unittest.TestCase):
+    def test_legacy_driving_action_contract_checkpoint_is_rejected(self):
+        agent = DrivingDQNAgent(_dqn(seed=31))
+        legacy = agent.state_dict()
+        legacy["checkpoint_version"] = 1
+
+        with self.assertRaisesRegex(ValueError, "legacy driving action contract"):
+            agent.load_state_dict(legacy)
+
     def test_agent_reports_replay_updates_gradient_pressure_and_value_scale(self):
         agent = DrivingDQNAgent(_dqn(gradient_clip=1e-8))
         state = np.zeros(16, dtype=np.float32)
@@ -283,7 +307,6 @@ class PopulationHealthTests(unittest.TestCase):
         before_generation = trainer.generation
         before_ids = [member.member_id for member in trainer.population]
         malformed = deepcopy(trainer.state_dict())
-        malformed["generation"] = before_generation + 9
         malformed["population"][0]["result"]["member_id"] = before_ids[1]
 
         with self.assertRaisesRegex(ValueError, "result member_id"):
@@ -293,6 +316,22 @@ class PopulationHealthTests(unittest.TestCase):
         self.assertEqual(
             [member.member_id for member in trainer.population], before_ids
         )
+
+    def test_checkpoint_rejects_legacy_contract_and_forged_elite_lineage(self):
+        trainer = self._trainer(1)
+
+        legacy = deepcopy(trainer.state_dict())
+        legacy["checkpoint_version"] = 1
+        with self.assertRaisesRegex(ValueError, "legacy driving action and reward"):
+            trainer.load_state_dict(legacy)
+
+        forged = deepcopy(trainer.state_dict())
+        for member in forged["population"]:
+            member["parent_ids"] = [member["member_id"]]
+        with self.assertRaisesRegex(ValueError, "generation-zero"):
+            trainer.load_state_dict(forged)
+
+        self.assertEqual(trainer.generation, 0)
 
     def test_curriculum_and_counter_relations_are_strict(self):
         trainer = self._trainer(1)

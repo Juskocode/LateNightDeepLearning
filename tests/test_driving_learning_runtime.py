@@ -37,6 +37,11 @@ def tiny_dqn(seed: int = 13) -> DQNConfig:
 
 
 class LearningRuntimeConfigTests(unittest.TestCase):
+    def test_default_budget_allows_a_real_lap_attempt(self):
+        self.assertEqual(LearningRuntimeConfig().evaluation_steps, 1_800)
+        args = build_parser().parse_args(["--learn"])
+        self.assertEqual(args.evaluation_steps, 1_800)
+
     def test_population_constraints_are_validated(self):
         with self.assertRaises(ValueError):
             LearningRuntimeConfig(population_size=1)
@@ -178,6 +183,20 @@ class DrivingLearningSessionTests(unittest.TestCase):
                 and member.agent.epsilon == 0.30
                 for member in session._population_trainer.population
             )
+        )
+
+        session.step()
+        telemetry = session.telemetry()
+        self.assertTrue(session._population_trainer.current_member.protected_elite)
+        self.assertEqual(telemetry["epsilon"], 0.0)
+        self.assertEqual(telemetry["expected_exploration_fraction"], 0.0)
+        self.assertFalse(telemetry["epsilon_schedule"]["enabled"])
+        self.assertTrue(telemetry["epsilon_schedule"]["protected_elite"])
+        self.assertEqual(
+            telemetry["epsilon_schedule"]["mode"], "protected_elite"
+        )
+        self.assertLess(
+            telemetry["training_decisions"], telemetry["environment_decisions"]
         )
 
     def test_standalone_default_exploration_contract_is_unchanged(self):

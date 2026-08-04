@@ -213,6 +213,12 @@ class PopulationRolloutManager:
                 "episode_lap_progress": float(
                     env_snapshot["episode_lap_progress"]
                 ),
+                "max_episode_lap_progress": float(
+                    env_snapshot.get(
+                        "max_episode_lap_progress",
+                        env_snapshot["episode_lap_progress"],
+                    )
+                ),
                 "laps": int(env_snapshot["laps"]),
                 "steps": int(env_snapshot["steps"]),
                 "episodes": rollout.episodes,
@@ -332,6 +338,12 @@ def scored_population_telemetry(
             "speed": float(env_snapshot["speed"]),
             "progress": float(env_snapshot["progress"]),
             "episode_lap_progress": float(env_snapshot["episode_lap_progress"]),
+            "max_episode_lap_progress": float(
+                env_snapshot.get(
+                    "max_episode_lap_progress",
+                    env_snapshot["episode_lap_progress"],
+                )
+            ),
             "laps": int(env_snapshot["laps"]),
             "collisions": int(env_snapshot["collisions"]),
             "steps": int(row.get("evaluation_step", env_snapshot["steps"])),
@@ -343,6 +355,15 @@ def scored_population_telemetry(
                 else float(row["result"].fitness)
             ),
             "evaluation_return": float(row.get("evaluation_return", 0.0)),
+            "raw_return": float(
+                row.get("raw_return", row.get("evaluation_return", 0.0))
+            ),
+            "selection_fitness": float(
+                row.get("selection_fitness", row.get("evaluation_return", 0.0))
+            ),
+            "safety_intervention_penalty": float(
+                row.get("safety_intervention_penalty", 0.0)
+            ),
             "random_start_curriculum": bool(
                 env_snapshot["random_start_curriculum"]
             ),
@@ -366,6 +387,27 @@ def scored_population_telemetry(
             "wall_contact_active": bool(env_snapshot["wall_contact_active"]),
             "wall_contact_steps": int(env_snapshot["wall_contact_steps"]),
             "wall_contact_limit": int(env_snapshot["wall_contact_limit"]),
+            "collision_recovery_active": bool(
+                env_snapshot.get("collision_recovery_active", False)
+            ),
+            "collision_recovery_steps": int(
+                env_snapshot.get("collision_recovery_steps", 0)
+            ),
+            "collision_recovery_clean_steps": int(
+                env_snapshot.get("collision_recovery_clean_steps", 0)
+            ),
+            "collision_recovery_confirm_steps": int(
+                env_snapshot.get("collision_recovery_confirm_steps", 0)
+            ),
+            "collision_recovery_timeout_steps": int(
+                env_snapshot.get("collision_recovery_timeout_steps", 0)
+            ),
+            "collision_recoveries": int(
+                env_snapshot.get("collision_recoveries", 0)
+            ),
+            "collision_pressure": float(
+                env_snapshot.get("collision_pressure", 0.0)
+            ),
             "recent_collision_entries": int(
                 env_snapshot["recent_collision_entries"]
             ),

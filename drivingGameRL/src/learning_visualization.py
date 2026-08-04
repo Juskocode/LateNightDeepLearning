@@ -1086,12 +1086,28 @@ class DrivingLearningVisualization:
             2 if selected else 1,
             border_radius=4,
         )
-        action = _integer(visual.rollout.get("action"), -1)
-        action_label = (
-            ACTION_LABELS[action][:3] if 0 <= action < len(ACTION_LABELS) else "---"
+        progress = max(
+            0.0,
+            min(
+                1.0,
+                _finite(
+                    visual.rollout.get(
+                        "max_episode_lap_progress",
+                        visual.rollout.get(
+                            "episode_lap_progress",
+                            visual.rollout.get("progress"),
+                        ),
+                    )
+                ),
+            ),
+        )
+        state_label = (
+            "REC"
+            if _flag(visual.rollout.get("collision_recovery_active"))
+            else f"{progress * 100:.0f}%"
         )
         text = self._render_text(
-            f"{visual.label} {action_label}",
+            f"{visual.label} {state_label}",
             size=8,
             color=visual.color,
             bold=True,
@@ -1263,6 +1279,8 @@ class DrivingLearningVisualization:
             "clear_road": "CLEAR ROAD",
             "danger_brake": "BRAKE FOR WALL",
             "critical_brake": "EMERGENCY BRAKE",
+            "blocked_reverse": "LOW-SPEED REVERSE",
+            "blocked_reverse_recovery": "LOW-SPEED REVERSE",
             "danger_steer_left": "OPEN SPACE LEFT",
             "danger_steer_right": "OPEN SPACE RIGHT",
             "danger_steer_left_tiebreak": "LEFT RAY TIEBREAK",
@@ -1369,12 +1387,44 @@ class DrivingLearningVisualization:
         contact_limit = max(1, _integer(data.get("wall_contact_limit"), 1))
         entries = max(0, _integer(data.get("recent_collision_entries")))
         entry_limit = max(1, _integer(data.get("collision_entry_limit"), 1))
+        recovery_present = "collision_recovery_active" in data
+        recovering = _flag(data.get("collision_recovery_active"))
+        recovery_clean_steps = max(
+            0, _integer(data.get("collision_recovery_clean_steps"))
+        )
+        recovery_confirm_steps = max(
+            1, _integer(data.get("collision_recovery_confirm_steps"), 1)
+        )
+        recovery_timeout = max(
+            1, _integer(data.get("collision_recovery_timeout_steps"), 1)
+        )
+        recoveries = max(0, _integer(data.get("collision_recoveries")))
+        collision_pressure = max(
+            0.0, min(1.0, _finite(data.get("collision_pressure")))
+        )
         if looped:
-            wall_state, wall_color = "COLLISION LOOP · RESET", COLORS["red"]
+            wall_state, wall_color = "RECOVERY FAILED · RESET", COLORS["red"]
+        elif recovering:
+            if contact:
+                wall_state = (
+                    f"IMPACT {contact_steps}/{recovery_timeout} · "
+                    f"PRESSURE {collision_pressure * 100:.0f}% · OK {recoveries}"
+                )
+            else:
+                wall_state = (
+                    f"STABILIZING {recovery_clean_steps}/"
+                    f"{recovery_confirm_steps} · "
+                    f"PRESSURE {collision_pressure * 100:.0f}% · OK {recoveries}"
+                )
+            wall_color = COLORS["red"] if contact else COLORS["orange"]
         elif contact:
+            # Compatibility for telemetry captured before explicit recovery
+            # diagnostics were introduced.
             wall_state = (
                 f"WALL CONTACT {contact_steps}/{contact_limit} · "
                 f"HITS {entries}/{entry_limit}"
+                if not recovery_present
+                else f"WALL CONTACT · RECOVERED {recoveries}"
             )
             wall_color = COLORS["red"]
         elif closing:
@@ -1660,7 +1710,9 @@ class DrivingLearningVisualization:
                 member = _integer(
                     item.get("member", item.get("index", item.get("id", index))), index
                 )
-                raw_fitness = item.get("fitness", item.get("score"))
+                raw_fitness = item.get("selection_fitness")
+                if raw_fitness is None:
+                    raw_fitness = item.get("fitness", item.get("score"))
                 if raw_fitness is None:
                     raw_fitness = item.get("evaluation_return")
                 if raw_fitness is None:
@@ -1677,7 +1729,7 @@ class DrivingLearningVisualization:
 
     def _population_panel(self, rect: pygame.Rect, data: Mapping[str, Any]) -> None:
         title = (
-            "LIVE POPULATION RETURN"
+            "LIVE SELECTION FITNESS"
             if _sequence(data.get("active_member_indices"))
             else "POPULATION RANKING"
         )
@@ -2051,7 +2103,29 @@ class DrivingLearningVisualization:
         else:
             generation_detail = f"member {member + 1}/{max(1, population_size)}"
         fitness = _finite(data.get("current_fitness", data.get("fitness")))
+        generation_metrics = _mapping(data.get("generation_metrics"))
+        if not _integer(generation_metrics.get("evaluated_members")):
+            history_rows = _sequence(
+                data.get("generation_history", data.get("history"))
+            )
+            if history_rows:
+                generation_metrics = _mapping(history_rows[-1])
+        completed_laps = max(
+            0, _integer(generation_metrics.get("laps_completed"))
+        )
+        best_progress = max(
+            0.0,
+            min(1.0, _finite(generation_metrics.get("best_progress"))),
+        )
+        progress_detail = (
+            f"{completed_laps} LAP · {best_progress * 100:.0f}% BEST"
+            if generation_metrics
+            else f"best {_compact_number(_finite(data.get('best_fitness', fitness)))}"
+        )
         epsilon = _finite(data.get("epsilon"))
+        epsilon_schedule = _mapping(data.get("epsilon_schedule"))
+        exploration_enabled = _flag(epsilon_schedule.get("enabled", True))
+        protected_elite = _flag(epsilon_schedule.get("protected_elite"))
         health = _mapping(data.get("health"))
         health_status = str(health.get("status", "warming_up")).lower()
         health_colors = {
@@ -2097,16 +2171,24 @@ class DrivingLearningVisualization:
             (
                 "FITNESS",
                 _compact_number(fitness),
-                f"best {_compact_number(_finite(data.get('best_fitness', fitness)))}",
+                progress_detail,
                 COLORS["green"],
             ),
             (
                 "EXPLORATION",
-                f"{epsilon * 100:05.1f}%",
+                f"{epsilon * 100:05.1f}%" if exploration_enabled else "GREEDY",
                 (
-                    f"u/d {_finite(health_optimization.get('update_to_decision_ratio')):.2f}"
-                    if optimization_applicable
-                    else "gradient updates N/A"
+                    (
+                        "protected elite · frozen"
+                        if protected_elite
+                        else "evolution only"
+                    )
+                    if not exploration_enabled
+                    else (
+                        f"u/d {_finite(health_optimization.get('update_to_decision_ratio')):.2f}"
+                        if optimization_applicable
+                        else "gradient updates N/A"
+                    )
                 ),
                 COLORS["magenta"],
             ),

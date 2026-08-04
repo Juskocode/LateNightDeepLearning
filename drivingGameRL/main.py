@@ -94,8 +94,11 @@ def build_parser() -> argparse.ArgumentParser:
     learning.add_argument(
         "--evaluation-steps",
         type=int,
-        default=900,
-        help="Fixed simulation-step budget per policy",
+        default=1800,
+        help=(
+            "Maximum simulation-step budget per policy (default: 1800; "
+            "successful laps and unrecoverable stalls still finish early)"
+        ),
     )
     learning.add_argument(
         "--workers",

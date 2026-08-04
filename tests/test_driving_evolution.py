@@ -257,6 +257,50 @@ class DrivingEvolutionTests(unittest.TestCase):
         self.assertEqual(pure.population[0].agent.gradient_steps, 0)
         self.assertEqual(hybrid.population[0].agent.gradient_steps, 1)
 
+    def test_hybrid_elite_is_frozen_while_children_keep_learning(self):
+        trainer = PopulationTrainer(
+            _evolution_config(
+                algorithm="genetic_dqn",
+                population_size=2,
+                tournament_size=2,
+            ),
+            _dqn_config(),
+            auto_evolve=False,
+            parallel_workers=1,
+        )
+        self.addCleanup(trainer.close)
+        _set_result(trainer, 0, 9.0)
+        _set_result(trainer, 1, 1.0)
+        trainer.evolve()
+        elite, child = trainer.population
+        elite_before = _parameters(elite.agent).clone()
+        child_before = _parameters(child.agent).clone()
+
+        trainer.step()
+
+        self.assertTrue(elite.protected_elite)
+        self.assertTrue(torch.equal(_parameters(elite.agent), elite_before))
+        self.assertEqual(len(elite.agent.replay), 0)
+        self.assertEqual(elite.agent.gradient_steps, 0)
+        self.assertFalse(child.protected_elite)
+        self.assertFalse(torch.equal(_parameters(child.agent), child_before))
+        self.assertEqual(len(child.agent.replay), 1)
+        self.assertEqual(child.agent.gradient_steps, 1)
+        telemetry = trainer.telemetry()
+        self.assertEqual(telemetry["environment_decisions"], 2)
+        self.assertEqual(telemetry["training_decisions"], 1)
+        self.assertEqual(telemetry["health"]["optimization"]["decisions"], 1)
+        self.assertEqual(
+            telemetry["health"]["optimization"]["update_to_decision_ratio"],
+            1.0,
+        )
+        for row in telemetry["population"]:
+            expected = (
+                row["raw_return"]
+                - row["safety_intervention_penalty"]
+            )
+            self.assertAlmostEqual(row["selection_fitness"], expected)
+
     def test_history_is_bounded_and_checkpoint_keeps_champion_genome(self):
         config = _evolution_config(history_capacity=2)
         trainer = PopulationTrainer(config, _dqn_config(), auto_evolve=False)

@@ -6,7 +6,12 @@ import unittest
 
 import numpy as np
 
-from drivingGameRL.src.environment import DrivingAction, DrivingEnv, StepResult
+from drivingGameRL.src.environment import (
+    ACTION_CONTROLS,
+    DrivingAction,
+    DrivingEnv,
+    StepResult,
+)
 from drivingGameRL.src.learning_runtime import (
     ChampionRace,
     DrivingLearningSession,
@@ -91,6 +96,23 @@ class SensorClearancePolicyTests(unittest.TestCase):
         self.assertTrue(decision.intervened)
         self.assertTrue(decision.dangerous)
         self.assertEqual(decision.reason, "critical_brake")
+
+    def test_blocked_low_speed_corridor_selects_observable_reverse_recovery(self):
+        observation = _observation(speed=0.08, rays=(0.05,) * 9)
+
+        decision = self.policy.decide(observation, DrivingAction.ACCELERATE)
+        controls = ACTION_CONTROLS[DrivingAction.BRAKE]
+
+        self.assertTrue(decision.dangerous)
+        self.assertTrue(decision.intervened)
+        self.assertEqual(decision.executed_action, int(DrivingAction.BRAKE))
+        self.assertEqual(decision.reason, "blocked_reverse_recovery")
+        self.assertLess(controls.throttle, 0.0)
+        self.assertGreater(controls.brake, 0.0)
+        self.assertLessEqual(
+            decision.speed_ratio,
+            SensorClearancePolicy.RECOVERY_SPEED_RATIO,
+        )
 
     def test_speed_lookahead_intervenes_earlier_without_changing_clear_road(self):
         rays = (0.9, 0.9, 0.8, 0.62, 0.53, 0.72, 0.9, 0.9, 0.9)
@@ -452,6 +474,43 @@ class SensorClearanceIntegrationTests(unittest.TestCase):
                         )
                 finally:
                     trainer.close()
+
+    def test_genetic_fitness_charges_reliance_on_safety_interventions(self):
+        dangerous = _observation(speed=0.8, rays=(0.05,) * 9)
+        trainer = PopulationTrainer(
+            EvolutionConfig(
+                algorithm="genetic",
+                population_size=2,
+                elite_count=1,
+                tournament_size=2,
+                evaluation_steps=1,
+                seed=35,
+            ),
+            _tiny_dqn(seed=35),
+            parallel_workers=1,
+            auto_evolve=False,
+        )
+        self.addCleanup(trainer.close)
+        for member, runtime in zip(trainer.population, trainer._member_runtimes):
+            runtime.observation = np.asarray(dangerous, dtype=np.float32)
+            member.agent.select_action = lambda _state, explore=True: int(
+                DrivingAction.ACCELERATE
+            )
+            runtime.env.step = lambda _action: _result(dangerous, reward=1.0)
+        trainer._sync_focal_aliases(0)
+
+        trainer.step()
+
+        for member in trainer.population:
+            result = member.result
+            self.assertIsNotNone(result)
+            self.assertEqual(result.total_reward, 1.0)
+            self.assertEqual(result.safety_interventions, 1)
+            self.assertAlmostEqual(
+                result.fitness,
+                1.0 - trainer.SAFETY_INTERVENTION_FITNESS_PENALTY,
+            )
+            self.assertEqual(result.end_reason, "evaluation_budget")
 
     def test_champion_race_reproduces_the_evaluated_safety_filter(self):
         session = DrivingLearningSession(

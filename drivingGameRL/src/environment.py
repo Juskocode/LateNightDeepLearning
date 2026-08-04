@@ -27,7 +27,11 @@ class DrivingAction(IntEnum):
 ACTION_CONTROLS = {
     DrivingAction.COAST: DriverControls(),
     DrivingAction.ACCELERATE: DriverControls(throttle=1.0),
-    DrivingAction.BRAKE: DriverControls(brake=1.0),
+    # One discrete action remains useful on both sides of zero speed: it first
+    # arrests forward motion, then becomes a deliberate reverse escape.  A
+    # small brake component keeps the control readable as a brake without
+    # overpowering the negative throttle once the car has stopped.
+    DrivingAction.BRAKE: DriverControls(throttle=-1.0, brake=0.15),
     DrivingAction.STEER_LEFT: DriverControls(throttle=0.72, steering=-1.0),
     DrivingAction.STEER_RIGHT: DriverControls(throttle=0.72, steering=1.0),
 }
@@ -92,6 +96,8 @@ class DrivingEnv:
     MAX_GHOST_SAMPLES = 4_096
     GHOST_SAMPLE_INTERVAL = 1.0 / 30.0
     LAP_CHECKPOINTS = (0.25, 0.50, 0.75)
+    ORDERED_CHECKPOINT_REWARD = 15.0
+    LAP_COMPLETION_REWARD = 300.0
     MAX_LAP_PROGRESS_STEP = 0.075
     BEST_LAP_EPSILON = 1e-9
     SENSOR_MAX_DISTANCE = 150.0
@@ -123,7 +129,11 @@ class DrivingEnv:
     COLLISION_ENTRY_PENALTY = 6.0
     COLLISION_IMPACT_PENALTY_SCALE = 0.12
     COLLISION_IMPACT_PENALTY_CAP = 12.0
-    WALL_CONTACT_TRUNCATION_STEPS = 45
+    COLLISION_RECOVERY_CONFIRM_STEPS = 12
+    COLLISION_RECOVERY_TIMEOUT_STEPS = 45
+    # Compatibility name retained for dashboards and callers written before
+    # collision recovery became an explicit state machine.
+    WALL_CONTACT_TRUNCATION_STEPS = COLLISION_RECOVERY_TIMEOUT_STEPS
     COLLISION_LOOP_ENTRY_LIMIT = 4
     COLLISION_LOOP_WINDOW_STEPS = 180
     NORMAL_START_PROBABILITY = 0.80
@@ -186,6 +196,7 @@ class DrivingEnv:
         self._spawn_progress = 0.0
         self._lap_origin_progress = 0.0
         self._episode_lap_progress = 0.0
+        self._max_episode_lap_progress = 0.0
         self._last_curriculum_lap_completed = False
         self.steps = 0
         self.laps = 0
@@ -202,10 +213,16 @@ class DrivingEnv:
         self._lap_progress = 0.0
         self.previous_progress = 0.0
         self._stagnation_steps = 0
+        self._wall_contact_active = False
         self._wall_contact_steps = 0
         self._collision_entry_steps: deque[int] = deque()
         self._recent_collision_entries = 0
         self._steps_since_collision = self.COLLISION_LOOP_WINDOW_STEPS
+        self._collision_recovery_active = False
+        self._collision_recovery_steps = 0
+        self._collision_recovery_clean_steps = 0
+        self._collision_recoveries = 0
+        self._collision_pressure = 0.0
         self._collision_looped = False
         self._last_truncation_reason: str | None = None
         self._usable_clearance = 0.0
@@ -253,15 +270,22 @@ class DrivingEnv:
         self.last_projection = self.circuit.project(position)
         self.previous_progress = self.last_projection.progress
         self._stagnation_steps = 0
+        self._wall_contact_active = False
         self._wall_contact_steps = 0
         self._collision_entry_steps.clear()
         self._recent_collision_entries = 0
         self._steps_since_collision = self.COLLISION_LOOP_WINDOW_STEPS
+        self._collision_recovery_active = False
+        self._collision_recovery_steps = 0
+        self._collision_recovery_clean_steps = 0
+        self._collision_recoveries = 0
+        self._collision_pressure = 0.0
         self._collision_looped = False
         self._last_truncation_reason = None
         self._spawn_progress = self.last_projection.progress
         self._lap_origin_progress = self.last_projection.progress
         self._episode_lap_progress = 0.0
+        self._max_episode_lap_progress = 0.0
         self._last_curriculum_lap_completed = False
         self.last_reward_terms = {}
         self._reset_lap_recording()
@@ -640,9 +664,11 @@ class DrivingEnv:
             "collision_entry_penalty": cls.COLLISION_ENTRY_PENALTY,
             "collision_impact_scale": cls.COLLISION_IMPACT_PENALTY_SCALE,
             "collision_impact_cap": cls.COLLISION_IMPACT_PENALTY_CAP,
-            "wall_contact_limit": cls.WALL_CONTACT_TRUNCATION_STEPS,
+            "wall_contact_limit": cls.COLLISION_RECOVERY_TIMEOUT_STEPS,
             "collision_entry_limit": cls.COLLISION_LOOP_ENTRY_LIMIT,
             "collision_window_steps": cls.COLLISION_LOOP_WINDOW_STEPS,
+            "recovery_confirm_steps": cls.COLLISION_RECOVERY_CONFIRM_STEPS,
+            "recovery_timeout_steps": cls.COLLISION_RECOVERY_TIMEOUT_STEPS,
         }
 
     def step(self, action: int | DrivingAction | DriverControls) -> StepResult:
@@ -664,6 +690,7 @@ class DrivingEnv:
             after.point, self.circuit.collision_radius
         )
         collided = penetrated_barrier
+        self._wall_contact_active = collided
         collision_started = collided and not self._collision_contact
         if collision_started:
             self.collisions += 1
@@ -675,10 +702,15 @@ class DrivingEnv:
         elif after.distance < self.circuit.collision_radius - 4.0:
             self._collision_contact = False
 
-        if self._collision_contact:
+        # Collision-entry latching prevents one scrape from being counted as
+        # many impacts.  Recovery pressure is intentionally different: only a
+        # tick that physically penetrated the barrier contributes contact cost.
+        if collided:
             self._wall_contact_steps += 1
-        else:
-            self._wall_contact_steps = 0
+            self._collision_recovery_active = True
+            self._collision_recovery_clean_steps = 0
+        if self._collision_recovery_active:
+            self._collision_recovery_steps += 1
 
         # Keep exact entry timestamps rather than a reset-on-idle counter. The
         # active set is therefore a true sliding window: an entry expires as
@@ -699,10 +731,6 @@ class DrivingEnv:
             )
         else:
             self._steps_since_collision = self.COLLISION_LOOP_WINDOW_STEPS
-        self._collision_looped = (
-            self._wall_contact_steps >= self.WALL_CONTACT_TRUNCATION_STEPS
-            or self._recent_collision_entries >= self.COLLISION_LOOP_ENTRY_LIMIT
-        )
 
         raw_delta_progress = after.progress - self.previous_progress
         delta_progress = raw_delta_progress
@@ -712,6 +740,7 @@ class DrivingEnv:
             delta_progress -= 1.0
 
         valid_forward_progress = 0.0 < delta_progress <= self.MAX_LAP_PROGRESS_STEP
+        ordered_checkpoint_advanced = False
         relative_previous = (
             self.previous_progress - self._lap_origin_progress
         ) % 1.0
@@ -743,6 +772,7 @@ class DrivingEnv:
                     and relative_previous < checkpoint <= relative_after
                 ):
                     self._next_lap_checkpoint += 1
+                    ordered_checkpoint_advanced = True
 
         lap_completed = (
             forward_lap_origin_crossed
@@ -783,6 +813,10 @@ class DrivingEnv:
         curriculum_lap_completed = self.random_start_curriculum and lap_completed
         episode_lap_progress = 1.0 if lap_completed else self._lap_progress
         self._episode_lap_progress = episode_lap_progress
+        self._max_episode_lap_progress = max(
+            self._max_episode_lap_progress,
+            episode_lap_progress,
+        )
         if curriculum_lap_completed:
             self._curriculum_unlocked = True
         self._last_curriculum_lap_completed = curriculum_lap_completed
@@ -797,6 +831,49 @@ class DrivingEnv:
             self._stagnation_steps += 1
 
         on_road = after.distance <= self.circuit.track_width * 0.5
+        meaningful_forward_recovery = (
+            self._collision_recovery_active
+            and not collided
+            and on_road
+            and forward_distance >= self.STAGNATION_PROGRESS_DISTANCE
+        )
+        if meaningful_forward_recovery:
+            self._collision_recovery_clean_steps += 1
+        elif self._collision_recovery_active:
+            self._collision_recovery_clean_steps = 0
+
+        if (
+            self._collision_recovery_active
+            and self._collision_recovery_clean_steps
+            >= self.COLLISION_RECOVERY_CONFIRM_STEPS
+        ):
+            # A stable return to forward road motion ends the incident without
+            # touching ordered lap gates, timers, or accumulated lap progress.
+            self._collision_recoveries += 1
+            self._collision_recovery_active = False
+            self._collision_recovery_steps = 0
+            self._collision_recovery_clean_steps = 0
+            self._wall_contact_steps = 0
+            self._collision_entry_steps.clear()
+            self._recent_collision_entries = 0
+            self._steps_since_collision = self.COLLISION_LOOP_WINDOW_STEPS
+            self._collision_contact = False
+
+        if self._collision_recovery_active:
+            contact_pressure = (
+                self._wall_contact_steps / self.COLLISION_RECOVERY_TIMEOUT_STEPS
+            )
+            entry_pressure = (
+                self._recent_collision_entries / self.COLLISION_LOOP_ENTRY_LIMIT
+            )
+            self._collision_pressure = clamp(
+                max(contact_pressure, entry_pressure), 0.0, 1.0
+            )
+        else:
+            self._collision_pressure = 0.0
+        self._collision_looped = (
+            self._collision_recovery_active and self._collision_pressure >= 1.0
+        )
         max_speed = max(1.0, self.vehicle.build.max_speed)
         forward_speed_ratio = clamp(
             max(0.0, telemetry.longitudinal_speed) / max_speed, 0.0, 1.0
@@ -888,7 +965,7 @@ class DrivingEnv:
             "reverse": -0.16 * reverse_speed_ratio,
             "barrier_contact": (
                 -self.WALL_CONTACT_PENALTY
-                if self._collision_contact
+                if collided
                 else 0.0
             ),
             "collision": (
@@ -901,7 +978,14 @@ class DrivingEnv:
                 else 0.0
             ),
             "stagnation": -min(0.12, stagnation_excess * 0.002),
-            "lap": 75.0 if lap_completed else 0.0,
+            # Ordered gates are monotonically consumed within one lap
+            # candidate, so crossing back and forth cannot farm this signal.
+            "checkpoint": (
+                self.ORDERED_CHECKPOINT_REWARD
+                if ordered_checkpoint_advanced
+                else 0.0
+            ),
+            "lap": self.LAP_COMPLETION_REWARD if lap_completed else 0.0,
         }
         reward = sum(reward_terms.values())
         self.last_reward_terms = reward_terms
@@ -929,8 +1013,11 @@ class DrivingEnv:
             "on_road": on_road,
             "progress": after.progress,
             "episode_lap_progress": episode_lap_progress,
+            "max_episode_lap_progress": self._max_episode_lap_progress,
             "laps": self.laps,
             "lap_completed": lap_completed,
+            "checkpoint_advanced": ordered_checkpoint_advanced,
+            "next_lap_checkpoint": self._next_lap_checkpoint,
             "current_lap_time": self.current_lap_time,
             "last_lap_time": self.last_lap_time,
             "best_lap_time": self.best_lap_time,
@@ -955,14 +1042,27 @@ class DrivingEnv:
             "wall_closing": self._wall_closing,
             "clearance_motion_ratio": self._clearance_motion_ratio,
             "clearance_green_threshold": self.CLEARANCE_GREEN_THRESHOLD,
-            "wall_contact_active": self._collision_contact,
+            "wall_contact_active": self._wall_contact_active,
             "wall_contact_steps": self._wall_contact_steps,
-            "wall_contact_limit": self.WALL_CONTACT_TRUNCATION_STEPS,
+            "wall_contact_limit": self.COLLISION_RECOVERY_TIMEOUT_STEPS,
             "recent_collision_entries": self._recent_collision_entries,
             "collision_entry_limit": self.COLLISION_LOOP_ENTRY_LIMIT,
             "collision_loop_window_steps": self.COLLISION_LOOP_WINDOW_STEPS,
             "steps_since_collision": self._steps_since_collision,
             "collision_looped": self._collision_looped,
+            "collision_recovery_active": self._collision_recovery_active,
+            "collision_recovery_steps": self._collision_recovery_steps,
+            "collision_recovery_clean_steps": (
+                self._collision_recovery_clean_steps
+            ),
+            "collision_recovery_confirm_steps": (
+                self.COLLISION_RECOVERY_CONFIRM_STEPS
+            ),
+            "collision_recovery_timeout_steps": (
+                self.COLLISION_RECOVERY_TIMEOUT_STEPS
+            ),
+            "collision_recoveries": self._collision_recoveries,
+            "collision_pressure": self._collision_pressure,
             "clearance_objective": self._clearance_objective_config(),
             "stagnation_steps": self._stagnation_steps,
             "stagnated": stagnated,
@@ -996,6 +1096,7 @@ class DrivingEnv:
             "best_lap_time": self.best_lap_time,
             "lap_candidate_valid": self._lap_candidate_armed,
             "episode_lap_progress": self._episode_lap_progress,
+            "max_episode_lap_progress": self._max_episode_lap_progress,
             "lap_origin_progress": self._lap_origin_progress,
             "random_start_curriculum": self.random_start_curriculum,
             "curriculum_unlocked": self._curriculum_unlocked,
@@ -1036,14 +1137,27 @@ class DrivingEnv:
             "wall_closing": self._wall_closing,
             "clearance_motion_ratio": self._clearance_motion_ratio,
             "clearance_green_threshold": self.CLEARANCE_GREEN_THRESHOLD,
-            "wall_contact_active": self._collision_contact,
+            "wall_contact_active": self._wall_contact_active,
             "wall_contact_steps": self._wall_contact_steps,
-            "wall_contact_limit": self.WALL_CONTACT_TRUNCATION_STEPS,
+            "wall_contact_limit": self.COLLISION_RECOVERY_TIMEOUT_STEPS,
             "recent_collision_entries": self._recent_collision_entries,
             "collision_entry_limit": self.COLLISION_LOOP_ENTRY_LIMIT,
             "collision_loop_window_steps": self.COLLISION_LOOP_WINDOW_STEPS,
             "steps_since_collision": self._steps_since_collision,
             "collision_looped": self._collision_looped,
+            "collision_recovery_active": self._collision_recovery_active,
+            "collision_recovery_steps": self._collision_recovery_steps,
+            "collision_recovery_clean_steps": (
+                self._collision_recovery_clean_steps
+            ),
+            "collision_recovery_confirm_steps": (
+                self.COLLISION_RECOVERY_CONFIRM_STEPS
+            ),
+            "collision_recovery_timeout_steps": (
+                self.COLLISION_RECOVERY_TIMEOUT_STEPS
+            ),
+            "collision_recoveries": self._collision_recoveries,
+            "collision_pressure": self._collision_pressure,
             "truncation_reason": self._last_truncation_reason,
             "clearance_objective": self._clearance_objective_config(),
             "stagnation_steps": self._stagnation_steps,

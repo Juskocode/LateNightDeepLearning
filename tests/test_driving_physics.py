@@ -418,7 +418,9 @@ class DrivingPhysicsTests(unittest.TestCase):
             result = env.step(DrivingAction.COAST)
         self.assertTrue(result.info["lap_completed"])
         self.assertEqual(env.laps, 1)
-        self.assertEqual(result.info["reward_terms"]["lap"], 75.0)
+        self.assertEqual(
+            result.info["reward_terms"]["lap"], env.LAP_COMPLETION_REWARD
+        )
 
     def test_collision_recovers_to_track_and_stays_finite_under_stress(self):
         env = DrivingEnv("harbor_loop", seed=5)

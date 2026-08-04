@@ -46,6 +46,27 @@ class DrivingRewardShapingTests(unittest.TestCase):
         self.assertEqual(result.info["stagnation_steps"], 0)
         self.assertFalse(result.truncated)
 
+    def test_max_episode_progress_is_monotonic_and_resettable(self):
+        env = DrivingEnv("harbor_loop", seed=8, max_steps=2_000)
+        for progress in (0.05, 0.10):
+            place_on_centerline(env, progress)
+            forward = env.step(DrivingAction.COAST)
+
+        peak = forward.info["episode_lap_progress"]
+        self.assertGreater(peak, 0.0)
+        self.assertEqual(forward.info["max_episode_lap_progress"], peak)
+
+        place_on_centerline(env, 0.07)
+        regressed = env.step(DrivingAction.COAST)
+        self.assertLess(regressed.info["episode_lap_progress"], peak)
+        self.assertEqual(regressed.info["max_episode_lap_progress"], peak)
+        self.assertEqual(env.telemetry()["max_episode_lap_progress"], peak)
+
+        env.reset(seed=8)
+        telemetry = env.telemetry()
+        self.assertEqual(telemetry["episode_lap_progress"], 0.0)
+        self.assertEqual(telemetry["max_episode_lap_progress"], 0.0)
+
     def test_aligned_forward_motion_beats_reverse_motion(self):
         forward = DrivingEnv("pine_sprint", seed=11)
         reverse = DrivingEnv("pine_sprint", seed=11)
@@ -266,6 +287,97 @@ class DrivingRewardShapingTests(unittest.TestCase):
         self.assertLessEqual(terms["collision"], -env.COLLISION_ENTRY_PENALTY)
         self.assertEqual(terms["barrier_contact"], -env.WALL_CONTACT_PENALTY)
         self.assertLess(result.reward, 0.0)
+        self.assertFalse(result.terminated)
+        self.assertFalse(result.truncated)
+        self.assertTrue(result.info["collision_recovery_active"])
+        self.assertGreater(result.info["collision_pressure"], 0.0)
+
+    def test_slow_inward_escape_does_not_accrue_stale_contact_pressure(self):
+        env = DrivingEnv("harbor_loop", seed=19, max_steps=2_000)
+        point, tangent = env.circuit.point_tangent_at(0.2)
+        outward = tangent.perpendicular()
+        radius = env.circuit.collision_radius
+        env.vehicle.state.heading = math.atan2(tangent.y, tangent.x)
+        env.vehicle.state.position = point + outward * (radius + 1.0)
+        env.vehicle.state.velocity = outward * 20.0
+
+        impact = env.step(DrivingAction.COAST)
+        self.assertTrue(impact.info["collided"])
+        initial_pressure = impact.info["collision_pressure"]
+
+        # This is the formerly fatal case: collision-entry hysteresis remains
+        # latched while a low-speed car is physically clear and moving inward.
+        env.vehicle.state.position = point + outward * (radius - 0.1)
+        env.vehicle.state.velocity = outward * -3.0
+        for _ in range(env.COLLISION_RECOVERY_TIMEOUT_STEPS):
+            recovering = env.step(DrivingAction.COAST)
+            self.assertFalse(recovering.info["collided"])
+            self.assertFalse(recovering.info["wall_contact_active"])
+            self.assertEqual(recovering.info["reward_terms"]["barrier_contact"], 0.0)
+            self.assertFalse(recovering.truncated)
+
+        self.assertEqual(recovering.info["wall_contact_steps"], 1)
+        self.assertEqual(recovering.info["collision_pressure"], initial_pressure)
+        self.assertTrue(recovering.info["collision_recovery_active"])
+
+    def test_clean_forward_recovery_resets_collision_pressure(self):
+        env = DrivingEnv("harbor_loop", seed=18, max_steps=2_000)
+        progress = 0.20
+
+        # Three quick glancing entries create pressure without trapping the car.
+        # A single clear tick between them is intentionally too short to count as
+        # a stable recovery.
+        for _ in range(3):
+            point, tangent = env.circuit.point_tangent_at(progress)
+            outward = tangent.perpendicular()
+            env.vehicle.state.position = point + outward * (
+                env.circuit.collision_radius + 2.0
+            )
+            env.vehicle.state.heading = math.atan2(tangent.y, tangent.x)
+            env.vehicle.state.velocity = outward * 45.0 + tangent * 35.0
+            impact = env.step(DrivingAction.COAST)
+            self.assertTrue(impact.info["collision_started"])
+            self.assertFalse(impact.truncated)
+
+            progress += 0.001
+            place_on_centerline(env, progress, longitudinal_speed=45.0)
+            clear_tick = env.step(DrivingAction.COAST)
+            self.assertFalse(clear_tick.info["wall_contact_active"])
+            self.assertFalse(clear_tick.truncated)
+
+        self.assertTrue(env.telemetry()["collision_recovery_active"])
+        self.assertGreater(env.telemetry()["collision_pressure"], 0.0)
+
+        # Sustained, meaningful forward movement proves that this car recovered.
+        # Recovery must clear accumulated kill pressure rather than leaving an
+        # otherwise healthy car one glancing impact away from a reset.
+        confirmation_steps = env.COLLISION_RECOVERY_CONFIRM_STEPS
+        for _ in range(confirmation_steps):
+            progress += 0.002
+            place_on_centerline(env, progress, longitudinal_speed=55.0)
+            recovered = env.step(DrivingAction.COAST)
+            self.assertFalse(recovered.truncated)
+
+        telemetry = env.telemetry()
+        self.assertFalse(telemetry["collision_recovery_active"])
+        self.assertEqual(telemetry["collision_pressure"], 0.0)
+        self.assertGreaterEqual(telemetry["collision_recoveries"], 1)
+        self.assertEqual(telemetry["wall_contact_steps"], 0)
+
+        # A later isolated impact begins a fresh recovery window; it is not the
+        # fourth strike of the already recovered incident.
+        point, tangent = env.circuit.point_tangent_at(progress)
+        outward = tangent.perpendicular()
+        env.vehicle.state.position = point + outward * (
+            env.circuit.collision_radius + 2.0
+        )
+        env.vehicle.state.heading = math.atan2(tangent.y, tangent.x)
+        env.vehicle.state.velocity = outward * 45.0 + tangent * 35.0
+        next_impact = env.step(DrivingAction.COAST)
+        self.assertTrue(next_impact.info["collision_started"])
+        self.assertFalse(next_impact.terminated)
+        self.assertFalse(next_impact.truncated)
+        self.assertEqual(next_impact.info["recent_collision_entries"], 1)
 
     def test_persistent_wall_contact_is_decisive_and_truncates_early(self):
         env = DrivingEnv("harbor_loop", seed=31, max_steps=2_000)
@@ -273,7 +385,7 @@ class DrivingRewardShapingTests(unittest.TestCase):
         outward = tangent.perpendicular()
         rewards = []
 
-        for _ in range(env.WALL_CONTACT_TRUNCATION_STEPS):
+        for _ in range(env.COLLISION_RECOVERY_TIMEOUT_STEPS):
             env.vehicle.state.position = point + outward * (
                 env.circuit.collision_radius + 2.0
             )
@@ -284,9 +396,15 @@ class DrivingRewardShapingTests(unittest.TestCase):
         self.assertTrue(result.truncated)
         self.assertTrue(result.info["collision_looped"])
         self.assertEqual(result.info["truncation_reason"], "collision_loop")
+        self.assertEqual(result.info["collision_recoveries"], 0)
+        self.assertEqual(result.info["collision_pressure"], 1.0)
+        self.assertGreaterEqual(
+            result.info["collision_recovery_steps"],
+            env.COLLISION_RECOVERY_TIMEOUT_STEPS,
+        )
         self.assertEqual(
             result.info["wall_contact_steps"],
-            env.WALL_CONTACT_TRUNCATION_STEPS,
+            env.COLLISION_RECOVERY_TIMEOUT_STEPS,
         )
         self.assertLess(sum(rewards), -50.0)
         self.assertEqual(
@@ -294,7 +412,7 @@ class DrivingRewardShapingTests(unittest.TestCase):
             result.info["wall_contact_steps"],
         )
 
-    def test_repeated_collision_entries_within_window_truncate_loop(self):
+    def test_repeated_collision_entries_without_forward_recovery_truncate_loop(self):
         env = DrivingEnv("harbor_loop", seed=37, max_steps=2_000)
         point, tangent = env.circuit.point_tangent_at(0.2)
         outward = tangent.perpendicular()
@@ -318,7 +436,7 @@ class DrivingRewardShapingTests(unittest.TestCase):
             env.COLLISION_LOOP_ENTRY_LIMIT,
         )
 
-    def test_collision_entries_spaced_at_window_do_not_accumulate(self):
+    def test_collision_entries_do_not_accumulate_after_clean_forward_recovery(self):
         env = DrivingEnv("harbor_loop", seed=38, max_steps=3_000)
         point, tangent = env.circuit.point_tangent_at(0.2)
         outward = tangent.perpendicular()
@@ -336,20 +454,19 @@ class DrivingRewardShapingTests(unittest.TestCase):
             if entry + 1 == env.COLLISION_LOOP_ENTRY_LIMIT:
                 break
 
-            for clean_tick in range(env.COLLISION_LOOP_WINDOW_STEPS):
-                clean_progress += 0.001
-                place_on_centerline(env, clean_progress)
+            for _ in range(env.COLLISION_RECOVERY_CONFIRM_STEPS):
+                clean_progress += 0.002
+                place_on_centerline(
+                    env,
+                    clean_progress,
+                    longitudinal_speed=50.0,
+                )
                 clean_result = env.step(DrivingAction.COAST)
-                if clean_tick == env.COLLISION_LOOP_WINDOW_STEPS - 2:
-                    self.assertEqual(
-                        clean_result.info["recent_collision_entries"], 1
-                    )
+                self.assertFalse(clean_result.truncated)
             self.assertEqual(clean_result.info["recent_collision_entries"], 0)
-            self.assertEqual(
-                clean_result.info["steps_since_collision"],
-                env.COLLISION_LOOP_WINDOW_STEPS,
-            )
             self.assertFalse(clean_result.info["collision_looped"])
+            self.assertFalse(clean_result.info["collision_recovery_active"])
+            self.assertEqual(clean_result.info["collision_pressure"], 0.0)
 
     def test_reset_clears_contact_and_clearance_transition_diagnostics(self):
         env = DrivingEnv("harbor_loop", seed=39)
@@ -369,12 +486,63 @@ class DrivingRewardShapingTests(unittest.TestCase):
         self.assertEqual(telemetry["wall_contact_steps"], 0)
         self.assertEqual(telemetry["recent_collision_entries"], 0)
         self.assertFalse(telemetry["collision_looped"])
+        self.assertFalse(telemetry["collision_recovery_active"])
+        self.assertEqual(telemetry["collision_recovery_steps"], 0)
+        self.assertEqual(telemetry["collision_recovery_clean_steps"], 0)
+        self.assertEqual(telemetry["collision_recoveries"], 0)
+        self.assertEqual(telemetry["collision_pressure"], 0.0)
         self.assertIsNone(telemetry["truncation_reason"])
         self.assertEqual(telemetry["clearance_delta"], 0.0)
         self.assertEqual(
             telemetry["usable_clearance"],
             telemetry["previous_usable_clearance"],
         )
+
+    def test_recovered_contact_preserves_the_ordered_lap_candidate(self):
+        env = DrivingEnv("harbor_loop", seed=40, max_steps=2_000)
+
+        # Establish ordinary ordered progress before one glancing impact.
+        for progress in (0.05, 0.10):
+            place_on_centerline(env, progress, longitudinal_speed=50.0)
+            result = env.step(DrivingAction.COAST)
+            self.assertTrue(result.info["lap_candidate_valid"])
+
+        point, tangent = env.circuit.point_tangent_at(0.10)
+        outward = tangent.perpendicular()
+        env.vehicle.state.position = point + outward * (
+            env.circuit.collision_radius + 3.0
+        )
+        env.vehicle.state.heading = math.atan2(tangent.y, tangent.x)
+        env.vehicle.state.velocity = outward * 80.0 + tangent * 45.0
+        impact = env.step(DrivingAction.COAST)
+        self.assertTrue(impact.info["collision_started"])
+        self.assertTrue(impact.info["lap_candidate_valid"])
+        self.assertFalse(impact.truncated)
+
+        progress = 0.105
+        for _ in range(env.COLLISION_RECOVERY_CONFIRM_STEPS):
+            progress += 0.002
+            place_on_centerline(env, progress, longitudinal_speed=50.0)
+            recovered = env.step(DrivingAction.COAST)
+        self.assertFalse(recovered.info["collision_recovery_active"])
+        self.assertTrue(recovered.info["lap_candidate_valid"])
+
+        # Continue through all ordered gates and the episode origin. Collision
+        # recovery must not silently throw away an otherwise valid near-lap.
+        while progress < 0.95:
+            progress = min(0.95, progress + 0.04)
+            place_on_centerline(env, progress, longitudinal_speed=50.0)
+            result = env.step(DrivingAction.COAST)
+            self.assertFalse(result.truncated)
+        place_on_centerline(env, 0.999, longitudinal_speed=50.0)
+        env.step(DrivingAction.COAST)
+        place_on_centerline(env, 0.001, longitudinal_speed=50.0)
+        completed = env.step(DrivingAction.COAST)
+
+        self.assertTrue(completed.info["lap_completed"])
+        self.assertFalse(completed.truncated)
+        self.assertEqual(completed.info["laps"], 1)
+        self.assertGreaterEqual(completed.info["collision_recoveries"], 1)
 
     def test_clearance_objective_preserves_ordered_progress_and_lap_reward(self):
         env = DrivingEnv("harbor_loop", seed=41)
@@ -386,10 +554,34 @@ class DrivingRewardShapingTests(unittest.TestCase):
         assert result is not None
         self.assertTrue(result.info["lap_completed"])
         self.assertEqual(result.info["laps"], 1)
-        self.assertEqual(result.info["reward_terms"]["lap"], 75.0)
+        self.assertEqual(result.info["max_episode_lap_progress"], 1.0)
+        self.assertEqual(
+            result.info["reward_terms"]["lap"], env.LAP_COMPLETION_REWARD
+        )
         self.assertGreater(result.info["reward_terms"]["progress"], 0.0)
         self.assertFalse(result.info["collision_looped"])
         self.assertFalse(result.truncated)
+
+    def test_ordered_checkpoint_reward_is_one_time_and_non_farmable(self):
+        env = DrivingEnv("harbor_loop", seed=42)
+        for progress in (0.04, 0.08, 0.12, 0.16, 0.20, 0.24):
+            place_on_centerline(env, progress, longitudinal_speed=45.0)
+            before_gate = env.step(DrivingAction.COAST)
+            self.assertEqual(before_gate.info["reward_terms"]["checkpoint"], 0.0)
+
+        place_on_centerline(env, 0.26, longitudinal_speed=45.0)
+        milestone = env.step(DrivingAction.COAST)
+        self.assertTrue(milestone.info["checkpoint_advanced"])
+        self.assertEqual(
+            milestone.info["reward_terms"]["checkpoint"],
+            env.ORDERED_CHECKPOINT_REWARD,
+        )
+
+        for progress in (0.24, 0.26) * 4:
+            place_on_centerline(env, progress, longitudinal_speed=45.0)
+            oscillation = env.step(DrivingAction.COAST)
+            self.assertFalse(oscillation.info["checkpoint_advanced"])
+            self.assertEqual(oscillation.info["reward_terms"]["checkpoint"], 0.0)
 
 
 if __name__ == "__main__":

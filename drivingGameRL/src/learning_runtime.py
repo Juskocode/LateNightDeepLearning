@@ -42,7 +42,7 @@ class LearningRuntimeConfig:
     algorithm: LearningAlgorithm = "genetic_dqn"
     circuit: str = "harbor_loop"
     seed: int = 7
-    evaluation_steps: int = 900
+    evaluation_steps: int = 1_800
     population_size: int = 8
     elite_count: int = 2
     tournament_size: int = 2
@@ -170,13 +170,13 @@ class DrivingLearningSession:
 
         base_algorithm = "double_dqn"
         if dqn_config is None:
-            # Population members live for a bounded 900-step episode by
-            # default. The generic 512-step warmup spends most of that lifetime
+            # Population members live for a bounded 1,800-step episode by
+            # default. The generic 512-step warmup spends too much of that lifetime
             # collecting without learning, then trains every frame. Start
             # replay early and spread updates across four transitions instead:
             # better early feedback with substantially lower interactive CPU
             # cost. Population exploration also needs its own lifetime scale:
-            # the generic 40k decay would make each freshly cloned 900-step
+            # the generic 40k decay would make each freshly cloned bounded
             # member almost entirely random. Explicit caller configurations
             # remain untouched.
             dqn_config = default_population_dqn_config(
@@ -418,9 +418,8 @@ class DrivingLearningSession:
             loss = float(population_step.result.mean_loss)
         if math.isfinite(loss):
             self._loss_history.append(loss)
-        epsilon = (
-            0.0 if self.config.algorithm == "genetic" else float(self.agent.epsilon)
-        )
+        exploration_enabled, _, _ = self._exploration_context()
+        epsilon = float(self.agent.epsilon) if exploration_enabled else 0.0
         if math.isfinite(epsilon):
             self._epsilon_history.append(epsilon)
 
@@ -477,6 +476,19 @@ class DrivingLearningSession:
             include_rays=include_rays,
         )
 
+    def _exploration_context(self) -> tuple[bool, bool, str]:
+        """Return whether the currently displayed policy actually explores."""
+
+        if self.config.algorithm == "genetic":
+            return False, False, "genetic_greedy"
+        if self.config.algorithm == "genetic_dqn":
+            member = self._population_trainer.current_member
+            if member is None:
+                return False, False, "generation_complete"
+            if member.protected_elite:
+                return False, True, "protected_elite"
+        return True, False, "epsilon_greedy"
+
     def _epsilon_schedule_telemetry(self) -> dict[str, Any]:
         """Describe the effective proposal-exploration schedule analytically."""
 
@@ -495,11 +507,15 @@ class DrivingLearningSession:
         mean_epsilon = config.epsilon_start + (
             config.epsilon_end - config.epsilon_start
         ) * (progress_sum / lifetime)
-        exploration_enabled = self.config.algorithm != "genetic"
+        exploration_enabled, protected_elite, exploration_mode = (
+            self._exploration_context()
+        )
         expected_exploration = mean_epsilon if exploration_enabled else 0.0
         current_epsilon = float(self.agent.epsilon) if exploration_enabled else 0.0
         return {
             "enabled": exploration_enabled,
+            "mode": exploration_mode,
+            "protected_elite": protected_elite,
             "population_default": bool(self._uses_population_default_dqn),
             "start": float(config.epsilon_start),
             "end": float(config.epsilon_end),
@@ -530,6 +546,9 @@ class DrivingLearningSession:
             for index, member in enumerate(raw.get("population", ())):
                 result = member.get("result") or {}
                 member_fitness = member.get("fitness")
+                selection_fitness = member.get("selection_fitness")
+                if member_fitness is None:
+                    member_fitness = selection_fitness
                 runtime_status = member.get("status")
                 if runtime_status == "active":
                     runtime_status = "evaluating"
@@ -550,10 +569,31 @@ class DrivingLearningSession:
                         ),
                         "elite": False,
                         "laps": result.get("laps", 0),
+                        "progress": result.get("progress", 0.0),
+                        "max_progress": result.get(
+                            "max_progress", result.get("progress", 0.0)
+                        ),
                         "collisions": result.get("collisions", 0),
+                        "collision_recoveries": result.get(
+                            "collision_recoveries", 0
+                        ),
+                        "end_reason": result.get("end_reason", "unknown"),
+                        "safety_interventions": result.get(
+                            "safety_interventions", 0
+                        ),
+                        "protected_elite": bool(
+                            member.get("protected_elite", False)
+                        ),
                         "parents": member.get("parent_ids", ()),
                         "evaluation_step": member.get("evaluation_step", 0),
                         "evaluation_return": member.get("evaluation_return", 0.0),
+                        "raw_return": member.get(
+                            "raw_return", member.get("evaluation_return", 0.0)
+                        ),
+                        "selection_fitness": selection_fitness,
+                        "safety_intervention_penalty": member.get(
+                            "safety_intervention_penalty", 0.0
+                        ),
                         "action": member.get("action"),
                         "raw_action": member.get("raw_action"),
                         "executed_action": member.get("executed_action"),
@@ -570,6 +610,15 @@ class DrivingLearningSession:
                     "mean": row["mean_fitness"],
                     "worst": row["worst_fitness"],
                     "diversity": row.get("genome_diversity", 0.0),
+                    "laps_completed": row.get("laps_completed", 0),
+                    "lap_completion_rate": row.get("lap_completion_rate", 0.0),
+                    "best_progress": row.get("best_progress", 0.0),
+                    "mean_progress": row.get("mean_progress", 0.0),
+                    "near_finish_count": row.get("near_finish_count", 0),
+                    "collision_recoveries": row.get(
+                        "collision_recoveries", 0
+                    ),
+                    "end_reasons": dict(row.get("end_reasons", {})),
                 }
                 for row in raw.get("history", ())
             ]
@@ -590,7 +639,13 @@ class DrivingLearningSession:
                 "completed_generations": len(history),
                 "member_index": current_index,
                 "episode_step": raw.get("evaluation_step", 0),
-                "current_fitness": raw.get("evaluation_return", 0.0),
+                "current_fitness": raw.get(
+                    "evaluation_fitness", raw.get("evaluation_return", 0.0)
+                ),
+                "raw_return": raw.get("raw_return", raw.get("evaluation_return", 0.0)),
+                "safety_intervention_penalty": raw.get(
+                    "safety_intervention_penalty", 0.0
+                ),
                 "best_fitness": current_best,
                 "mean_fitness": current_mean,
                 "champion_member": champion.get("member_id", 0),
@@ -652,7 +707,29 @@ class DrivingLearningSession:
         # The visualizer receives the exact network. It may down-sample nodes and
         # edges for legibility, but never invents values.
         network = self.agent.network_snapshot(observation)
-        replay = agent_learning.get("replay", {})
+        replay = dict(agent_learning.get("replay", {}))
+        if self.is_population:
+            aggregate_memory = raw.get("memory") or {}
+            aggregate_health = raw.get("health") or {}
+            aggregate_replay = aggregate_health.get("replay") or {}
+            replay.update(
+                {
+                    "size": int(aggregate_memory.get("transitions", 0)),
+                    "capacity": int(aggregate_memory.get("capacity", 0)),
+                    "fill_ratio": float(aggregate_memory.get("fill_ratio", 0.0)),
+                    "ready": bool(aggregate_replay.get("ready", False)),
+                    "ready_members": int(
+                        aggregate_replay.get("ready_members", 0)
+                    ),
+                    "member_count": int(
+                        aggregate_replay.get("member_count", 0)
+                    ),
+                    "protected_elites": sum(
+                        bool(member.get("protected_elite", False))
+                        for member in raw.get("population", ())
+                    ),
+                }
+            )
         memory_samples = [
             {
                 "action": item.action,
@@ -696,9 +773,7 @@ class DrivingLearningSession:
                 "safety_intervened": bool(safety.get("intervened", False)),
                 "safety_prior": safety,
                 "epsilon": (
-                    0.0
-                    if self.config.algorithm == "genetic"
-                    else agent_learning["epsilon"]
+                    epsilon_schedule["current"]
                 ),
                 "epsilon_start": epsilon_schedule["start"],
                 "epsilon_end": epsilon_schedule["end"],

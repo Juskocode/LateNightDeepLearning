@@ -42,6 +42,16 @@ def learning_telemetry(env: DrivingEnv) -> dict[str, object]:
         "current_fitness": 18.42,
         "best_fitness": 27.8,
         "mean_fitness": 13.9,
+        "generation_metrics": {
+            "evaluated_members": 8,
+            "laps_completed": 2,
+            "lap_completion_rate": 0.25,
+            "best_progress": 1.0,
+            "mean_progress": 0.68,
+            "near_finish_count": 1,
+            "collision_recoveries": 3,
+            "end_reasons": {"lap_completed": 2, "collision_loop": 1},
+        },
         "population": [
             {
                 "index": index,
@@ -182,6 +192,10 @@ class DrivingLearningVisualizationTests(unittest.TestCase):
         self.assertEqual(after["steps"], before["steps"])
         self.assertEqual(after["position"], before["position"])
         self.assertEqual(after["current_lap_time"], before["current_lap_time"])
+        rendered_labels = {key[0] for key in self.visualization._text_surfaces}
+        self.assertTrue(
+            any(label.startswith("2 LAP · 100%") for label in rendered_labels)
+        )
 
     def test_parallel_generation_status_is_visible_and_read_only(self):
         before = self.env.telemetry()
@@ -224,6 +238,13 @@ class DrivingLearningVisualizationTests(unittest.TestCase):
                 "recent_collision_entries": 3,
                 "collision_entry_limit": 4,
                 "collision_looped": False,
+                "collision_recovery_active": True,
+                "collision_recovery_steps": 12,
+                "collision_recovery_clean_steps": 0,
+                "collision_recovery_confirm_steps": 12,
+                "collision_recovery_timeout_steps": 45,
+                "collision_recoveries": 2,
+                "collision_pressure": 0.5,
             },
             "safety_prior": {
                 "proposed_action": int(DrivingAction.ACCELERATE),
@@ -239,13 +260,27 @@ class DrivingLearningVisualizationTests(unittest.TestCase):
         rendered_labels = {key[0] for key in self.visualization._text_surfaces}
 
         self.assertIn("GREEN CLEARANCE", rendered_labels)
-        self.assertIn("WALL CONTACT 12/45 · HITS 3/4", rendered_labels)
+        self.assertIn("IMPACT 12/45 · PRESSURE 50% · OK 2", rendered_labels)
         self.assertTrue(
             any(
                 label.startswith("SHIELD THROTTLE → BRAKE · EMERGENCY BRAKE · 7/120")
                 for label in rendered_labels
             )
         )
+
+        self.visualization.draw(
+            telemetry={
+                **contact,
+                "environment": {
+                    **contact["environment"],
+                    "wall_contact_active": False,
+                    "collision_recovery_steps": 31,
+                    "collision_recovery_clean_steps": 5,
+                },
+            }
+        )
+        rendered_labels = {key[0] for key in self.visualization._text_surfaces}
+        self.assertIn("STABILIZING 5/12 · PRESSURE 50% · OK 2", rendered_labels)
 
         clear_surface = self.visualization.draw(
             telemetry={
@@ -259,6 +294,9 @@ class DrivingLearningVisualizationTests(unittest.TestCase):
                     "wall_contact_active": False,
                     "wall_contact_steps": 0,
                     "recent_collision_entries": 0,
+                    "collision_recovery_active": False,
+                    "collision_recovery_steps": 0,
+                    "collision_pressure": 0.0,
                 },
                 "safety_prior": {
                     "proposed_action": int(DrivingAction.STEER_LEFT),
@@ -278,6 +316,25 @@ class DrivingLearningVisualizationTests(unittest.TestCase):
             pygame.image.tostring(clear_surface, "RGB"),
         )
         self.assertEqual(self.env.telemetry(), before)
+
+    def test_protected_elite_card_reports_frozen_greedy_evaluation(self):
+        self.visualization.draw(
+            telemetry={
+                **self.telemetry,
+                "epsilon": 0.0,
+                "epsilon_schedule": {
+                    "enabled": False,
+                    "protected_elite": True,
+                    "mode": "protected_elite",
+                },
+            }
+        )
+
+        rendered_labels = {key[0] for key in self.visualization._text_surfaces}
+        self.assertIn("GREEDY", rendered_labels)
+        self.assertTrue(
+            any(label.startswith("protected elite") for label in rendered_labels)
+        )
 
     def test_curriculum_view_marks_the_random_episode_origin_read_only(self):
         env = DrivingEnv("canyon_maze", seed=29, random_start_curriculum=True)

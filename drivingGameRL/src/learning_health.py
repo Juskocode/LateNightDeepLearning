@@ -52,6 +52,7 @@ def build_learning_health(
     environment: Mapping[str, Any] | object | None = None,
     throughput: Mapping[str, Any] | object | None = None,
     environment_decisions: int | float = 0,
+    optimization_decisions: int | float | None = None,
     batch_size: int | float = 1,
     warmup_steps: int | float = 0,
     gradient_clip: int | float = 1.0,
@@ -90,6 +91,15 @@ def build_learning_health(
     decisions, decisions_ok = _finite_number(
         environment_decisions,
         name="environment_decisions",
+        alerts=alerts,
+        minimum=0.0,
+    )
+    optimization_decision_source = (
+        decisions if optimization_decisions is None else optimization_decisions
+    )
+    optimization_decision_count, optimization_decisions_ok = _finite_number(
+        optimization_decision_source,
+        name="optimization.decisions",
         alerts=alerts,
         minimum=0.0,
     )
@@ -178,7 +188,11 @@ def build_learning_health(
         alerts=alerts,
         minimum=0.0,
     )
-    update_ratio = updates / decisions if decisions > 0.0 else 0.0
+    update_ratio = (
+        updates / optimization_decision_count
+        if optimization_decision_count > 0.0
+        else 0.0
+    )
     current_norm_ratio = gradient_norm / clip_threshold if clip_threshold > 0.0 else 0.0
     clip_ratio = clip_events / updates if updates > 0.0 else 0.0
 
@@ -322,6 +336,7 @@ def build_learning_health(
     finite = all(
         (
             decisions_ok,
+            optimization_decisions_ok,
             size_ok,
             capacity_ok,
             batch_ok,
@@ -406,7 +421,7 @@ def build_learning_health(
         "optimization": {
             "applicable": bool(replay_enabled),
             "updates": int(updates),
-            "decisions": int(decisions),
+            "decisions": int(optimization_decision_count),
             "update_to_decision_ratio": update_ratio,
             "gradient_norm": gradient_norm,
             "clip_threshold": clip_threshold,

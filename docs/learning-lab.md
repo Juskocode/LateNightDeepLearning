@@ -489,9 +489,10 @@ memorizing only the turns immediately after the permanent start line.
 Lap validation rotates with the sampled episode origin. The car must pass the
 relative 25%, 50%, and 75% gates in order and then cross that origin in the
 forward direction. Reverse crossings, origin oscillation, and implausible
-projection jumps retain the same rejection rules as normal laps. A valid loop
-earns the `+75` lap reward, sets `curriculum_lap_completed`, and terminates that
-learning evaluation. Random-origin times are deliberately excluded from the
+projection jumps retain the same rejection rules as normal laps. Each ordered
+gate pays `+15` once; a valid loop earns `+300`, sets
+`curriculum_lap_completed`, and terminates that learning evaluation.
+Random-origin times are deliberately excluded from the
 normal-grid best-lap record because their trajectories begin at a different
 place and would make the manual ghost misleading.
 
@@ -553,7 +554,7 @@ The discrete action space is:
 |---:|---|---|
 | 0 | Coast | No throttle, brake, or steering |
 | 1 | Accelerate | Full throttle |
-| 2 | Brake | Full brake |
+| 2 | Brake / reverse | Brakes forward motion, then applies reverse throttle |
 | 3 | Steer left | 72% throttle and full left steering |
 | 4 | Steer right | 72% throttle and full right steering |
 
@@ -583,28 +584,31 @@ clearance       = -0.55 * v+ * h^2
 clearance_gain  = +6 * max(u_t - u_(t-1), 0) * m
 wall_closing    = -32 * max(u_(t-1) - u_t, 0) * (0.35 + 0.65m)
 reverse         = -0.16 * v-
-barrier_contact = -1.25 on every active contact tick
+barrier_contact = -1.25 on every real penetration tick
 collision       = -6 - min(12, 0.12 * impact_speed) on contact start
 stagnation      = ramps from 0 to -0.12 after 90 non-progress ticks
-lap             = +75 after one valid gated forward circuit
+checkpoint      = +15 once at each ordered 25% / 50% / 75% gate
+lap             = +300 after one valid gated forward circuit
 ```
 
 There is deliberately no positive survival reward. Meaningful forward movement
 resets stagnation; otherwise the penalty grows after 90 ticks and the episode is
 truncated at 240. Increasing clearance cannot be farmed while stationary because
 its positive term is multiplied by motion, and closing clearance is more than
-five times as costly as opening it is rewarding. Persistent scraping also
-cannot survive an entire evaluation: 45 continuous contact ticks, or four
-collision entries within the latest 180 ticks, truncate the run as a collision
-loop.
+five times as costly as opening it is rewarding. Real penetration raises
+collision pressure immediately; entry hysteresis by itself does not. Twelve
+clean, on-road, forward-progress ticks confirm recovery and clear the incident.
+Forty-five penetration ticks, or four entries before confirmed recovery,
+truncate a genuinely stuck run as a collision loop.
 
 The `info` dictionary exposes the active terrain, on-road flag, absolute
-`progress`, origin-relative `episode_lap_progress`, spawn mode and origin,
+`progress`, origin-relative current and maximum episode lap progress, spawn mode and origin,
 curriculum readiness, completed laps, `lap_completed`, current/last/best lap
 time, current-tick barrier penetration in `collided`, one-shot
-`collision_started`, persistent `wall_contact_active`, impact speed,
+`collision_started`, current-tick `wall_contact_active`, impact speed,
 heading alignment, forward and usable clearance, clearance delta, green-ray
-fraction, wall-closing state, contact streak, recent collision entries,
+fraction, wall-closing state, collision pressure, recovery duration and count,
+real contact ticks, recent collision entries,
 stagnation count, exact cutoff constants, every reward term, and vehicle
 telemetry. Curriculum learning episodes terminate on a valid loop; all modes
 truncate at their configured step limit, stagnation limit, or collision-loop
@@ -655,10 +659,12 @@ actions. The deep action-value function is a fully connected network:
 16 observations → 128 ReLU → 128 ReLU → 5 Q-values
 ```
 
-Legacy 12-input checkpoints migrate automatically: the five old ray columns are
-copied to their matching angles, the four new input columns (and corresponding
-Adam moments) start at zero, and the policy's original predictions are retained
-at the migration boundary.
+Within driving checkpoint semantic contract v2, compatible 12-input tensors can
+still use the observation-shape bridge: the five old ray columns are copied to
+their matching angles, the four new input columns (and corresponding Adam
+moments) start at zero, and predictions are retained at the migration boundary.
+Pre-v2 files are deliberately rejected because their action and reward meanings
+are no longer the same.
 
 The five outputs estimate the discounted return for coast, accelerate, brake,
 steer left, and steer right. In the standalone deep modes, epsilon-greedy action
@@ -739,10 +745,11 @@ fitness spread, genome diversity, ancestry, and the active member.
 
 ### Hybrid genetic DQN
 
-`--algorithm genetic_dqn` uses the same population and evolutionary operators,
-but every member is also a real Double-DQN learner during its evaluation. It acts
-epsilon-greedily, stores experience, and performs replay-based TD updates before
-its final learned weights are ranked. This creates two time scales:
+`--algorithm genetic_dqn` uses the same population and evolutionary operators.
+New children are real Double-DQN learners during evaluation: they act
+epsilon-greedily, store experience, and perform replay-based TD updates before
+their final learned weights are ranked. Exact inherited elites instead run as
+frozen greedy controls. This creates two time scales:
 
 ```mermaid
 flowchart LR
@@ -769,11 +776,32 @@ decisions and run every fourth transition. This replaces the former 512-step
 warm-up/every-tick update pattern: useful TD feedback begins within a short
 evaluation while optimizer work no longer monopolizes every frame. Explicit
 programmatic `DQNConfig` values remain unchanged. Population-created hybrid
-members also use epsilon `0.30 → 0.05` across exactly `evaluation_steps`. For a
-900-step lifetime, the linear schedule averages about 17.5% exploratory and
+members also use epsilon `0.30 → 0.05` across exactly `evaluation_steps`. For the
+default 1,800-step lifetime, the linear schedule averages about 17.5% exploratory and
 82.5% greedy proposals. The former generic 40,000-step decay restarted every
 short-lived member near epsilon 1.0, leaving only about ten greedy choices in a
 default evaluation. Standalone DQN retains its generic schedule.
+
+Exact hybrid elites are frozen during their next scored rollout: they act
+greedily and receive no replay or optimizer writes. Children retain the hybrid
+exploration/training path. This makes elitism literal—the prior best genome
+cannot be destroyed by a noisy TD update—while leaving the rest of the
+population free to improve. A `0.05` fitness charge per safety-filter
+intervention also distinguishes autonomous policies from genomes whose return
+depends on repeated deterministic corrections.
+The dashboard therefore labels an active protected elite **GREEDY / frozen**
+instead of displaying its unused epsilon. Live population rows expose both raw
+environment return and selection fitness after the accumulating intervention
+charge; optimizer update ratios divide only by trainable-child decisions.
+
+Wall contact uses an explicit recovery state rather than an instant reset. Real
+penetration incurs the contact and impact penalties; the collision-entry latch
+only deduplicates one scrape. A low-speed blocked car can brake into reverse,
+and twelve consecutive clean, on-road, forward-progress ticks confirm recovery
+without discarding ordered lap gates. Telemetry exposes collision pressure,
+recovery duration, successful recoveries, terminal reason, current progress,
+and the maximum frontier reached before any reversal. Ordered 25%, 50%, and 75%
+gates each pay `+15` once, while a valid loop pays `+300`.
 
 ### Live dashboard and the `P` champion race
 
@@ -782,7 +810,7 @@ synthesize training state.
 
 | Tab | What it answers |
 |---|---|
-| Overview | Which real scored members are driving in parallel, their episode origins, exact rays, usable green clearance and delta, contact/collision-loop state, neural proposal → executed safety action, cars per tick and worker count, and how fitness changes across generations |
+| Overview | Which real scored members are driving in parallel, their episode origins, current/maximum progress, exact rays, usable green clearance and delta, recovery pressure, neural proposal → executed safety action, lap/near-finish/end-reason diagnostics, cars per tick and worker count, and how fitness changes across generations |
 | Network | Which real layers and connections produced the current Q-values; colors and intensity come from current activations and weights |
 | Memory | How full replay is, whether action selection explored, and what loss, TD error, gradient steps, action counts, and target synchronization are doing |
 
@@ -873,6 +901,9 @@ late-night-driving-rl --algorithm genetic_dqn \
 
 An explicit `--checkpoint` is loaded when it exists and saved on clean exit.
 `--fresh` skips loading, while `--no-save` keeps the existing file unchanged.
+Driving checkpoints use semantic contract v2. A v1 policy used hard brake for
+action 2 and a different milestone/lap reward contract, so it cannot be resumed
+honestly—use `--fresh` to begin a new run under the current environment.
 
 Without `--learn`, headless mode and any `--screenshot` request enter deterministic
 autopilot capture mode, which defaults to 240 steps when `--steps` is omitted.
@@ -971,8 +1002,10 @@ For online tabular methods, `applicable` is false and readiness is not treated a
 a failure. Likewise, gradient and TD diagnostics are neural-only unless the
 tabular backend exposes a mathematically equivalent measurement.
 
-`update_to_decision_ratio` uses optimizer updates and environment decisions from
-the same diagnostic window. Fresh runs use their full lifetime; a standalone
+`update_to_decision_ratio` uses optimizer updates and optimizer-eligible
+decisions from the same diagnostic window. Frozen genetic-DQN elites are
+excluded from this denominator because they cannot update, while their decisions
+remain included in environment throughput and safety/contact rates. Fresh runs use their full lifetime; a standalone
 resume starts a new window when replay and session-only safety counters are not
 restored, while population checkpoints persist their aggregate counters. It
 distinguishes a learner waiting for replay from one whose update schedule has
@@ -1005,8 +1038,9 @@ in-range actions, binary legal masks, and real boolean terminal flags.
 Checkpoint loaders validate compatible
 metadata, counters, model tensors, optimizer state where restored, and optional
 replay/RNG payloads before committing them. A rejected checkpoint therefore
-cannot leave a half-restored learner, while documented legacy migrations remain
-supported.
+cannot leave a half-restored learner. Driving additionally validates population
+lineage and its action/reward semantic version; only migrations within a
+compatible semantic contract remain supported.
 
 ## Reproducible comparison protocol
 

@@ -168,6 +168,10 @@ class EvaluationResult:
     truncated: bool
     mean_loss: float = 0.0
     training_updates: int = 0
+    end_reason: str = "unknown"
+    collision_recoveries: int = 0
+    safety_interventions: int = 0
+    max_progress: float | None = None
 
     def __post_init__(self) -> None:
         for name in (
@@ -177,6 +181,8 @@ class EvaluationResult:
             "laps",
             "collisions",
             "training_updates",
+            "collision_recoveries",
+            "safety_interventions",
         ):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
@@ -189,10 +195,22 @@ class EvaluationResult:
                 raise ValueError(f"{name} must be finite")
         if not 0.0 <= float(self.progress) <= 1.0:
             raise ValueError("progress must be in [0, 1]")
+        if self.max_progress is not None:
+            if (
+                isinstance(self.max_progress, bool)
+                or not isinstance(self.max_progress, (int, float))
+                or not math.isfinite(float(self.max_progress))
+                or not 0.0 <= float(self.max_progress) <= 1.0
+            ):
+                raise ValueError("max_progress must be None or finite in [0, 1]")
+            if float(self.max_progress) + 1e-12 < float(self.progress):
+                raise ValueError("max_progress cannot be smaller than progress")
         if not isinstance(self.terminated, bool) or not isinstance(
             self.truncated, bool
         ):
             raise ValueError("terminated and truncated must be booleans")
+        if not isinstance(self.end_reason, str) or not self.end_reason.strip():
+            raise ValueError("end_reason must be a non-empty string")
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -230,6 +248,12 @@ class PopulationMember:
     def evaluated(self) -> bool:
         return self.result is not None
 
+    @property
+    def protected_elite(self) -> bool:
+        """Whether this genome is the exact survivor of the prior generation."""
+
+        return self.parent_ids == (self.member_id,)
+
     def summary(self) -> dict[str, Any]:
         return {
             "member_id": self.member_id,
@@ -237,6 +261,7 @@ class PopulationMember:
             "parent_ids": list(self.parent_ids),
             "evaluated": self.evaluated,
             "fitness": None if self.result is None else self.result.fitness,
+            "protected_elite": self.protected_elite,
             "result": None if self.result is None else self.result.to_dict(),
         }
 
@@ -255,6 +280,13 @@ class GenerationRecord:
     elite_ids: tuple[int, ...]
     population_size: int
     genome_diversity: float
+    laps_completed: int = 0
+    lap_completion_rate: float = 0.0
+    best_progress: float = 0.0
+    mean_progress: float = 0.0
+    near_finish_count: int = 0
+    collision_recoveries: int = 0
+    end_reasons: tuple[tuple[str, int], ...] = ()
 
     def __post_init__(self) -> None:
         for name in ("generation", "champion_id", "population_size"):
@@ -263,6 +295,16 @@ class GenerationRecord:
                 raise ValueError(f"{name} must be a non-negative integer")
         if self.population_size < 1:
             raise ValueError("population_size must be positive")
+        for name in (
+            "laps_completed",
+            "near_finish_count",
+            "collision_recoveries",
+        ):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"{name} must be a non-negative integer")
+        if self.near_finish_count > self.population_size:
+            raise ValueError("near_finish_count cannot exceed population_size")
         if not isinstance(self.elite_ids, tuple) or any(
             isinstance(value, bool) or not isinstance(value, int) or value < 0
             for value in self.elite_ids
@@ -275,16 +317,45 @@ class GenerationRecord:
             "worst_fitness",
             "fitness_std",
             "genome_diversity",
+            "lap_completion_rate",
+            "best_progress",
+            "mean_progress",
         ):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, (int, float)):
                 raise ValueError(f"{name} must be finite")
             if not math.isfinite(float(value)):
                 raise ValueError(f"{name} must be finite")
+        for name in ("lap_completion_rate", "best_progress", "mean_progress"):
+            value = float(getattr(self, name))
+            if not 0.0 <= value <= 1.0:
+                raise ValueError(f"{name} must be in [0, 1]")
+        if not isinstance(self.end_reasons, tuple):
+            raise ValueError("end_reasons must be a tuple")
+        if any(
+            not isinstance(reason, str)
+            or not reason.strip()
+            or isinstance(count, bool)
+            or not isinstance(count, int)
+            or count < 0
+            for reason, count in self.end_reasons
+        ):
+            raise ValueError(
+                "end_reasons must contain non-empty names and non-negative counts"
+            )
+        reason_names = [reason for reason, _ in self.end_reasons]
+        if len(set(reason_names)) != len(reason_names):
+            raise ValueError("end_reasons names must be unique")
+        if (
+            self.end_reasons
+            and sum(count for _, count in self.end_reasons) != self.population_size
+        ):
+            raise ValueError("end_reasons must account for the complete population")
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
         data["elite_ids"] = list(self.elite_ids)
+        data["end_reasons"] = dict(self.end_reasons)
         return data
 
     @classmethod
@@ -294,6 +365,20 @@ class GenerationRecord:
         data = dict(values)
         try:
             data["elite_ids"] = tuple(data["elite_ids"])
+            raw_end_reasons = data.get("end_reasons", ())
+            if isinstance(raw_end_reasons, Mapping):
+                raw_end_reasons = raw_end_reasons.items()
+            parsed_end_reasons = []
+            for item in raw_end_reasons:
+                if not isinstance(item, (list, tuple)) or len(item) != 2:
+                    raise ValueError("end_reasons entries must be name/count pairs")
+                reason, count = item
+                if not isinstance(reason, str):
+                    raise ValueError("end_reasons names must be strings")
+                if isinstance(count, bool) or not isinstance(count, int):
+                    raise ValueError("end_reasons counts must be integers")
+                parsed_end_reasons.append((reason, count))
+            data["end_reasons"] = tuple(parsed_end_reasons)
             return cls(**data)
         except (KeyError, TypeError, ValueError) as error:
             raise ValueError(f"invalid GenerationRecord payload: {error}") from error
@@ -423,9 +508,14 @@ class _MemberAdvance:
 class PopulationTrainer:
     """Lockstep, multithreaded genetic population session over ``DrivingEnv``."""
 
-    CHECKPOINT_VERSION = 1
+    # v2 binds a population to the brake/reverse and milestone-reward contract.
+    # Resuming a partially scored v1 generation would otherwise compare old
+    # rewards with new rewards inside one selection pool.
+    CHECKPOINT_VERSION = 2
     GENOME_SAMPLE_LIMIT = 2_048
     MAX_WORKER_CHUNK_TICKS = 8
+    NEAR_FINISH_THRESHOLD = 0.90
+    SAFETY_INTERVENTION_FITNESS_PENALTY = 0.05
     _SEED_LIMIT = 2**63
 
     def __init__(
@@ -475,6 +565,7 @@ class PopulationTrainer:
         self._closed = False
         self._worker_failure: BaseException | None = None
         self._environment_decisions = 0
+        self._training_decisions = 0
         self._optimization_updates = 0
         self._gradient_clip_events = 0
         self._wall_contact_decisions = 0
@@ -855,6 +946,11 @@ class PopulationTrainer:
         )
         self._last_tick_member_count = len(advances)
         self._environment_decisions += len(advances)
+        self._training_decisions += sum(
+            self.config.algorithm == "genetic_dqn"
+            and not self.population[advance.index].protected_elite
+            for advance in advances
+        )
         advances_by_index = {advance.index: advance for advance in advances}
         completed_results: list[EvaluationResult] = []
         focal_result: EvaluationResult | None = None
@@ -1032,6 +1128,70 @@ class PopulationTrainer:
 
     mutate = mutate_agent
 
+    def _generation_metrics(self) -> dict[str, Any]:
+        """Summarize how far evaluated cars got and why they stopped.
+
+        Fitness alone hides the difference between an early crash and a policy
+        that repeatedly reaches the final corner.  These diagnostics are also
+        persisted in :class:`GenerationRecord`, so an evolution boundary does
+        not erase the evidence needed to tune the learner.
+        """
+
+        evaluated: list[tuple[EvaluationResult, _EvaluationRuntime]] = []
+        for member, runtime in zip(self.population, self._member_runtimes):
+            if member.result is not None:
+                evaluated.append((member.result, runtime))
+        count = len(evaluated)
+        progresses = [
+            float(
+                result.progress
+                if result.max_progress is None
+                else result.max_progress
+            )
+            for result, _ in evaluated
+        ]
+        laps_completed = sum(int(result.laps) for result, _ in evaluated)
+        finishers = sum(result.laps > 0 for result, _ in evaluated)
+        near_finish_count = sum(
+            result.laps == 0 and progress >= self.NEAR_FINISH_THRESHOLD
+            for (result, _), progress in zip(evaluated, progresses)
+        )
+        collision_recoveries = 0
+        safety_interventions = 0
+        end_reasons: dict[str, int] = {}
+        for result, runtime in evaluated:
+            collision_recoveries += max(
+                int(result.collision_recoveries),
+                int(runtime.last_info.get("collision_recoveries", 0)),
+            )
+            safety_interventions += int(result.safety_interventions)
+            reason = result.end_reason.strip()
+            if reason == "unknown":
+                if result.laps > 0 or bool(runtime.last_info.get("lap_completed")):
+                    reason = "lap_completed"
+                else:
+                    raw_reason = runtime.last_info.get("truncation_reason")
+                    if raw_reason:
+                        reason = str(raw_reason)
+                    elif result.truncated:
+                        reason = "evaluation_budget"
+                    elif result.terminated:
+                        reason = "terminated"
+            end_reasons[reason] = end_reasons.get(reason, 0) + 1
+        return {
+            "evaluated_members": count,
+            "population_size": len(self.population),
+            "laps_completed": laps_completed,
+            "lap_completion_rate": finishers / count if count else 0.0,
+            "best_progress": max(progresses, default=0.0),
+            "mean_progress": float(np.mean(progresses)) if progresses else 0.0,
+            "near_finish_threshold": self.NEAR_FINISH_THRESHOLD,
+            "near_finish_count": near_finish_count,
+            "collision_recoveries": collision_recoveries,
+            "safety_interventions": safety_interventions,
+            "end_reasons": end_reasons,
+        }
+
     def evolve(self) -> GenerationRecord:
         """Retain exact elites, create mutated children, and begin the next generation."""
 
@@ -1044,6 +1204,7 @@ class PopulationTrainer:
         ranked = list(self.ranked_members)
         elites = ranked[: self.config.elite_count]
         fitness_values = np.asarray([member.fitness for member in ranked], dtype=float)
+        generation_metrics = self._generation_metrics()
         record = GenerationRecord(
             generation=self.generation,
             best_fitness=float(fitness_values.max()),
@@ -1055,6 +1216,15 @@ class PopulationTrainer:
             elite_ids=tuple(member.member_id for member in elites),
             population_size=len(ranked),
             genome_diversity=self._genome_diversity(self.population),
+            laps_completed=int(generation_metrics["laps_completed"]),
+            lap_completion_rate=float(generation_metrics["lap_completion_rate"]),
+            best_progress=float(generation_metrics["best_progress"]),
+            mean_progress=float(generation_metrics["mean_progress"]),
+            near_finish_count=int(generation_metrics["near_finish_count"]),
+            collision_recoveries=int(
+                generation_metrics["collision_recoveries"]
+            ),
+            end_reasons=tuple(generation_metrics["end_reasons"].items()),
         )
         self.history.append(record)
 
@@ -1122,14 +1292,22 @@ class PopulationTrainer:
         fitnesses = np.asarray([member.fitness for member in evaluated], dtype=float)
         member = self.current_member
         learning = None if member is None else member.agent.telemetry(self._observation)
-        replay_size = sum(len(item.agent.replay) for item in self.population)
-        replay_capacity = sum(item.agent.replay.capacity for item in self.population)
+        trainable_members = [
+            item
+            for item in self.population
+            if self.config.algorithm == "genetic_dqn"
+            and not item.protected_elite
+        ]
+        replay_size = sum(len(item.agent.replay) for item in trainable_members)
+        replay_capacity = sum(
+            item.agent.replay.capacity for item in trainable_members
+        )
         replay_readiness = max(
             self.dqn_config.batch_size,
             self.dqn_config.warmup_steps,
         )
         replay_ready_members = sum(
-            len(item.agent.replay) >= replay_readiness for item in self.population
+            len(item.agent.replay) >= replay_readiness for item in trainable_members
         )
         population = []
         active_indices = self.active_member_indices
@@ -1141,6 +1319,15 @@ class PopulationTrainer:
         ):
             summary = item.summary()
             safety = runtime.safety.snapshot()
+            safety_penalty = (
+                int(safety["interventions"])
+                * self.SAFETY_INTERVENTION_FITNESS_PENALTY
+            )
+            selection_fitness = (
+                float(item.result.fitness)
+                if item.result is not None
+                else float(runtime.total_reward) - safety_penalty
+            )
             safety_decisions += runtime.safety.decisions
             safety_interventions += runtime.safety.interventions
             summary.update(
@@ -1149,6 +1336,9 @@ class PopulationTrainer:
                     "status": "active" if index in active_set else "evaluated",
                     "evaluation_step": runtime.steps,
                     "evaluation_return": runtime.total_reward,
+                    "raw_return": runtime.total_reward,
+                    "selection_fitness": selection_fitness,
+                    "safety_intervention_penalty": safety_penalty,
                     "last_reward": runtime.last_reward,
                     "action": safety["executed_action"],
                     "raw_action": safety["proposed_action"],
@@ -1163,12 +1353,24 @@ class PopulationTrainer:
             population.append(summary)
         aggregate_safety = self._safety_stats.snapshot()
         current_index = self.current_member_index
+        current_raw_return = float(self._evaluation_return)
+        current_safety_penalty = 0.0
+        current_selection_fitness = current_raw_return
         if current_index is not None:
             # The coordinator's last merged decision can belong to a member
             # that completed on this tick. Keep aggregate counters, but source
             # the visible decision from the member now selected everywhere
             # else in telemetry so action, observation, and network agree.
             current_safety = self._member_runtimes[current_index].safety.snapshot()
+            current_runtime = self._member_runtimes[current_index]
+            current_raw_return = float(current_runtime.total_reward)
+            current_safety_penalty = (
+                int(current_runtime.safety.interventions)
+                * self.SAFETY_INTERVENTION_FITNESS_PENALTY
+            )
+            current_selection_fitness = (
+                current_raw_return - current_safety_penalty
+            )
             for key in (
                 "proposed_action",
                 "executed_action",
@@ -1199,6 +1401,7 @@ class PopulationTrainer:
             ),
         }
         environment_snapshot = self.env.telemetry()
+        generation_metrics = self._generation_metrics()
         health_learning = dict(learning or {})
         if self.population:
             gradient_norms = [
@@ -1216,10 +1419,17 @@ class PopulationTrainer:
                 "capacity": replay_capacity,
                 "ready": (
                     self.config.algorithm == "genetic"
-                    or replay_ready_members == len(self.population)
+                    or replay_ready_members == len(trainable_members)
                 ),
                 "ready_members": replay_ready_members,
-                "member_count": len(self.population),
+                "member_count": (
+                    len(trainable_members)
+                    if self.config.algorithm == "genetic_dqn"
+                    else len(self.population)
+                ),
+                "protected_elites": sum(
+                    item.protected_elite for item in self.population
+                ),
             },
             safety=safety_snapshot,
             environment=environment_snapshot,
@@ -1230,12 +1440,13 @@ class PopulationTrainer:
                 "parallel_workers": self.parallel_workers,
             },
             environment_decisions=self._environment_decisions,
-            batch_size=self.dqn_config.batch_size * len(self.population),
+            optimization_decisions=self._training_decisions,
+            batch_size=self.dqn_config.batch_size * max(1, len(trainable_members)),
             warmup_steps=max(
                 self.dqn_config.batch_size,
                 self.dqn_config.warmup_steps,
             )
-            * len(self.population),
+            * max(1, len(trainable_members)),
             gradient_clip=self.dqn_config.gradient_clip,
             optimization_updates=self._optimization_updates,
             gradient_clip_events=self._gradient_clip_events,
@@ -1279,6 +1490,7 @@ class PopulationTrainer:
                 else type(self._worker_failure).__name__
             ),
             "environment_decisions": self._environment_decisions,
+            "training_decisions": self._training_decisions,
             "last_tick_member_count": self._last_tick_member_count,
             "last_batch_ticks": self._last_batch_ticks,
             "last_batch_decisions": self._last_batch_decisions,
@@ -1294,6 +1506,9 @@ class PopulationTrainer:
             "evaluation_progress": self._evaluation_steps
             / self.config.evaluation_steps,
             "evaluation_return": self._evaluation_return,
+            "raw_return": current_raw_return,
+            "evaluation_fitness": current_selection_fitness,
+            "safety_intervention_penalty": current_safety_penalty,
             "last_reward": self._last_reward,
             "proposed_action": safety_snapshot["proposed_action"],
             "executed_action": safety_snapshot["executed_action"],
@@ -1307,6 +1522,7 @@ class PopulationTrainer:
                 "worst": None if not len(fitnesses) else float(fitnesses.min()),
                 "std": None if not len(fitnesses) else float(fitnesses.std()),
             },
+            "generation_metrics": generation_metrics,
             "genetics": {
                 "elite_count": self.config.elite_count,
                 "tournament_size": self.config.tournament_size,
@@ -1360,6 +1576,7 @@ class PopulationTrainer:
             "next_member_id": self._next_member_id,
             "environment_decisions": self._environment_decisions,
             "health_counters": {
+                "training_decisions": self._training_decisions,
                 "optimization_updates": self._optimization_updates,
                 "gradient_clip_events": self._gradient_clip_events,
                 "wall_contact_decisions": self._wall_contact_decisions,
@@ -1397,6 +1614,11 @@ class PopulationTrainer:
         if isinstance(version, bool) or not isinstance(version, (int, np.integer)):
             raise ValueError("population checkpoint version must be an integer")
         if int(version) != self.CHECKPOINT_VERSION:
+            if int(version) == 1:
+                raise ValueError(
+                    "population checkpoint v1 uses the legacy driving action and "
+                    "reward contract; start a fresh learner with --fresh"
+                )
             raise ValueError("unsupported population checkpoint version")
         required = {
             "evolution_config",
@@ -1476,6 +1698,40 @@ class PopulationTrainer:
             raise ValueError("population checkpoint member IDs must be unique")
         if member_ids and next_member_id <= max(member_ids):
             raise ValueError("population checkpoint next_member_id is not ahead")
+        if any(member.birth_generation > generation for member in population):
+            raise ValueError(
+                "population checkpoint member birth_generation exceeds generation"
+            )
+        if generation == 0:
+            if any(
+                member.birth_generation != 0 or member.parent_ids
+                for member in population
+            ):
+                raise ValueError(
+                    "population checkpoint generation-zero members cannot have parents"
+                )
+        else:
+            protected = [member for member in population if member.protected_elite]
+            if len(protected) != self.config.elite_count:
+                raise ValueError(
+                    "population checkpoint protected-elite count is incompatible"
+                )
+            for member in population:
+                if member.protected_elite:
+                    if member.birth_generation >= generation:
+                        raise ValueError(
+                            "population checkpoint protected elite has invalid birth generation"
+                        )
+                    continue
+                if (
+                    member.birth_generation != generation
+                    or len(member.parent_ids) != 2
+                    or len(set(member.parent_ids)) != 2
+                    or member.member_id in member.parent_ids
+                ):
+                    raise ValueError(
+                        "population checkpoint child lineage is incompatible"
+                    )
         for member in population:
             if member.result is None:
                 continue
@@ -1509,6 +1765,10 @@ class PopulationTrainer:
                 sum(member.agent.gradient_steps for member in population),
             ),
         )
+        training_decisions = self._checkpoint_counter(
+            "training_decisions",
+            health_counters.get("training_decisions", optimization_updates),
+        )
         gradient_clip_events = self._checkpoint_counter(
             "gradient_clip_events",
             health_counters.get(
@@ -1526,8 +1786,14 @@ class PopulationTrainer:
         )
         if gradient_clip_events > optimization_updates:
             raise ValueError("population checkpoint clips cannot exceed updates")
-        if optimization_updates > environment_decisions:
-            raise ValueError("population checkpoint updates cannot exceed decisions")
+        if training_decisions > environment_decisions:
+            raise ValueError(
+                "population checkpoint training decisions cannot exceed decisions"
+            )
+        if optimization_updates > training_decisions:
+            raise ValueError(
+                "population checkpoint updates cannot exceed training decisions"
+            )
         if wall_contact_decisions > environment_decisions:
             raise ValueError("population checkpoint contacts cannot exceed decisions")
         if collision_loop_terminations > environment_decisions:
@@ -1578,6 +1844,7 @@ class PopulationTrainer:
         self.generation = generation
         self._next_member_id = next_member_id
         self._environment_decisions = environment_decisions
+        self._training_decisions = training_decisions
         self._optimization_updates = optimization_updates
         self._gradient_clip_events = gradient_clip_events
         self._wall_contact_decisions = wall_contact_decisions
@@ -1858,7 +2125,14 @@ class PopulationTrainer:
         runtime = self._member_runtimes[index]
         state = runtime.observation.copy()
         completed_steps = runtime.steps
-        explore = self.config.algorithm == "genetic_dqn"
+        # A hybrid child may learn and explore during its lifetime. Exact
+        # elites are evaluated greedily without optimizer writes so one noisy
+        # rollout cannot destroy the best inherited genome before selection.
+        dqn_training = (
+            self.config.algorithm == "genetic_dqn"
+            and not member.protected_elite
+        )
+        explore = dqn_training
         advances: list[_MemberAdvance] = []
         for _ in range(max_ticks):
             gradient_steps_before = member.agent.gradient_steps
@@ -1875,7 +2149,7 @@ class PopulationTrainer:
             budget_reached = completed_steps >= self.config.evaluation_steps
             done = bool(env_result.terminated or env_result.truncated or budget_reached)
             loss: float | None = None
-            if self.config.algorithm == "genetic_dqn":
+            if dqn_training:
                 observed_loss = member.agent.observe(
                     state,
                     executed_action,
@@ -1917,15 +2191,35 @@ class PopulationTrainer:
         runtime = self._member_runtimes[index]
         env_result = advance.env_result
         info = env_result.info
+        laps = int(info.get("laps", runtime.env.laps))
+        if laps > 0 or bool(info.get("lap_completed", False)):
+            end_reason = "lap_completed"
+        elif info.get("truncation_reason"):
+            end_reason = str(info["truncation_reason"])
+        elif advance.budget_reached:
+            end_reason = "evaluation_budget"
+        elif env_result.terminated:
+            end_reason = "terminated"
+        else:
+            end_reason = "completed"
+        safety_interventions = int(runtime.safety.interventions)
+        intervention_penalty = (
+            safety_interventions * self.SAFETY_INTERVENTION_FITNESS_PENALTY
+        )
+        fitness = float(runtime.total_reward) - intervention_penalty
+        runtime.last_info["end_reason"] = end_reason
+        runtime.last_info["safety_intervention_penalty"] = intervention_penalty
         result = EvaluationResult(
             generation=self.generation,
             member_id=member.member_id,
-            # The environment reward already combines progress, road holding,
-            # speed, collisions, and lap completion without double counting.
-            fitness=float(runtime.total_reward),
+            # Environment reward measures driving.  Genetic selection also
+            # charges a small reliance cost when the transparent safety prior
+            # has to replace an unsafe proposal; replay still receives the
+            # executed transition and its unmodified environment reward.
+            fitness=fitness,
             total_reward=float(runtime.total_reward),
             steps=runtime.steps,
-            laps=int(info.get("laps", runtime.env.laps)),
+            laps=laps,
             # Random-origin episodes report absolute circuit position as
             # ``progress`` and distance travelled from their own origin as
             # ``episode_lap_progress``. Fitness summaries must use the latter so a
@@ -1936,6 +2230,15 @@ class PopulationTrainer:
             truncated=bool(env_result.truncated or advance.budget_reached),
             mean_loss=(float(np.mean(runtime.losses)) if runtime.losses else 0.0),
             training_updates=len(runtime.losses),
+            end_reason=end_reason,
+            collision_recoveries=int(info.get("collision_recoveries", 0)),
+            safety_interventions=safety_interventions,
+            max_progress=float(
+                info.get(
+                    "max_episode_lap_progress",
+                    info.get("episode_lap_progress", info.get("progress", 0.0)),
+                )
+            ),
         )
         member.result = result
         self._consider_champion(member)
