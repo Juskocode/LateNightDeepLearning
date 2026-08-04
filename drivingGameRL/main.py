@@ -96,9 +96,21 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=1800,
         help=(
-            "Maximum simulation-step budget per policy (default: 1800; "
-            "successful laps and unrecoverable stalls still finish early)"
+            "Simulation-step budget per target lap (default: 1800); the live "
+            "evaluation budget scales with its progressive lap target"
         ),
+    )
+    learning.add_argument(
+        "--initial-laps",
+        type=int,
+        default=2,
+        help="Laps required by the first learning evaluation (default: 2)",
+    )
+    learning.add_argument(
+        "--max-laps",
+        type=int,
+        default=5,
+        help="Maximum progressively learned lap target (default: 5)",
     )
     learning.add_argument(
         "--workers",
@@ -189,19 +201,31 @@ def _run_learning(args: argparse.Namespace, parser: argparse.ArgumentParser) -> 
         parser.error("--tournament-size must be in [1, population]")
     if args.evaluation_steps <= 0:
         parser.error("--evaluation-steps must be positive")
+    if args.initial_laps <= 0:
+        parser.error("--initial-laps must be positive")
+    if args.max_laps <= 0:
+        parser.error("--max-laps must be positive")
+    if args.initial_laps > args.max_laps:
+        parser.error("--initial-laps cannot exceed --max-laps")
     if args.workers is not None and args.workers <= 0:
         parser.error("--workers must be positive")
     if args.generations is not None and args.generations <= 0:
         parser.error("--generations must be positive")
 
     from .src.learning_game import DrivingLearningGame
+    from .src.environment import DrivingEnv
     from .src.learning_runtime import DrivingLearningSession, LearningRuntimeConfig
+
+    if args.max_laps > DrivingEnv.MAX_LAP_TARGET:
+        parser.error(f"--max-laps cannot exceed {DrivingEnv.MAX_LAP_TARGET}")
 
     runtime = LearningRuntimeConfig(
         algorithm=args.algorithm,
         circuit=args.circuit,
         seed=args.seed,
         evaluation_steps=args.evaluation_steps,
+        initial_lap_target=args.initial_laps,
+        max_lap_target=args.max_laps,
         population_size=args.population,
         elite_count=args.elite_count,
         tournament_size=args.tournament_size,

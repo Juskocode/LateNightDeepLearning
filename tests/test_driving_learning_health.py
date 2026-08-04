@@ -49,6 +49,8 @@ def _evolution(**changes) -> EvolutionConfig:
         "elite_count": 1,
         "tournament_size": 1,
         "evaluation_steps": 4,
+        "initial_lap_target": 1,
+        "max_lap_target": 1,
         "mutation_rate": 0.0,
         "mutation_std": 0.0,
         "seed": 23,
@@ -147,11 +149,15 @@ class LearningHealthContractTests(unittest.TestCase):
 class DrivingDQNHealthTests(unittest.TestCase):
     def test_legacy_driving_action_contract_checkpoint_is_rejected(self):
         agent = DrivingDQNAgent(_dqn(seed=31))
-        legacy = agent.state_dict()
-        legacy["checkpoint_version"] = 1
-
-        with self.assertRaisesRegex(ValueError, "legacy driving action contract"):
-            agent.load_state_dict(legacy)
+        for version in (1, 2):
+            with self.subTest(version=version):
+                legacy = agent.state_dict()
+                legacy["checkpoint_version"] = version
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "legacy action, reward, or lap-target contract",
+                ):
+                    agent.load_state_dict(legacy)
 
     def test_agent_reports_replay_updates_gradient_pressure_and_value_scale(self):
         agent = DrivingDQNAgent(_dqn(gradient_clip=1e-8))
@@ -320,10 +326,15 @@ class PopulationHealthTests(unittest.TestCase):
     def test_checkpoint_rejects_legacy_contract_and_forged_elite_lineage(self):
         trainer = self._trainer(1)
 
-        legacy = deepcopy(trainer.state_dict())
-        legacy["checkpoint_version"] = 1
-        with self.assertRaisesRegex(ValueError, "legacy driving action and reward"):
-            trainer.load_state_dict(legacy)
+        for version in (1, 2):
+            with self.subTest(version=version):
+                legacy = deepcopy(trainer.state_dict())
+                legacy["checkpoint_version"] = version
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "legacy driving termination/reward contract",
+                ):
+                    trainer.load_state_dict(legacy)
 
         forged = deepcopy(trainer.state_dict())
         for member in forged["population"]:

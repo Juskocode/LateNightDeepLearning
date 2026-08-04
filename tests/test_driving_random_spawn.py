@@ -135,19 +135,21 @@ class DrivingRandomSpawnTests(unittest.TestCase):
         self.assertEqual(env.normal_start_probability, 0.80)
 
     def test_curriculum_state_is_checkpoint_and_clone_safe(self):
-        source = DrivingEnv(seed=9, random_start_curriculum=True)
+        source = DrivingEnv(seed=9, random_start_curriculum=True, lap_target=3)
         source.load_curriculum_state({"ready": True})
         state = source.curriculum_state()
-        self.assertEqual(state, {"unlocked": True})
+        self.assertEqual(state, {"unlocked": True, "lap_target": 3})
 
         clone = DrivingEnv(seed=9, random_start_curriculum=True)
         clone.load_curriculum_state(state)
         self.assertTrue(clone.curriculum_ready)
+        self.assertEqual(clone.lap_target, 3)
         clone.reset(seed=1)
         self.assertEqual(clone.spawn_mode, "start_line")
 
         clone.load_curriculum_state({})
         self.assertFalse(clone.curriculum_unlocked)
+        self.assertEqual(clone.lap_target, 3)
         clone.reset(seed=1)
         self.assertEqual(clone.spawn_mode, "random_track")
 

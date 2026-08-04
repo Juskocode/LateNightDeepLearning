@@ -43,6 +43,8 @@ class LearningRuntimeConfig:
     circuit: str = "harbor_loop"
     seed: int = 7
     evaluation_steps: int = 1_800
+    initial_lap_target: int = 2
+    max_lap_target: int = 5
     population_size: int = 8
     elite_count: int = 2
     tournament_size: int = 2
@@ -61,6 +63,8 @@ class LearningRuntimeConfig:
         integer_fields = (
             "seed",
             "evaluation_steps",
+            "initial_lap_target",
+            "max_lap_target",
             "population_size",
             "elite_count",
             "tournament_size",
@@ -73,6 +77,15 @@ class LearningRuntimeConfig:
             raise ValueError("seed must be in the [0, 2**63) interval")
         if self.evaluation_steps <= 0:
             raise ValueError("evaluation_steps must be positive")
+        if not 1 <= self.initial_lap_target <= self.max_lap_target:
+            raise ValueError(
+                "initial_lap_target must be in [1, max_lap_target]"
+            )
+        if self.max_lap_target > DrivingEnv.MAX_LAP_TARGET:
+            raise ValueError(
+                "max_lap_target cannot exceed "
+                f"DrivingEnv.MAX_LAP_TARGET ({DrivingEnv.MAX_LAP_TARGET})"
+            )
         if self.population_size < 2:
             raise ValueError("population_size must be at least two")
         if not 1 <= self.elite_count < self.population_size:
@@ -152,15 +165,23 @@ class DrivingLearningSession:
             self.config.circuit,
             build=self.build,
             seed=self.config.seed,
-            max_steps=self.config.evaluation_steps,
+            max_steps=self._effective_evaluation_steps(
+                self.config.initial_lap_target
+            ),
             random_start_curriculum=True,
+            lap_target=self.config.initial_lap_target,
         )
         self.observation = self.env.observation()
         self.generation = 1
         self.episode_return = 0.0
         self.best_fitness = -math.inf
+        self._best_champion_rank: tuple[float, bool, int] = (
+            -math.inf,
+            False,
+            0,
+        )
         self._champion = self.agent.clone(seed=self.config.seed + 1)
-        self.generation_history: list[dict[str, float | int]] = []
+        self.generation_history: list[dict[str, object]] = []
         self._episode_fitness: list[float] = []
 
     def _init_population(self, dqn_config: DQNConfig | None) -> None:
@@ -170,8 +191,8 @@ class DrivingLearningSession:
 
         base_algorithm = "double_dqn"
         if dqn_config is None:
-            # Population members live for a bounded 1,800-step episode by
-            # default. The generic 512-step warmup spends too much of that lifetime
+            # Population members receive 1,800 steps per target lap by default.
+            # The generic 512-step warmup still spends too much of the first lap
             # collecting without learning, then trains every frame. Start
             # replay early and spread updates across four transitions instead:
             # better early feedback with substantially lower interactive CPU
@@ -191,6 +212,8 @@ class DrivingLearningSession:
             elite_count=self.config.elite_count,
             tournament_size=self.config.tournament_size,
             evaluation_steps=self.config.evaluation_steps,
+            initial_lap_target=self.config.initial_lap_target,
+            max_lap_target=self.config.max_lap_target,
             crossover=self.config.crossover,
             crossover_rate=self.config.crossover_rate,
             blend_alpha=self.config.blend_alpha,
@@ -202,8 +225,11 @@ class DrivingLearningSession:
             self.config.circuit,
             build=self.build,
             seed=self.config.seed,
-            max_steps=self.config.evaluation_steps,
+            max_steps=self._effective_evaluation_steps(
+                self.config.initial_lap_target
+            ),
             random_start_curriculum=True,
+            lap_target=self.config.initial_lap_target,
         )
         self._population_trainer = PopulationTrainer(
             evolution,
@@ -214,6 +240,19 @@ class DrivingLearningSession:
         self.env = self._population_trainer.env
         self.agent = self._population_trainer.current_agent
         self.observation = self.env.observation()
+
+    def _effective_evaluation_steps(self, lap_target: int) -> int:
+        """Return the fixed-step budget for one progressive lap target."""
+
+        if (
+            isinstance(lap_target, bool)
+            or not isinstance(lap_target, int)
+            or not 1 <= lap_target <= self.config.max_lap_target
+        ):
+            raise ValueError(
+                "lap_target must be an integer in [1, max_lap_target]"
+            )
+        return self.config.evaluation_steps * lap_target
 
     @property
     def is_population(self) -> bool:
@@ -354,7 +393,7 @@ class DrivingLearningSession:
         self.observation = result.observation
         self._last_event = "training_step"
         if done:
-            self._finish_dqn_episode()
+            self._finish_dqn_episode(result)
         self._record_learning_trace()
         return result
 
@@ -423,25 +462,60 @@ class DrivingLearningSession:
         if math.isfinite(epsilon):
             self._epsilon_history.append(epsilon)
 
-    def _finish_dqn_episode(self) -> None:
+    def _finish_dqn_episode(self, result: StepResult) -> None:
+        completed_lap_target = bool(result.info.get("lap_target_completed", False))
+        completed_target = int(self.env.lap_target)
         fitness = float(self.episode_return)
+        fitness_per_target_lap = fitness / max(1, completed_target)
+        champion_rank = (
+            fitness_per_target_lap,
+            completed_lap_target,
+            completed_target,
+        )
         self._episode_fitness.append(fitness)
-        if fitness > self.best_fitness:
+        if champion_rank > self._best_champion_rank:
+            self._best_champion_rank = champion_rank
             self.best_fitness = fitness
             self._champion = self.agent.clone(seed=self.config.seed + self.generation)
             self._last_event = "new_champion"
         else:
             self._last_event = "episode_complete"
+        laps = int(result.info.get("laps", self.env.laps))
+        target_progress = float(
+            result.info.get("episode_target_progress", 0.0)
+        )
         self.generation_history.append(
             {
                 "generation": self.generation,
                 "best": fitness,
                 "mean": fitness,
                 "worst": fitness,
+                "laps": laps,
+                "laps_completed": laps,
+                "lap_target": completed_target,
+                "lap_target_completed": completed_lap_target,
+                "target_finishers": int(completed_lap_target),
+                "target_completion_rate": float(completed_lap_target),
+                "lap_finishers": int(laps > 0),
+                "lap_completion_rate": float(laps > 0),
+                "fitness_per_target_lap": fitness_per_target_lap,
+                "target_progress": target_progress,
+                "best_progress": target_progress,
+                "mean_progress": target_progress,
+                "best_target_progress": target_progress,
+                "mean_target_progress": target_progress,
+                "best_lap_time": result.info.get("episode_best_lap_time"),
+                "mean_lap_time": result.info.get("episode_mean_lap_time"),
+                "lap_time_bonus_total": float(
+                    result.info.get("episode_lap_time_bonus_total", 0.0)
+                ),
             }
         )
         self.generation += 1
         self.episode_return = 0.0
+        if completed_lap_target and completed_target < self.config.max_lap_target:
+            self.env.set_lap_target(completed_target + 1)
+        self.env.max_steps = self._effective_evaluation_steps(self.env.lap_target)
         self.observation = self.env.reset()
 
     def champion_agent(self) -> DrivingDQNAgent:
@@ -493,7 +567,7 @@ class DrivingLearningSession:
         """Describe the effective proposal-exploration schedule analytically."""
 
         config = self.agent.config
-        lifetime = max(1, int(self.config.evaluation_steps))
+        lifetime = max(1, int(self.env.max_steps))
         decay = max(1, int(config.epsilon_decay_steps))
         schedule_step = max(0, int(self.agent.environment_steps))
         # Forecast the next evaluation-sized horizon from the learner's actual
@@ -568,10 +642,34 @@ class DrivingLearningSession:
                             )
                         ),
                         "elite": False,
-                        "laps": result.get("laps", 0),
-                        "progress": result.get("progress", 0.0),
+                        "laps": result.get("laps", member.get("laps", 0)),
+                        "lap_target": result.get(
+                            "lap_target", member.get("lap_target", 1)
+                        ),
+                        "lap_target_completed": result.get(
+                            "lap_target_completed",
+                            member.get("lap_target_completed", False),
+                        ),
+                        "progress": result.get(
+                            "progress",
+                            member.get("episode_target_progress", 0.0),
+                        ),
                         "max_progress": result.get(
-                            "max_progress", result.get("progress", 0.0)
+                            "max_progress",
+                            member.get(
+                                "max_episode_target_progress",
+                                result.get("progress", 0.0),
+                            ),
+                        ),
+                        "best_lap_time": result.get(
+                            "best_lap_time", member.get("best_lap_time")
+                        ),
+                        "mean_lap_time": result.get(
+                            "mean_lap_time", member.get("mean_lap_time")
+                        ),
+                        "lap_time_bonus_total": result.get(
+                            "lap_time_bonus_total",
+                            member.get("lap_time_bonus_total", 0.0),
                         ),
                         "collisions": result.get("collisions", 0),
                         "collision_recoveries": result.get(
@@ -612,8 +710,23 @@ class DrivingLearningSession:
                     "diversity": row.get("genome_diversity", 0.0),
                     "laps_completed": row.get("laps_completed", 0),
                     "lap_completion_rate": row.get("lap_completion_rate", 0.0),
+                    "lap_finishers": row.get("lap_finishers", 0),
+                    "lap_target": row.get("lap_target", 1),
+                    "target_finishers": row.get("target_finishers", 0),
+                    "target_completion_rate": row.get(
+                        "target_completion_rate",
+                        row.get("lap_completion_rate", 0.0),
+                    ),
                     "best_progress": row.get("best_progress", 0.0),
                     "mean_progress": row.get("mean_progress", 0.0),
+                    "best_target_progress": row.get(
+                        "best_target_progress", row.get("best_progress", 0.0)
+                    ),
+                    "mean_target_progress": row.get(
+                        "mean_target_progress", row.get("mean_progress", 0.0)
+                    ),
+                    "best_lap_time": row.get("best_lap_time"),
+                    "mean_lap_time": row.get("mean_lap_time"),
                     "near_finish_count": row.get("near_finish_count", 0),
                     "collision_recoveries": row.get(
                         "collision_recoveries", 0
@@ -679,10 +792,19 @@ class DrivingLearningSession:
                 "member_index": 0,
                 "population_size": 1,
                 "episode_step": self.env.steps,
-                "evaluation_steps": self.config.evaluation_steps,
+                "evaluation_steps": self.env.max_steps,
+                "evaluation_steps_per_lap": self.config.evaluation_steps,
+                "effective_evaluation_steps": self.env.max_steps,
+                "initial_lap_target": self.config.initial_lap_target,
+                "max_lap_target": self.config.max_lap_target,
                 "current_fitness": self.episode_return,
                 "best_fitness": (
                     None if self.best_fitness == -math.inf else self.best_fitness
+                ),
+                "best_fitness_per_target_lap": (
+                    None
+                    if not math.isfinite(self._best_champion_rank[0])
+                    else self._best_champion_rank[0]
                 ),
                 "mean_fitness": (
                     sum(self._episode_fitness) / len(self._episode_fitness)
@@ -906,6 +1028,24 @@ class DrivingLearningSession:
                 raise ValueError(
                     "checkpoint curriculum unlocked state must be a boolean"
                 )
+            lap_target = curriculum_state.get(
+                "lap_target", self.config.initial_lap_target
+            )
+            if (
+                isinstance(lap_target, bool)
+                or not isinstance(lap_target, int)
+                or not (
+                    self.config.initial_lap_target
+                    <= lap_target
+                    <= self.config.max_lap_target
+                )
+            ):
+                raise ValueError(
+                    "checkpoint lap target must be an integer in the configured "
+                    "[initial_lap_target, max_lap_target] interval"
+                )
+            curriculum_state = dict(curriculum_state)
+            curriculum_state["lap_target"] = lap_target
             rng_state = state.get("environment_rng_state")
             if rng_state is not None:
                 import random
@@ -926,6 +1066,9 @@ class DrivingLearningSession:
                 self.agent.nonfinite_update_rejections
             )
             self.env.load_curriculum_state(curriculum_state)
+            self.env.max_steps = self._effective_evaluation_steps(
+                self.env.lap_target
+            )
             if rng_state is None:
                 # Backward-compatible checkpoints predate the environment RNG
                 # payload, so retain their former deterministic seed behavior.
@@ -958,6 +1101,9 @@ class DrivingLearningSession:
             self.env = self._population_trainer.env
             self.agent = self._population_trainer.current_agent
         else:
+            self.env.max_steps = self._effective_evaluation_steps(
+                self.env.lap_target
+            )
             observation = self.env.reset()
             self.episode_return = 0.0
         self.observation = tuple(float(value) for value in observation)

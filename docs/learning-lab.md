@@ -490,9 +490,10 @@ Lap validation rotates with the sampled episode origin. The car must pass the
 relative 25%, 50%, and 75% gates in order and then cross that origin in the
 forward direction. Reverse crossings, origin oscillation, and implausible
 projection jumps retain the same rejection rules as normal laps. Each ordered
-gate pays `+15` once; a valid loop earns `+300`, sets
-`curriculum_lap_completed`, and terminates that learning evaluation.
-Random-origin times are deliberately excluded from the
+gate pays `+15` once; every valid loop earns `+300` plus a bounded pace bonus
+and sets the one-tick `curriculum_lap_completed` event. The evaluation continues
+until its current multi-lap target is complete. Random-origin times are
+deliberately excluded from the
 normal-grid best-lap record because their trajectories begin at a different
 place and would make the manual ghost misleading.
 
@@ -504,17 +505,27 @@ after qualification:    80% normal grid + 20% random origin
 ```
 
 The reset draws and origin are deterministic for a seed. Standalone DQN and
-Double-DQN checkpoints persist the unlock and environment RNG stream, while
-population checkpoints persist the generation-level curriculum state. In a
-genetic generation, all members receive the same seeded scenario. A successful
-member's unlock is deferred until the next generation so every genome in the
-current ranking faces equal conditions.
+Double-DQN checkpoints persist the unlock, current endurance target, and
+environment RNG stream, while population checkpoints persist the shared
+generation-level curriculum state. In a genetic generation, all members receive
+the same seeded scenario. A successful member's unlock is deferred until the
+next generation so every genome in the current ranking faces equal conditions.
+
+Endurance difficulty is also shared within a generation. The initial target is
+two valid laps. When any member reaches the full target, the next generation
+requires one additional lap, up to a five-lap cap. All members in that
+generation receive the same target and the same target-scaled budget. For
+standalone DQN or Double DQN, the single successful episode advances the same
+2 → 3 → 4 → 5 progression. Completing only part of a target remains useful
+fitness evidence, but it is not reported as a target finish.
 
 The dashboard draws the active **RANDOM ORIGIN** or **GRID ORIGIN** gate and
-reports `episode_lap_progress` from 0 to 1. Preview cars copy that same
-curriculum state into isolated environments. The permanent observation value
-at index 6 remains absolute circuit `lap_progress`; this is intentionally
-distinct from origin-relative episode completion.
+reports **LAPS completed/target** plus cumulative
+`episode_target_progress`. The existing `episode_lap_progress` remains the
+0-to-1 position within the current origin-relative loop; neither field replaces
+the absolute circuit observation. Preview cars copy the same curriculum state
+into isolated environments. The permanent observation value at index 6 remains
+absolute circuit `lap_progress`.
 
 ### Observation: 16 normalized values
 
@@ -570,7 +581,8 @@ factor, `q` be the minimum normalized clearance of the three forward rays,
 ray first maps `[0.18, 1]` onto `[0, 1]`; `u` combines 65% of the minimum front
 three with 35% of the weighted nine-ray fan. The center ray has weight 1.0,
 then weights fall symmetrically through 0.75, 0.45, 0.25, and 0.15. The
-implemented terms are:
+optimistic lap-time reference `t_ref` is circuit length divided by the current
+build's maximum speed. The implemented terms are:
 
 ```text
 progress        = 300 * p
@@ -589,7 +601,14 @@ collision       = -6 - min(12, 0.12 * impact_speed) on contact start
 stagnation      = ramps from 0 to -0.12 after 90 non-progress ticks
 checkpoint      = +15 once at each ordered 25% / 50% / 75% gate
 lap             = +300 after one valid gated forward circuit
+lap_time        = min(150, 150 * t_ref / completed_lap_time)
 ```
+
+The `lap_time` term is paid only with a valid gated completion. A reported time
+below `0.75 * t_ref` is treated as physically implausible and receives zero
+instead of a bonus, so a projection shortcut cannot dominate fitness. The
+bounded term makes a faster valid lap worth more without allowing pace to
+outweigh the progress and endurance value of another complete loop.
 
 There is deliberately no positive survival reward. Meaningful forward movement
 resets stagnation; otherwise the penalty grows after 90 ticks and the episode is
@@ -602,17 +621,21 @@ Forty-five penetration ticks, or four entries before confirmed recovery,
 truncate a genuinely stuck run as a collision loop.
 
 The `info` dictionary exposes the active terrain, on-road flag, absolute
-`progress`, origin-relative current and maximum episode lap progress, spawn mode and origin,
-curriculum readiness, completed laps, `lap_completed`, current/last/best lap
-time, current-tick barrier penetration in `collided`, one-shot
+`progress`, origin-relative current and maximum per-loop progress, cumulative
+current and maximum target progress, spawn mode and origin, curriculum
+readiness, completed/required/remaining laps, `lap_completed`,
+`lap_target_completed`, current/last/best and episode best/mean lap time, the
+pace reference, bonus and validity flag, current-tick barrier penetration in
+`collided`, one-shot
 `collision_started`, current-tick `wall_contact_active`, impact speed,
 heading alignment, forward and usable clearance, clearance delta, green-ray
 fraction, wall-closing state, collision pressure, recovery duration and count,
 real contact ticks, recent collision entries,
 stagnation count, exact cutoff constants, every reward term, and vehicle
-telemetry. Curriculum learning episodes terminate on a valid loop; all modes
-truncate at their configured step limit, stagnation limit, or collision-loop
-limit. The general step limit defaults to 10,800 steps (three minutes at 60 Hz).
+telemetry. Curriculum learning episodes terminate only when
+`lap_target_completed` is true; all modes truncate at their configured step
+limit, stagnation limit, or collision-loop limit. The general manual-environment
+step limit defaults to 10,800 steps (three minutes at 60 Hz).
 
 ### Observable sensor-clearance policy
 
@@ -659,12 +682,13 @@ actions. The deep action-value function is a fully connected network:
 16 observations → 128 ReLU → 128 ReLU → 5 Q-values
 ```
 
-Within driving checkpoint semantic contract v2, compatible 12-input tensors can
+Within driving checkpoint semantic contract v3, compatible 12-input tensors can
 still use the observation-shape bridge: the five old ray columns are copied to
 their matching angles, the four new input columns (and corresponding Adam
 moments) start at zero, and predictions are retained at the migration boundary.
-Pre-v2 files are deliberately rejected because their action and reward meanings
-are no longer the same.
+Pre-v3 files are deliberately rejected because their terminal and reward
+meanings are no longer the same: a one-lap terminal transition cannot be mixed
+honestly with progressive multi-lap returns and the new pace term.
 
 The five outputs estimate the discounted return for coast, accelerate, brake,
 steer left, and steer right. In the standalone deep modes, epsilon-greedy action
@@ -704,6 +728,14 @@ budget, and its fitness is exactly its accumulated shaped environment reward:
 fitness_i = sum(t=0..T-1) reward_i,t
 ```
 
+`--evaluation-steps` defines the allowance per required lap rather than the
+whole endurance run. With target `L` and per-lap allowance `S`, the effective
+member ceiling is `L * S`. The default `S = 1,800` therefore gives the initial
+two-lap stage 3,600 ticks and the five-lap cap 9,000 ticks; finishing the target,
+stagnating, or failing collision recovery still stops early. CLI flags
+`--initial-laps` and `--max-laps` override the default 2 → 5 range; the initial
+value must not exceed the maximum, and the environment hard-caps targets at 12.
+
 Population evaluation is seeded, synchronous, and concurrent. The trainer
 submits one short, bounded chunk per unfinished member instead of recreating one
 future for every car on every tick. Each task mutates only its member's private
@@ -741,7 +773,12 @@ child_j <- child_j + Bernoulli(mutation_rate) * Normal(0, mutation_std)
 Strict elitism prevents a good genome from being destroyed by random operators,
 while tournament selection still gives weaker genomes a non-zero path into the
 next generation. The dashboard reports best, mean, median, and worst fitness,
-fitness spread, genome diversity, ancestry, and the active member.
+fitness spread, genome diversity, ancestry, the active member, completed laps,
+target finishers, and current/best target-wide progress. Partial multi-lap
+attempts retain their real truncation reason instead of being mislabeled as
+finishers merely because they completed one lap. `lap_completion_rate` counts
+members that completed at least one loop; `target_completion_rate` counts only
+members that finished the full endurance target.
 
 ### Hybrid genetic DQN
 
@@ -776,11 +813,12 @@ decisions and run every fourth transition. This replaces the former 512-step
 warm-up/every-tick update pattern: useful TD feedback begins within a short
 evaluation while optimizer work no longer monopolizes every frame. Explicit
 programmatic `DQNConfig` values remain unchanged. Population-created hybrid
-members also use epsilon `0.30 → 0.05` across exactly `evaluation_steps`. For the
-default 1,800-step lifetime, the linear schedule averages about 17.5% exploratory and
-82.5% greedy proposals. The former generic 40,000-step decay restarted every
-short-lived member near epsilon 1.0, leaving only about ten greedy choices in a
-default evaluation. Standalone DQN retains its generic schedule.
+members also use epsilon `0.30 → 0.05` across the first per-lap allowance, then
+hold at `0.05` through the remaining endurance laps. This keeps later laps
+strongly greedy-biased while the first lap still samples alternative actions.
+The former generic 40,000-step decay kept each bounded member unnecessarily
+close to epsilon 1.0 through most of its rollout. Standalone DQN retains its
+generic schedule.
 
 Exact hybrid elites are frozen during their next scored rollout: they act
 greedily and receive no replay or optimizer writes. Children retain the hybrid
@@ -800,8 +838,9 @@ only deduplicates one scrape. A low-speed blocked car can brake into reverse,
 and twelve consecutive clean, on-road, forward-progress ticks confirm recovery
 without discarding ordered lap gates. Telemetry exposes collision pressure,
 recovery duration, successful recoveries, terminal reason, current progress,
-and the maximum frontier reached before any reversal. Ordered 25%, 50%, and 75%
-gates each pay `+15` once, while a valid loop pays `+300`.
+and the maximum target-wide frontier reached before any reversal. Ordered 25%,
+50%, and 75% gates each pay `+15` once per valid lap candidate, while every
+valid loop pays `+300` plus the bounded pace bonus.
 
 ### Live dashboard and the `P` champion race
 
@@ -810,7 +849,7 @@ synthesize training state.
 
 | Tab | What it answers |
 |---|---|
-| Overview | Which real scored members are driving in parallel, their episode origins, current/maximum progress, exact rays, usable green clearance and delta, recovery pressure, neural proposal → executed safety action, lap/near-finish/end-reason diagnostics, cars per tick and worker count, and how fitness changes across generations |
+| Overview | Which real scored members are driving in parallel, their episode origins, completed/required laps, current/maximum target progress, exact rays, usable green clearance and delta, recovery pressure, neural proposal → executed safety action, target-finisher/near-finish/end-reason diagnostics, cars per tick and worker count, and how fitness changes across generations |
 | Network | Which real layers and connections produced the current Q-values; colors and intensity come from current activations and weights |
 | Memory | How full replay is, whether action selection explored, and what loss, TD error, gradient steps, action counts, and target synchronization are doing |
 
@@ -849,8 +888,15 @@ under equal environment-decision budgets. For a population run, the interaction
 budget per full generation is approximately:
 
 ```text
-population_size * evaluation_steps
+population_size * lap_target * evaluation_steps
 ```
+
+Because the target rises only after demonstrated completion, report the target
+alongside fitness and decision counts; raw fitness from a two-lap generation is
+not directly comparable to raw fitness from a five-lap generation. Selection
+inside a generation still uses raw fitness because every member shares one
+target. The best-ever race champion is compared by `fitness / lap_target`, with
+target completion and then longer demonstrated endurance breaking exact ties.
 
 ### Driving commands and controls
 
@@ -901,9 +947,10 @@ late-night-driving-rl --algorithm genetic_dqn \
 
 An explicit `--checkpoint` is loaded when it exists and saved on clean exit.
 `--fresh` skips loading, while `--no-save` keeps the existing file unchanged.
-Driving checkpoints use semantic contract v2. A v1 policy used hard brake for
-action 2 and a different milestone/lap reward contract, so it cannot be resumed
-honestly—use `--fresh` to begin a new run under the current environment.
+Driving checkpoints use semantic contract v3. Version-2 and older policies use
+one-lap terminal transitions and omit the bounded lap-time reward, so they
+cannot be resumed honestly—use `--fresh` to begin a new run under the current
+environment.
 
 Without `--learn`, headless mode and any `--screenshot` request enter deterministic
 autopilot capture mode, which defaults to 240 steps when `--steps` is omitted.

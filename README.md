@@ -431,7 +431,7 @@ penetration raises collision pressure. Twelve clean, on-road, forward-progress
 ticks confirm a recovery, clear that incident's pressure, and preserve the
 ordered lap candidate. A car is truncated only after sustained penetration or
 repeated unrecovered impacts; the Overview shows recovery state, pressure,
-successful recoveries, and each member's best lap frontier.
+successful recoveries, and each member's best target-wide frontier.
 
 Population evaluation is synchronous and concurrent. Each unfinished member
 owns a private environment, car, policy, replay buffer, and optimizer. The
@@ -450,26 +450,37 @@ Every learning algorithm starts with the same anti-memorization curriculum:
 1. Before qualification, every evaluation spawns at a seeded random point on
    the track centerline, facing the local forward tangent.
 2. The 25%, 50%, and 75% safety gates rotate with that episode's origin. Each
-   ordered gate pays a one-time `+15`; a full loop back to the origin earns the
-   `+300` lap reward and ends the evaluation. Crossing the permanent grid line
-   is not a shortcut.
+   ordered gate pays a one-time `+15`; every full loop back to the origin earns
+   `+300` plus a bounded faster-lap bonus. Crossing the permanent grid line is
+   not a shortcut.
 3. After the learner proves one random-origin loop, resets use the normal start
    line 80% of the time and another random origin 20% of the time.
+4. Learning evaluations start at a two-lap endurance target. Once any member
+   in a generation reaches its target, the following generation requires one
+   additional lap, capped at five. Every member in a generation shares the
+   same target and effective step budget.
 
 For genetic runs, every member in one generation receives the same seeded
 scenario. A qualification is latched until the generation boundary, so later
 members are not ranked on an easier distribution. Manual driving and the `P`
 champion race remain on the normal grid, and random-origin completions never
 replace the normal-start best-lap ghost. Checkpoints preserve both curriculum
-readiness and deterministic spawn continuation.
+readiness, the current endurance target, and deterministic spawn continuation.
 
-The default evaluation budget is 1,800 fixed ticks (30 simulated seconds),
-which is long enough for a real Harbor Loop attempt; the former 900-tick cap
-was shorter than a typical clean lap. Completed laps, stagnation, and failed
-recovery still end an evaluation early, so weak policies need not consume the
-full ceiling. In hybrid mode, exact inherited elites are scored greedily without
-optimizer writes while children continue to explore and learn, preserving at
-least one bit-identical policy across each generation boundary.
+`--evaluation-steps` is a per-required-lap allowance: the default is 1,800
+fixed ticks (30 simulated seconds) for each target lap. The initial two-lap
+stage therefore permits 3,600 ticks and the five-lap cap permits 9,000. Reaching
+the complete target, stagnation, and failed recovery still end an evaluation
+early, so weak policies need not consume the full ceiling. In hybrid mode,
+exact inherited elites are scored greedily without optimizer writes while
+children continue to explore and learn, preserving at least one bit-identical
+policy across each generation boundary. `--initial-laps` and `--max-laps`
+override the 2 → 5 progression for bounded curriculum experiments.
+
+Within one generation, genetic selection uses raw fitness because every member
+shares the same target. Across endurance stages, the best-ever race champion is
+ranked by fitness per required lap, so a merely longer reward horizon cannot
+replace a faster, stronger policy.
 
 ```bash
 # Standard and Double-DQN episode learners
@@ -498,16 +509,17 @@ late-night-driving-rl --algorithm genetic_dqn \
 When `--checkpoint` names an existing compatible file, the full policy or
 population ancestry is restored; a clean exit saves back to that path. Use
 `--fresh` to ignore an existing file or `--no-save` to leave it unchanged.
-Driving checkpoints use semantic contract v2. Version-1 files are intentionally
-rejected because action 2 changed from hard brake to brake-then-reverse and the
-milestone/lap reward scale changed; mixing those semantics would corrupt policy
-behavior or population ranking. Start that experiment again with `--fresh`.
+Driving checkpoints use semantic contract v3. Version-2 and older files are
+intentionally rejected because the terminal contract now requires progressive
+multi-lap targets and the reward includes a bounded lap-time term. Mixing those
+transitions with one-lap returns would corrupt TD targets and population
+ranking. Start that experiment again with `--fresh`.
 
 The 1,400×760 learning dashboard is fed only by live telemetry:
 
 | Tab | Live evidence |
 |---|---|
-| Overview | Health status and alert reason, real scored cars and circuit, exact rays, green-clearance value and delta, collision recovery/pressure, proposed → executed safety actions, current and maximum lap progress, completion and near-finish evidence, end reasons, episode-origin gates, generation-wide cars-per-tick and worker count, raw return and selection fitness, observations, and Q-values |
+| Overview | Health status and alert reason, real scored cars and circuit, exact rays, green-clearance value and delta, collision recovery/pressure, proposed → executed safety actions, laps completed/required, current and maximum target progress, target finishers and near-finish evidence, end reasons, episode-origin gates, generation-wide cars-per-tick and worker count, raw return and selection fitness, observations, and Q-values |
 | Network | The current network's actual architecture, activations, parameter count, and sampled connection weights |
 | Memory | Replay readiness, update/decision ratio, clipping frequency, Q/TD scale, safety/contact rates, epsilon, action use, target synchronization, and recent learning state; pure genetic mode marks replay/gradient/TD fields `N/A` |
 
@@ -540,11 +552,13 @@ comparison clones because there is no population to display. Use
 `--no-sensors` to start with rays hidden. Pause, speed, cars, and rays are also
 clickable in the header.
 
-The yellow **RANDOM ORIGIN** gate on the track is the finish target for the
-current qualifying episode. The footer reports origin-relative
-`episode_lap_progress` and changes to **80% GRID / 20% RANDOM** after unlock.
-The network's `lap_progress` observation remains the absolute circuit coordinate,
-so telemetry never overloads one field with two meanings.
+The yellow **RANDOM ORIGIN** gate on the track closes each required loop. The
+footer reports **LAPS completed/target** and target-normalized progress, then
+changes to **80% GRID / 20% RANDOM** after the first valid loop unlocks the
+spawn mix. Per-loop `episode_lap_progress` remains distinct from cumulative
+`episode_target_progress`. The network's `lap_progress` observation remains the
+absolute circuit coordinate, so telemetry never overloads one field with two
+meanings.
 
 Visible training is time-sliced so a costly DQN update or `MAX` setting cannot
 starve input and rendering. Speed presets increase both the requested ticks and
@@ -555,10 +569,11 @@ decisions/s, worker count, and render FPS separately. Auto-configured hybrid
 members start replay learning after 96 decisions and update every fourth
 transition, producing earlier feedback with less optimizer contention than the
 old 512-step/every-tick schedule. Their population-specific epsilon schedule is
-`0.30 → 0.05` over exactly one evaluation lifetime—about 17.5% exploratory and
-82.5% greedy proposals for the default 1,800 steps—instead of restarting each
-generation near entirely random behavior. Standalone DQN and explicit
-programmatic configurations keep their own schedules. A protected elite's card
+`0.30 → 0.05` across the first per-lap allowance, then remains at `0.05` for
+the rest of a multi-lap evaluation. This makes the added endurance laps strongly
+greedy-biased instead of restarting each generation near entirely random
+behavior. Standalone DQN and explicit programmatic configurations keep their
+own schedules. A protected elite's card
 instead reads **GREEDY / frozen**, because its rollout has no epsilon exploration
 or optimizer writes. No scored transition is
 dropped or reordered, and headless training still runs exact requested batches.
@@ -574,17 +589,22 @@ four entries without a confirmed recovery end that unproductive incident;
 clean recovery clears its pressure. Track offset, slip, reversing, low
 clearance, and stagnation remain explicit costs. There is no positive
 idle/survival term; stagnation starts after 90 ticks and truncates at 240. Each
-ordered gate pays `+15`, and a valid loop earns `+300`. Telemetry exposes every
-reward term, current and maximum progress, recovery pressure, successful
-recoveries, safety interventions, the live safety penalty, raw return, selection
-fitness, and the final termination reason. Hybrid update/decision ratios count
+ordered gate pays `+15`, and every valid loop earns `+300` plus a bounded
+`[0, 150]` pace bonus. It scales an optimistic circuit-length/max-speed reference
+by the actual lap time and caps the result at 150; implausible shortcut times
+below 75% of that reference earn zero.
+Telemetry exposes every reward term, completed/required laps, current and
+maximum target progress, lap timing, target finishers, recovery pressure,
+successful recoveries, safety interventions, the live safety penalty, raw
+return, selection fitness, and the final termination reason. Hybrid
+update/decision ratios count
 only decisions from trainable children; frozen-elite driving still remains in
 environment throughput and safety rates.
 
-Within the current v2 semantic contract, a compatible 12-input tensor payload
+Within the current v3 semantic contract, a compatible 12-input tensor payload
 can still use the five-to-nine-ray shape bridge: old ray columns map onto matching
 angles while new input columns and optimizer moments begin at zero. This shape
-migration does not override the explicit rejection of pre-v2 driving semantics.
+migration does not override the explicit rejection of pre-v3 driving semantics.
 
 The race always advances at a fixed 60 simulation steps per second, regardless
 of the accelerated training setting. Drive with arrows or `WASD` and brake with

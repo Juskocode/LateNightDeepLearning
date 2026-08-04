@@ -32,6 +32,8 @@ def _evolution() -> EvolutionConfig:
         elite_count=1,
         tournament_size=2,
         evaluation_steps=8,
+        initial_lap_target=1,
+        max_lap_target=1,
         mutation_rate=0.0,
         mutation_std=0.0,
         seed=83,
@@ -39,6 +41,63 @@ def _evolution() -> EvolutionConfig:
 
 
 class DrivingGenerationDiagnosticsTests(unittest.TestCase):
+    def test_partial_laps_and_population_pace_remain_distinct_from_target_finish(self):
+        config = EvolutionConfig(
+            algorithm="genetic",
+            population_size=4,
+            elite_count=1,
+            tournament_size=2,
+            evaluation_steps=8,
+            initial_lap_target=4,
+            max_lap_target=4,
+            mutation_rate=0.0,
+            mutation_std=0.0,
+            seed=89,
+        )
+        trainer = PopulationTrainer(
+            config,
+            _dqn(),
+            auto_evolve=False,
+            parallel_workers=1,
+        )
+        self.addCleanup(trainer.close)
+        results = (
+            (1, 0.25, 30.0, 30.0),
+            (3, 0.75, 18.0, 20.0),
+        )
+        for member, (laps, progress, best_time, mean_time) in zip(
+            trainer.population,
+            results,
+        ):
+            member.result = EvaluationResult(
+                generation=0,
+                member_id=member.member_id,
+                fitness=100.0 * laps,
+                total_reward=100.0 * laps,
+                steps=8,
+                laps=laps,
+                progress=progress,
+                max_progress=progress,
+                collisions=0,
+                terminated=False,
+                truncated=True,
+                end_reason="step_limit",
+                lap_target=4,
+                lap_target_completed=False,
+                best_lap_time=best_time,
+                mean_lap_time=mean_time,
+            )
+
+        metrics = trainer._generation_metrics()
+
+        self.assertEqual(metrics["laps_completed"], 4)
+        self.assertEqual(metrics["lap_finishers"], 2)
+        self.assertEqual(metrics["lap_completion_rate"], 1.0)
+        self.assertEqual(metrics["target_finishers"], 0)
+        self.assertEqual(metrics["target_completion_rate"], 0.0)
+        self.assertEqual(metrics["best_lap_time"], 18.0)
+        self.assertAlmostEqual(metrics["mean_lap_time"], 22.5)
+
     def test_progress_and_end_reason_diagnostics_reject_malformed_values(self):
         with self.assertRaisesRegex(ValueError, "smaller than progress"):
             EvaluationResult(
@@ -82,7 +141,7 @@ class DrivingGenerationDiagnosticsTests(unittest.TestCase):
 
         cases = (
             # A recovered finisher.
-            (410.0, 1, 1.0, 1.0, 1, True, False, "lap_completed"),
+            (410.0, 1, 1.0, 1.0, 1, True, False, "lap_target_completed"),
             # A useful near-finish that should be visible instead of disappearing
             # into one scalar fitness number.
             (275.0, 0, 0.70, 0.96, 2, False, True, "collision_loop"),
@@ -118,9 +177,15 @@ class DrivingGenerationDiagnosticsTests(unittest.TestCase):
                 end_reason=reason,
                 collision_recoveries=1 if laps > 0 else 0,
                 max_progress=max_progress,
+                lap_target=1,
+                lap_target_completed=laps > 0,
+                best_lap_time=22.0 if laps > 0 else None,
+                mean_lap_time=22.0 if laps > 0 else None,
             )
             runtime.last_info = {
                 "lap_completed": laps > 0,
+                "lap_target": 1,
+                "lap_target_completed": laps > 0,
                 "truncation_reason": None if laps > 0 else reason,
                 "collision_recoveries": 1 if laps > 0 else 0,
             }
@@ -130,16 +195,22 @@ class DrivingGenerationDiagnosticsTests(unittest.TestCase):
 
         self.assertEqual(diagnostics["evaluated_members"], 4)
         self.assertEqual(diagnostics["laps_completed"], 1)
+        self.assertEqual(diagnostics["lap_target"], 1)
+        self.assertEqual(diagnostics["lap_finishers"], 1)
+        self.assertEqual(diagnostics["target_finishers"], 1)
+        self.assertAlmostEqual(diagnostics["target_completion_rate"], 0.25)
         self.assertAlmostEqual(diagnostics["lap_completion_rate"], 0.25)
         self.assertEqual(diagnostics["best_progress"], 1.0)
         self.assertAlmostEqual(diagnostics["mean_progress"], 0.69)
         self.assertEqual(diagnostics["near_finish_threshold"], 0.90)
         self.assertEqual(diagnostics["near_finish_count"], 1)
         self.assertEqual(diagnostics["collision_recoveries"], 1)
+        self.assertEqual(diagnostics["best_lap_time"], 22.0)
+        self.assertEqual(diagnostics["mean_lap_time"], 22.0)
         self.assertEqual(
             diagnostics["end_reasons"],
             {
-                "lap_completed": 1,
+                "lap_target_completed": 1,
                 "collision_loop": 1,
                 "stagnation": 1,
                 "step_limit": 1,
@@ -165,11 +236,17 @@ class DrivingGenerationDiagnosticsTests(unittest.TestCase):
         record = trainer.evolve()
         record_values = record.to_dict()
         self.assertEqual(record_values["laps_completed"], 1)
+        self.assertEqual(record_values["lap_target"], 1)
+        self.assertEqual(record_values["lap_finishers"], 1)
+        self.assertEqual(record_values["target_finishers"], 1)
+        self.assertAlmostEqual(record_values["target_completion_rate"], 0.25)
         self.assertAlmostEqual(record_values["lap_completion_rate"], 0.25)
         self.assertEqual(record_values["best_progress"], 1.0)
         self.assertAlmostEqual(record_values["mean_progress"], 0.69)
         self.assertEqual(record_values["near_finish_count"], 1)
         self.assertEqual(record_values["collision_recoveries"], 1)
+        self.assertEqual(record_values["best_lap_time"], 22.0)
+        self.assertEqual(record_values["mean_lap_time"], 22.0)
         self.assertEqual(record_values["end_reasons"], diagnostics["end_reasons"])
         self.assertEqual(trainer.telemetry()["history"][-1], record_values)
 

@@ -219,7 +219,56 @@ class PopulationRolloutManager:
                         env_snapshot["episode_lap_progress"],
                     )
                 ),
+                "episode_target_progress": float(
+                    env_snapshot.get("episode_target_progress", 0.0)
+                ),
+                "max_episode_target_progress": float(
+                    env_snapshot.get(
+                        "max_episode_target_progress",
+                        env_snapshot.get("episode_target_progress", 0.0),
+                    )
+                ),
                 "laps": int(env_snapshot["laps"]),
+                "lap_target": int(env_snapshot.get("lap_target", 1)),
+                "laps_remaining": int(env_snapshot.get("laps_remaining", 0)),
+                "lap_target_completed": bool(
+                    env_snapshot.get("lap_target_completed", False)
+                ),
+                "current_lap_time": float(
+                    env_snapshot.get("current_lap_time", 0.0)
+                ),
+                "last_lap_time": (
+                    None
+                    if env_snapshot.get("last_lap_time") is None
+                    else float(env_snapshot["last_lap_time"])
+                ),
+                "best_lap_time": (
+                    None
+                    if env_snapshot.get("best_lap_time") is None
+                    else float(env_snapshot["best_lap_time"])
+                ),
+                "episode_best_lap_time": (
+                    None
+                    if env_snapshot.get("episode_best_lap_time") is None
+                    else float(env_snapshot["episode_best_lap_time"])
+                ),
+                "episode_mean_lap_time": (
+                    None
+                    if env_snapshot.get("episode_mean_lap_time") is None
+                    else float(env_snapshot["episode_mean_lap_time"])
+                ),
+                "lap_time_reference": float(
+                    env_snapshot.get("lap_time_reference", 0.0)
+                ),
+                "lap_time_bonus": float(
+                    env_snapshot.get("lap_time_bonus", 0.0)
+                ),
+                "episode_lap_time_bonus_total": float(
+                    env_snapshot.get("episode_lap_time_bonus_total", 0.0)
+                ),
+                "lap_time_bonus_valid": bool(
+                    env_snapshot.get("lap_time_bonus_valid", False)
+                ),
                 "steps": int(env_snapshot["steps"]),
                 "episodes": rollout.episodes,
                 "random_start_curriculum": bool(
@@ -327,6 +376,53 @@ def scored_population_telemetry(
                 if member.evaluated
                 else "queued"
             )
+        result = row.get("result")
+        restored_result = result is not None and bool(row.get("pose_reset", False))
+        if result is not None:
+            # A v3 checkpoint keeps the completed scorecard, but intentionally
+            # restarts physics because poses are not checkpointed.  Never mix
+            # that reset environment's zeroed counters with the stored result.
+            result_return = float(result.total_reward)
+            result_fitness = float(result.fitness)
+            result_safety_penalty = result_return - result_fitness
+            safety["decisions"] = int(result.steps)
+            safety["interventions"] = int(result.safety_interventions)
+            safety["intervention_rate"] = (
+                int(result.safety_interventions) / max(1, int(result.steps))
+            )
+        else:
+            result_return = float(row.get("evaluation_return", 0.0))
+            result_fitness = None
+            result_safety_penalty = float(
+                row.get("safety_intervention_penalty", 0.0)
+            )
+        result_laps = (
+            int(result.laps) if result is not None else int(env_snapshot["laps"])
+        )
+        result_target = (
+            int(result.lap_target)
+            if result is not None
+            else int(env_snapshot.get("lap_target", 1))
+        )
+        result_progress = (
+            float(result.progress)
+            if result is not None
+            else float(env_snapshot.get("episode_target_progress", 0.0))
+        )
+        result_max_progress = (
+            float(
+                result.progress
+                if result.max_progress is None
+                else result.max_progress
+            )
+            if result is not None
+            else float(
+                env_snapshot.get(
+                    "max_episode_target_progress",
+                    env_snapshot.get("episode_target_progress", 0.0),
+                )
+            )
+        )
         item: dict[str, Any] = {
             "index": index,
             "member": int(member.member_id),
@@ -344,26 +440,86 @@ def scored_population_telemetry(
                     env_snapshot["episode_lap_progress"],
                 )
             ),
-            "laps": int(env_snapshot["laps"]),
-            "collisions": int(env_snapshot["collisions"]),
+            "episode_target_progress": result_progress,
+            "max_episode_target_progress": result_max_progress,
+            "laps": result_laps,
+            "lap_target": result_target,
+            "laps_remaining": max(0, result_target - result_laps),
+            "lap_target_completed": (
+                bool(result.lap_target_completed)
+                if result is not None
+                else bool(env_snapshot.get("lap_target_completed", False))
+            ),
+            "current_lap_time": float(
+                env_snapshot.get("current_lap_time", 0.0)
+            ),
+            "last_lap_time": (
+                None
+                if env_snapshot.get("last_lap_time") is None
+                else float(env_snapshot["last_lap_time"])
+            ),
+            "best_lap_time": (
+                None
+                if env_snapshot.get("best_lap_time") is None
+                else float(env_snapshot["best_lap_time"])
+            ),
+            "episode_best_lap_time": (
+                result.best_lap_time
+                if result is not None
+                else (
+                    None
+                    if env_snapshot.get("episode_best_lap_time") is None
+                    else float(env_snapshot["episode_best_lap_time"])
+                )
+            ),
+            "episode_mean_lap_time": (
+                result.mean_lap_time
+                if result is not None
+                else (
+                    None
+                    if env_snapshot.get("episode_mean_lap_time") is None
+                    else float(env_snapshot["episode_mean_lap_time"])
+                )
+            ),
+            "lap_time_reference": float(
+                env_snapshot.get("lap_time_reference", 0.0)
+            ),
+            "lap_time_bonus": float(
+                env_snapshot.get("lap_time_bonus", 0.0)
+            ),
+            "episode_lap_time_bonus_total": float(
+                result.lap_time_bonus_total
+                if result is not None
+                else env_snapshot.get("episode_lap_time_bonus_total", 0.0)
+            ),
+            "lap_time_bonus_valid": bool(
+                env_snapshot.get("lap_time_bonus_valid", False)
+            ),
+            "collisions": int(
+                result.collisions if result is not None else env_snapshot["collisions"]
+            ),
             "steps": int(row.get("evaluation_step", env_snapshot["steps"])),
             "episodes": 0,
             "status": str(status),
-            "fitness": (
-                None
-                if row.get("result") is None
-                else float(row["result"].fitness)
-            ),
-            "evaluation_return": float(row.get("evaluation_return", 0.0)),
-            "raw_return": float(
-                row.get("raw_return", row.get("evaluation_return", 0.0))
+            "pose_reset": restored_result,
+            "fitness": result_fitness,
+            "evaluation_return": result_return,
+            "raw_return": (
+                result_return
+                if result is not None
+                else float(row.get("raw_return", result_return))
             ),
             "selection_fitness": float(
-                row.get("selection_fitness", row.get("evaluation_return", 0.0))
+                result_fitness
+                if result_fitness is not None
+                else row.get("selection_fitness", result_return)
             ),
-            "safety_intervention_penalty": float(
-                row.get("safety_intervention_penalty", 0.0)
+            "safety_interventions": int(
+                result.safety_interventions
+                if result is not None
+                else safety.get("interventions", 0)
             ),
+            "safety_intervention_penalty": result_safety_penalty,
             "random_start_curriculum": bool(
                 env_snapshot["random_start_curriculum"]
             ),
@@ -403,7 +559,9 @@ def scored_population_telemetry(
                 env_snapshot.get("collision_recovery_timeout_steps", 0)
             ),
             "collision_recoveries": int(
-                env_snapshot.get("collision_recoveries", 0)
+                result.collision_recoveries
+                if result is not None
+                else env_snapshot.get("collision_recoveries", 0)
             ),
             "collision_pressure": float(
                 env_snapshot.get("collision_pressure", 0.0)
@@ -412,8 +570,16 @@ def scored_population_telemetry(
                 env_snapshot["recent_collision_entries"]
             ),
             "collision_entry_limit": int(env_snapshot["collision_entry_limit"]),
-            "collision_looped": bool(env_snapshot["collision_looped"]),
-            "truncation_reason": env_snapshot["truncation_reason"],
+            "collision_looped": bool(
+                result.end_reason == "collision_loop"
+                if result is not None
+                else env_snapshot["collision_looped"]
+            ),
+            "truncation_reason": (
+                result.end_reason
+                if result is not None and result.truncated
+                else None if result is not None else env_snapshot["truncation_reason"]
+            ),
             "reward_terms": dict(env_snapshot["reward_terms"]),
             "q_values": list(q_values),
             "observation": [float(value) for value in observation],

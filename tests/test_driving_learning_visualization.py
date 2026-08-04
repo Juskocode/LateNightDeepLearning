@@ -46,11 +46,15 @@ def learning_telemetry(env: DrivingEnv) -> dict[str, object]:
             "evaluated_members": 8,
             "laps_completed": 2,
             "lap_completion_rate": 0.25,
+            "lap_target": 2,
+            "target_finishers": 1,
+            "target_completion_rate": 0.125,
             "best_progress": 1.0,
+            "best_target_progress": 1.0,
             "mean_progress": 0.68,
             "near_finish_count": 1,
             "collision_recoveries": 3,
-            "end_reasons": {"lap_completed": 2, "collision_loop": 1},
+            "end_reasons": {"lap_target_completed": 1, "collision_loop": 1},
         },
         "population": [
             {
@@ -194,7 +198,7 @@ class DrivingLearningVisualizationTests(unittest.TestCase):
         self.assertEqual(after["current_lap_time"], before["current_lap_time"])
         rendered_labels = {key[0] for key in self.visualization._text_surfaces}
         self.assertTrue(
-            any(label.startswith("2 LAP · 100%") for label in rendered_labels)
+            any(label.startswith("1F · 2L · 100%") for label in rendered_labels)
         )
 
     def test_parallel_generation_status_is_visible_and_read_only(self):
@@ -589,6 +593,20 @@ class DrivingLearningVisualizationTests(unittest.TestCase):
             POPULATION_TRAIL_LENGTH,
         )
         self.assertEqual(self.env.telemetry(), before)
+
+    def test_restored_result_with_reset_pose_is_not_drawn_as_true_position(self):
+        rollouts = population_rollouts()
+        rollouts[0]["pose_reset"] = True
+
+        prepared = self.visualization._population_rollouts(
+            {
+                "generation": 12,
+                "population_rollout_generation": 12,
+                "population_rollouts": rollouts,
+            }
+        )
+
+        self.assertEqual([visual.member_key for visual in prepared], [1, 2])
 
     def test_clickable_training_controls_queue_stable_action_requests(self):
         telemetry = {

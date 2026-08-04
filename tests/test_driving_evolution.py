@@ -32,6 +32,8 @@ def _evolution_config(**changes):
         "elite_count": 1,
         "tournament_size": 2,
         "evaluation_steps": 1,
+        "initial_lap_target": 1,
+        "max_lap_target": 1,
         "mutation_rate": 0.0,
         "mutation_std": 0.0,
         "history_capacity": 4,
@@ -67,6 +69,64 @@ def _set_result(trainer, index, fitness):
 
 
 class DrivingEvolutionTests(unittest.TestCase):
+    def test_best_champion_compares_fitness_per_target_lap_across_stages(self):
+        trainer = PopulationTrainer(
+            _evolution_config(initial_lap_target=2, max_lap_target=5),
+            _dqn_config(),
+            auto_evolve=False,
+        )
+        self.addCleanup(trainer.close)
+        first = trainer.population[0]
+        first.result = EvaluationResult(
+            generation=0,
+            member_id=first.member_id,
+            fitness=800.0,
+            total_reward=800.0,
+            steps=3_000,
+            laps=2,
+            progress=1.0,
+            max_progress=1.0,
+            collisions=0,
+            terminated=True,
+            truncated=False,
+            lap_target=2,
+            lap_target_completed=True,
+            end_reason="lap_target_completed",
+        )
+        trainer._consider_champion(first)
+
+        trainer.generation = 1
+        trainer._current_champion = None
+        trainer._current_champion_agent = None
+        slower_longer = trainer.population[1]
+        slower_longer.result = EvaluationResult(
+            generation=1,
+            member_id=slower_longer.member_id,
+            fitness=1_500.0,
+            total_reward=1_500.0,
+            steps=8_000,
+            laps=5,
+            progress=1.0,
+            max_progress=1.0,
+            collisions=0,
+            terminated=True,
+            truncated=False,
+            lap_target=5,
+            lap_target_completed=True,
+            end_reason="lap_target_completed",
+        )
+        trainer._consider_champion(slower_longer)
+
+        self.assertEqual(
+            trainer.current_champion_snapshot.member_id,
+            slower_longer.member_id,
+        )
+        self.assertEqual(trainer.best_champion_snapshot.member_id, first.member_id)
+        self.assertEqual(
+            trainer.best_champion_snapshot.to_dict()["fitness_per_target_lap"],
+            400.0,
+        )
+
     def test_seeded_populations_are_reproducible_but_members_are_distinct(self):
         config = _evolution_config()
         first = PopulationTrainer(config, _dqn_config(), auto_evolve=False)

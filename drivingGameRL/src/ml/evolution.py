@@ -74,6 +74,8 @@ class EvolutionConfig:
     mutation_rate: float = 0.06
     mutation_std: float = 0.035
     evaluation_steps: int = 1_800
+    initial_lap_target: int = 2
+    max_lap_target: int = 5
     history_capacity: int = 256
     seed: int = 7
 
@@ -96,6 +98,15 @@ class EvolutionConfig:
         if self.tournament_size > self.population_size:
             raise ValueError("tournament_size cannot exceed population_size")
         self._positive_int("evaluation_steps", self.evaluation_steps)
+        self._positive_int("initial_lap_target", self.initial_lap_target)
+        self._positive_int("max_lap_target", self.max_lap_target)
+        if self.initial_lap_target > self.max_lap_target:
+            raise ValueError("initial_lap_target cannot exceed max_lap_target")
+        if self.max_lap_target > DrivingEnv.MAX_LAP_TARGET:
+            raise ValueError(
+                "max_lap_target cannot exceed "
+                f"DrivingEnv.MAX_LAP_TARGET ({DrivingEnv.MAX_LAP_TARGET})"
+            )
         self._positive_int("history_capacity", self.history_capacity)
         self._probability("crossover_rate", self.crossover_rate)
         self._probability("mutation_rate", self.mutation_rate)
@@ -172,6 +183,11 @@ class EvaluationResult:
     collision_recoveries: int = 0
     safety_interventions: int = 0
     max_progress: float | None = None
+    lap_target: int = 1
+    lap_target_completed: bool = False
+    best_lap_time: float | None = None
+    mean_lap_time: float | None = None
+    lap_time_bonus_total: float = 0.0
 
     def __post_init__(self) -> None:
         for name in (
@@ -183,11 +199,22 @@ class EvaluationResult:
             "training_updates",
             "collision_recoveries",
             "safety_interventions",
+            "lap_target",
         ):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise ValueError(f"{name} must be a non-negative integer")
-        for name in ("fitness", "total_reward", "progress", "mean_loss"):
+        if self.lap_target < 1 or self.lap_target > DrivingEnv.MAX_LAP_TARGET:
+            raise ValueError(
+                f"lap_target must be in [1, {DrivingEnv.MAX_LAP_TARGET}]"
+            )
+        for name in (
+            "fitness",
+            "total_reward",
+            "progress",
+            "mean_loss",
+            "lap_time_bonus_total",
+        ):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, (int, float)):
                 raise ValueError(f"{name} must be finite")
@@ -209,6 +236,29 @@ class EvaluationResult:
             self.truncated, bool
         ):
             raise ValueError("terminated and truncated must be booleans")
+        if not isinstance(self.lap_target_completed, bool):
+            raise ValueError("lap_target_completed must be a boolean")
+        if self.lap_target_completed and self.laps < self.lap_target:
+            raise ValueError(
+                "lap_target_completed requires laps to reach lap_target"
+            )
+        if self.lap_time_bonus_total < 0.0:
+            raise ValueError("lap_time_bonus_total must be non-negative")
+        for name in ("best_lap_time", "mean_lap_time"):
+            value = getattr(self, name)
+            if value is not None and (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+                or float(value) <= 0.0
+            ):
+                raise ValueError(f"{name} must be None or finite and positive")
+        if (
+            self.best_lap_time is not None
+            and self.mean_lap_time is not None
+            and self.best_lap_time > self.mean_lap_time + 1e-12
+        ):
+            raise ValueError("best_lap_time cannot exceed mean_lap_time")
         if not isinstance(self.end_reason, str) or not self.end_reason.strip():
             raise ValueError("end_reason must be a non-empty string")
 
@@ -287,6 +337,12 @@ class GenerationRecord:
     near_finish_count: int = 0
     collision_recoveries: int = 0
     end_reasons: tuple[tuple[str, int], ...] = ()
+    lap_target: int = 1
+    target_finishers: int = 0
+    target_completion_rate: float = 0.0
+    best_lap_time: float | None = None
+    mean_lap_time: float | None = None
+    lap_finishers: int = 0
 
     def __post_init__(self) -> None:
         for name in ("generation", "champion_id", "population_size"):
@@ -299,12 +355,23 @@ class GenerationRecord:
             "laps_completed",
             "near_finish_count",
             "collision_recoveries",
+            "lap_target",
+            "target_finishers",
+            "lap_finishers",
         ):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise ValueError(f"{name} must be a non-negative integer")
         if self.near_finish_count > self.population_size:
             raise ValueError("near_finish_count cannot exceed population_size")
+        if self.lap_target < 1 or self.lap_target > DrivingEnv.MAX_LAP_TARGET:
+            raise ValueError(
+                f"lap_target must be in [1, {DrivingEnv.MAX_LAP_TARGET}]"
+            )
+        if self.target_finishers > self.population_size:
+            raise ValueError("target_finishers cannot exceed population_size")
+        if self.lap_finishers > self.population_size:
+            raise ValueError("lap_finishers cannot exceed population_size")
         if not isinstance(self.elite_ids, tuple) or any(
             isinstance(value, bool) or not isinstance(value, int) or value < 0
             for value in self.elite_ids
@@ -320,16 +387,31 @@ class GenerationRecord:
             "lap_completion_rate",
             "best_progress",
             "mean_progress",
+            "target_completion_rate",
         ):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, (int, float)):
                 raise ValueError(f"{name} must be finite")
             if not math.isfinite(float(value)):
                 raise ValueError(f"{name} must be finite")
-        for name in ("lap_completion_rate", "best_progress", "mean_progress"):
+        for name in (
+            "lap_completion_rate",
+            "best_progress",
+            "mean_progress",
+            "target_completion_rate",
+        ):
             value = float(getattr(self, name))
             if not 0.0 <= value <= 1.0:
                 raise ValueError(f"{name} must be in [0, 1]")
+        for name in ("best_lap_time", "mean_lap_time"):
+            value = getattr(self, name)
+            if value is not None and (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+                or float(value) <= 0.0
+            ):
+                raise ValueError(f"{name} must be None or finite and positive")
         if not isinstance(self.end_reasons, tuple):
             raise ValueError("end_reasons must be a tuple")
         if any(
@@ -421,6 +503,9 @@ class ChampionSnapshot:
             "generation": self.generation,
             "member_id": self.member_id,
             "fitness": self.fitness,
+            "fitness_per_target_lap": (
+                self.fitness / max(1, self.result.lap_target)
+            ),
             "result": self.result.to_dict(),
         }
 
@@ -487,6 +572,7 @@ class _EvaluationRuntime:
     last_reward: float = 0.0
     last_info: dict[str, object] = field(default_factory=dict)
     safety: SensorClearanceStats = field(default_factory=SensorClearanceStats)
+    pose_reset: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -508,10 +594,9 @@ class _MemberAdvance:
 class PopulationTrainer:
     """Lockstep, multithreaded genetic population session over ``DrivingEnv``."""
 
-    # v2 binds a population to the brake/reverse and milestone-reward contract.
-    # Resuming a partially scored v1 generation would otherwise compare old
-    # rewards with new rewards inside one selection pool.
-    CHECKPOINT_VERSION = 2
+    # v3 binds a population to progressive multi-lap termination and the
+    # bounded lap-time reward. Older score pools cannot be compared safely.
+    CHECKPOINT_VERSION = 3
     GENOME_SAMPLE_LIMIT = 2_048
     MAX_WORKER_CHUNK_TICKS = 8
     NEAR_FINISH_THRESHOLD = 0.90
@@ -584,6 +669,8 @@ class PopulationTrainer:
         self.history: deque[GenerationRecord] = deque(
             maxlen=self.config.history_capacity
         )
+        self._lap_target = self.config.initial_lap_target
+        self._pending_lap_target_increase = False
 
         initial_seed = self._generation_evaluation_seed(0)
         if env is not None:
@@ -599,11 +686,14 @@ class PopulationTrainer:
             first_env = DrivingEnv(
                 circuit,
                 seed=initial_seed,
-                max_steps=max(self.config.evaluation_steps, 1),
+                max_steps=self.evaluation_step_budget,
                 random_start_curriculum=True,
+                lap_target=self._lap_target,
             )
         if not isinstance(first_env, DrivingEnv):
             raise TypeError("env_factory must return DrivingEnv instances")
+        first_env.set_lap_target(self._lap_target)
+        first_env.max_steps = self.evaluation_step_budget
 
         member_envs = [first_env]
         for _ in range(1, self.config.population_size):
@@ -620,6 +710,9 @@ class PopulationTrainer:
             raise ValueError(
                 "each population member requires an independent environment"
             )
+        for member_env in member_envs:
+            member_env.set_lap_target(self._lap_target)
+            member_env.max_steps = self.evaluation_step_budget
         self._member_envs = member_envs
         self.env = first_env
 
@@ -671,6 +764,18 @@ class PopulationTrainer:
     @property
     def algorithm(self) -> EvolutionAlgorithm:
         return self.config.algorithm
+
+    @property
+    def lap_target(self) -> int:
+        """Shared endurance target used by every member this generation."""
+
+        return self._lap_target
+
+    @property
+    def evaluation_step_budget(self) -> int:
+        """Effective evaluation budget; the configured value is per lap."""
+
+        return self.config.evaluation_steps * self._lap_target
 
     @property
     def current_member_index(self) -> int | None:
@@ -747,12 +852,21 @@ class PopulationTrainer:
                     "evaluation_step": runtime.steps,
                     "evaluation_return": runtime.total_reward,
                     "last_reward": runtime.last_reward,
+                    "laps": runtime.last_info.get("laps", runtime.env.laps),
+                    "lap_target": self._lap_target,
+                    "episode_target_progress": runtime.last_info.get(
+                        "episode_target_progress", 0.0
+                    ),
+                    "max_episode_target_progress": runtime.last_info.get(
+                        "max_episode_target_progress", 0.0
+                    ),
                     "action": safety["executed_action"],
                     "raw_action": safety["proposed_action"],
                     "executed_action": safety["executed_action"],
                     "safety_intervened": safety["intervened"],
                     "safety": safety,
                     "result": member.result,
+                    "pose_reset": runtime.pose_reset,
                 }
             )
         return tuple(rows)
@@ -826,6 +940,7 @@ class PopulationTrainer:
             self._current_champion = None
             self._current_champion_agent = None
             self._pending_curriculum_unlock = False
+            self._pending_lap_target_increase = False
         reset_seed = (
             self._generation_evaluation_seed(self.generation) if seed is None else seed
         )
@@ -976,6 +1091,11 @@ class PopulationTrainer:
                 runtime.losses.append(advance.loss)
             if bool(advance.env_result.info.get("curriculum_lap_completed", False)):
                 self._pending_curriculum_unlock = True
+            if (
+                bool(advance.env_result.info.get("lap_target_completed", False))
+                and self._lap_target < self.config.max_lap_target
+            ):
+                self._pending_lap_target_increase = True
             if advance.done:
                 result = self._finish_member(advance.index, advance)
                 completed_results.append(result)
@@ -1151,11 +1271,25 @@ class PopulationTrainer:
             for result, _ in evaluated
         ]
         laps_completed = sum(int(result.laps) for result, _ in evaluated)
-        finishers = sum(result.laps > 0 for result, _ in evaluated)
+        lap_finishers = sum(result.laps > 0 for result, _ in evaluated)
+        target_finishers = sum(
+            result.lap_target_completed for result, _ in evaluated
+        )
         near_finish_count = sum(
-            result.laps == 0 and progress >= self.NEAR_FINISH_THRESHOLD
+            not result.lap_target_completed
+            and progress >= self.NEAR_FINISH_THRESHOLD
             for (result, _), progress in zip(evaluated, progresses)
         )
+        lap_times = [
+            float(result.best_lap_time)
+            for result, _ in evaluated
+            if result.best_lap_time is not None
+        ]
+        timed_lap_totals = [
+            (float(result.mean_lap_time) * result.laps, result.laps)
+            for result, _ in evaluated
+            if result.mean_lap_time is not None and result.laps > 0
+        ]
         collision_recoveries = 0
         safety_interventions = 0
         end_reasons: dict[str, int] = {}
@@ -1167,8 +1301,10 @@ class PopulationTrainer:
             safety_interventions += int(result.safety_interventions)
             reason = result.end_reason.strip()
             if reason == "unknown":
-                if result.laps > 0 or bool(runtime.last_info.get("lap_completed")):
-                    reason = "lap_completed"
+                if result.lap_target_completed or bool(
+                    runtime.last_info.get("lap_target_completed")
+                ):
+                    reason = "lap_target_completed"
                 else:
                     raw_reason = runtime.last_info.get("truncation_reason")
                     if raw_reason:
@@ -1181,10 +1317,27 @@ class PopulationTrainer:
         return {
             "evaluated_members": count,
             "population_size": len(self.population),
+            "lap_target": self._lap_target,
             "laps_completed": laps_completed,
-            "lap_completion_rate": finishers / count if count else 0.0,
+            "lap_finishers": lap_finishers,
+            "lap_completion_rate": lap_finishers / count if count else 0.0,
+            "target_finishers": target_finishers,
+            "target_completion_rate": (
+                target_finishers / count if count else 0.0
+            ),
             "best_progress": max(progresses, default=0.0),
             "mean_progress": float(np.mean(progresses)) if progresses else 0.0,
+            "best_target_progress": max(progresses, default=0.0),
+            "mean_target_progress": (
+                float(np.mean(progresses)) if progresses else 0.0
+            ),
+            "best_lap_time": min(lap_times) if lap_times else None,
+            "mean_lap_time": (
+                sum(total for total, _ in timed_lap_totals)
+                / sum(laps for _, laps in timed_lap_totals)
+                if timed_lap_totals
+                else None
+            ),
             "near_finish_threshold": self.NEAR_FINISH_THRESHOLD,
             "near_finish_count": near_finish_count,
             "collision_recoveries": collision_recoveries,
@@ -1225,6 +1378,14 @@ class PopulationTrainer:
                 generation_metrics["collision_recoveries"]
             ),
             end_reasons=tuple(generation_metrics["end_reasons"].items()),
+            lap_target=int(generation_metrics["lap_target"]),
+            target_finishers=int(generation_metrics["target_finishers"]),
+            target_completion_rate=float(
+                generation_metrics["target_completion_rate"]
+            ),
+            best_lap_time=generation_metrics["best_lap_time"],
+            mean_lap_time=generation_metrics["mean_lap_time"],
+            lap_finishers=int(generation_metrics["lap_finishers"]),
         )
         self.history.append(record)
 
@@ -1274,6 +1435,12 @@ class PopulationTrainer:
             self._generation_curriculum_ready or self._pending_curriculum_unlock
         )
         self._pending_curriculum_unlock = False
+        if (
+            self._pending_lap_target_increase
+            and self._lap_target < self.config.max_lap_target
+        ):
+            self._lap_target += 1
+        self._pending_lap_target_increase = False
         self._start_generation_runtime()
         return record
 
@@ -1348,6 +1515,30 @@ class PopulationTrainer:
                     "observation": [float(value) for value in runtime.observation],
                     "curriculum_qualified": runtime.env.curriculum_ready,
                     "curriculum_generation_ready": (self._generation_curriculum_ready),
+                    "laps": runtime.last_info.get("laps", runtime.env.laps),
+                    "lap_target": self._lap_target,
+                    "episode_lap_progress": runtime.last_info.get(
+                        "episode_lap_progress", 0.0
+                    ),
+                    "episode_target_progress": runtime.last_info.get(
+                        "episode_target_progress", 0.0
+                    ),
+                    "max_episode_target_progress": runtime.last_info.get(
+                        "max_episode_target_progress", 0.0
+                    ),
+                    "lap_target_completed": runtime.last_info.get(
+                        "lap_target_completed", False
+                    ),
+                    "best_lap_time": runtime.last_info.get(
+                        "episode_best_lap_time"
+                    ),
+                    "mean_lap_time": runtime.last_info.get(
+                        "episode_mean_lap_time"
+                    ),
+                    "lap_time_bonus_total": runtime.last_info.get(
+                        "episode_lap_time_bonus_total", 0.0
+                    ),
+                    "pose_reset": runtime.pose_reset,
                 }
             )
             population.append(summary)
@@ -1502,9 +1693,10 @@ class PopulationTrainer:
             "current_member_index": self.current_member_index,
             "current_member_id": None if member is None else member.member_id,
             "evaluation_step": self._evaluation_steps,
-            "evaluation_steps": self.config.evaluation_steps,
+            "evaluation_steps": self.evaluation_step_budget,
+            "evaluation_steps_per_lap": self.config.evaluation_steps,
             "evaluation_progress": self._evaluation_steps
-            / self.config.evaluation_steps,
+            / self.evaluation_step_budget,
             "evaluation_return": self._evaluation_return,
             "raw_return": current_raw_return,
             "evaluation_fitness": current_selection_fitness,
@@ -1551,6 +1743,11 @@ class PopulationTrainer:
             "curriculum": {
                 "generation_ready": self._generation_curriculum_ready,
                 "pending_unlock": self._pending_curriculum_unlock,
+                "lap_target": self._lap_target,
+                "max_lap_target": self.config.max_lap_target,
+                "pending_lap_target_increase": (
+                    self._pending_lap_target_increase
+                ),
             },
             "environment": environment_snapshot,
             "health": health,
@@ -1571,6 +1768,10 @@ class PopulationTrainer:
                 "unlocked": self._generation_curriculum_ready,
                 "generation_ready": self._generation_curriculum_ready,
                 "pending_unlock": self._pending_curriculum_unlock,
+                "lap_target": self._lap_target,
+                "pending_lap_target_increase": (
+                    self._pending_lap_target_increase
+                ),
             },
             "generation": self.generation,
             "next_member_id": self._next_member_id,
@@ -1614,10 +1815,10 @@ class PopulationTrainer:
         if isinstance(version, bool) or not isinstance(version, (int, np.integer)):
             raise ValueError("population checkpoint version must be an integer")
         if int(version) != self.CHECKPOINT_VERSION:
-            if int(version) == 1:
+            if int(version) in (1, 2):
                 raise ValueError(
-                    "population checkpoint v1 uses the legacy driving action and "
-                    "reward contract; start a fresh learner with --fresh"
+                    f"population checkpoint v{int(version)} uses a legacy driving "
+                    "termination/reward contract; start a fresh learner with --fresh"
                 )
             raise ValueError("unsupported population checkpoint version")
         required = {
@@ -1829,6 +2030,12 @@ class PopulationTrainer:
             curriculum.get("unlocked", curriculum.get("ready", False)),
         )
         pending_curriculum_unlock = curriculum.get("pending_unlock", False)
+        lap_target = curriculum.get(
+            "lap_target", saved_evolution.initial_lap_target
+        )
+        pending_lap_target_increase = curriculum.get(
+            "pending_lap_target_increase", False
+        )
         if not isinstance(generation_curriculum_ready, bool):
             raise ValueError(
                 "population checkpoint curriculum readiness must be a boolean"
@@ -1837,6 +2044,25 @@ class PopulationTrainer:
             raise ValueError(
                 "population checkpoint pending curriculum state must be a boolean"
             )
+        if (
+            isinstance(lap_target, bool)
+            or not isinstance(lap_target, int)
+            or not saved_evolution.initial_lap_target
+            <= lap_target
+            <= saved_evolution.max_lap_target
+        ):
+            raise ValueError(
+                "population checkpoint lap target is outside the configured range"
+            )
+        if not isinstance(pending_lap_target_increase, bool):
+            raise ValueError(
+                "population checkpoint pending lap-target state must be a boolean"
+            )
+        for member in population:
+            if member.result is not None and member.result.lap_target != lap_target:
+                raise ValueError(
+                    "population checkpoint result lap target is incompatible"
+                )
 
         # Commit only after the complete envelope, every nested agent, history,
         # champion, RNG, and optional v1 extension has passed validation.
@@ -1870,6 +2096,8 @@ class PopulationTrainer:
         self._refresh_champions()
         self._generation_curriculum_ready = generation_curriculum_ready
         self._pending_curriculum_unlock = pending_curriculum_unlock
+        self._lap_target = lap_target
+        self._pending_lap_target_increase = pending_lap_target_increase
         # Version-one checkpoints never stored partial environment contexts.
         # Keep that portable contract: retain completed results and restart all
         # unfinished members from the generation's one common scenario seed.
@@ -1984,6 +2212,7 @@ class PopulationTrainer:
             fixed_dt=source.fixed_dt,
             max_steps=source.max_steps,
             random_start_curriculum=source.random_start_curriculum,
+            lap_target=source.lap_target,
         )
         clone.load_curriculum_state(source.curriculum_state())
         return clone
@@ -2003,9 +2232,13 @@ class PopulationTrainer:
             self._generation_evaluation_seed(self.generation) if seed is None else seed
         )
         runtimes: list[_EvaluationRuntime] = []
-        for member_env in self._member_envs:
+        for index, member_env in enumerate(self._member_envs):
+            member_env.max_steps = self.evaluation_step_budget
             member_env.load_curriculum_state(
-                {"unlocked": self._generation_curriculum_ready}
+                {
+                    "unlocked": self._generation_curriculum_ready,
+                    "lap_target": self._lap_target,
+                }
             )
             observation = member_env.reset(seed=scenario_seed)
             if len(observation) != self.dqn_config.observation_size:
@@ -2013,10 +2246,42 @@ class PopulationTrainer:
                     "DrivingEnv observation size does not match DQNConfig: "
                     f"{len(observation)} != {self.dqn_config.observation_size}"
                 )
+            restored_result = (
+                self.population[index].result if keep_evaluated else None
+            )
+            restored_info: dict[str, object] = {}
+            if restored_result is not None:
+                restored_info = {
+                    "laps": restored_result.laps,
+                    "lap_target": restored_result.lap_target,
+                    "lap_target_completed": (
+                        restored_result.lap_target_completed
+                    ),
+                    "episode_target_progress": restored_result.progress,
+                    "max_episode_target_progress": (
+                        restored_result.max_progress
+                        if restored_result.max_progress is not None
+                        else restored_result.progress
+                    ),
+                    "episode_best_lap_time": restored_result.best_lap_time,
+                    "episode_mean_lap_time": restored_result.mean_lap_time,
+                    "episode_lap_time_bonus_total": (
+                        restored_result.lap_time_bonus_total
+                    ),
+                    "end_reason": restored_result.end_reason,
+                }
             runtimes.append(
                 _EvaluationRuntime(
                     env=member_env,
                     observation=np.asarray(observation, dtype=np.float32),
+                    total_reward=(
+                        0.0
+                        if restored_result is None
+                        else restored_result.total_reward
+                    ),
+                    steps=(0 if restored_result is None else restored_result.steps),
+                    last_info=restored_info,
+                    pose_reset=restored_result is not None,
                 )
             )
         self._member_runtimes = runtimes
@@ -2146,7 +2411,7 @@ class PopulationTrainer:
             env_result = runtime.env.step(executed_action)
             next_state = np.asarray(env_result.observation, dtype=np.float32)
             completed_steps += 1
-            budget_reached = completed_steps >= self.config.evaluation_steps
+            budget_reached = completed_steps >= self.evaluation_step_budget
             done = bool(env_result.terminated or env_result.truncated or budget_reached)
             loss: float | None = None
             if dqn_training:
@@ -2192,8 +2457,10 @@ class PopulationTrainer:
         env_result = advance.env_result
         info = env_result.info
         laps = int(info.get("laps", runtime.env.laps))
-        if laps > 0 or bool(info.get("lap_completed", False)):
-            end_reason = "lap_completed"
+        lap_target = int(info.get("lap_target", self._lap_target))
+        lap_target_completed = bool(info.get("lap_target_completed", False))
+        if lap_target_completed:
+            end_reason = "lap_target_completed"
         elif info.get("truncation_reason"):
             end_reason = str(info["truncation_reason"])
         elif advance.budget_reached:
@@ -2220,11 +2487,15 @@ class PopulationTrainer:
             total_reward=float(runtime.total_reward),
             steps=runtime.steps,
             laps=laps,
-            # Random-origin episodes report absolute circuit position as
-            # ``progress`` and distance travelled from their own origin as
-            # ``episode_lap_progress``. Fitness summaries must use the latter so a
-            # late-track spawn is not mistaken for a nearly completed loop.
-            progress=float(info.get("episode_lap_progress", info.get("progress", 0.0))),
+            # Target-wide progress includes completed loops and the current
+            # partial loop, so a 2/3-lap failure remains visible without being
+            # mislabeled as a finish.
+            progress=float(
+                info.get(
+                    "episode_target_progress",
+                    info.get("episode_lap_progress", info.get("progress", 0.0)),
+                )
+            ),
             collisions=int(runtime.env.collisions),
             terminated=bool(env_result.terminated),
             truncated=bool(env_result.truncated or advance.budget_reached),
@@ -2235,9 +2506,27 @@ class PopulationTrainer:
             safety_interventions=safety_interventions,
             max_progress=float(
                 info.get(
-                    "max_episode_lap_progress",
-                    info.get("episode_lap_progress", info.get("progress", 0.0)),
+                    "max_episode_target_progress",
+                    info.get(
+                        "episode_target_progress",
+                        info.get("episode_lap_progress", info.get("progress", 0.0)),
+                    ),
                 )
+            ),
+            lap_target=lap_target,
+            lap_target_completed=lap_target_completed,
+            best_lap_time=(
+                None
+                if info.get("episode_best_lap_time") is None
+                else float(info["episode_best_lap_time"])
+            ),
+            mean_lap_time=(
+                None
+                if info.get("episode_mean_lap_time") is None
+                else float(info["episode_mean_lap_time"])
+            ),
+            lap_time_bonus_total=float(
+                info.get("episode_lap_time_bonus_total", 0.0)
             ),
         )
         member.result = result
@@ -2272,11 +2561,26 @@ class PopulationTrainer:
             )
 
     @staticmethod
-    def _better(candidate: ChampionSnapshot, current: ChampionSnapshot | None) -> bool:
-        return current is None or (candidate.fitness, -candidate.member_id) > (
-            current.fitness,
-            -current.member_id,
+    def _champion_rank(snapshot: ChampionSnapshot) -> tuple[float, bool, int, int]:
+        """Compare policies fairly across progressively longer targets."""
+
+        result = snapshot.result
+        return (
+            float(snapshot.fitness) / max(1, result.lap_target),
+            result.lap_target_completed,
+            result.lap_target,
+            -snapshot.member_id,
         )
+
+    @classmethod
+    def _better(
+        cls,
+        candidate: ChampionSnapshot,
+        current: ChampionSnapshot | None,
+    ) -> bool:
+        return current is None or cls._champion_rank(
+            candidate
+        ) > cls._champion_rank(current)
 
     def _refresh_champions(self) -> None:
         for member in self.population:

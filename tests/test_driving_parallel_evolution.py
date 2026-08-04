@@ -24,6 +24,8 @@ def _evolution(**changes) -> EvolutionConfig:
         "elite_count": 1,
         "tournament_size": 2,
         "evaluation_steps": 3,
+        "initial_lap_target": 1,
+        "max_lap_target": 1,
         "mutation_rate": 0.0,
         "mutation_std": 0.0,
         "seed": 101,
@@ -544,8 +546,11 @@ class DrivingParallelEvolutionTests(unittest.TestCase):
                     truncated=False,
                     info={
                         "curriculum_lap_completed": item == 0,
+                        "lap_target": 1,
+                        "lap_target_completed": item == 0,
                         "laps": 1 if item == 0 else 0,
                         "episode_lap_progress": 1.0 if item == 0 else 0.0,
+                        "episode_target_progress": 1.0 if item == 0 else 0.0,
                     },
                 )
 

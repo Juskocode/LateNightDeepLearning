@@ -98,6 +98,9 @@ class DrivingEnv:
     LAP_CHECKPOINTS = (0.25, 0.50, 0.75)
     ORDERED_CHECKPOINT_REWARD = 15.0
     LAP_COMPLETION_REWARD = 300.0
+    LAP_TIME_BONUS_MAX = 150.0
+    LAP_TIME_MINIMUM_RATIO = 0.75
+    MAX_LAP_TARGET = 12
     MAX_LAP_PROGRESS_STEP = 0.075
     BEST_LAP_EPSILON = 1e-9
     SENSOR_MAX_DISTANCE = 150.0
@@ -177,6 +180,7 @@ class DrivingEnv:
         fixed_dt: float = 1.0 / 60.0,
         max_steps: int = 60 * 180,
         random_start_curriculum: bool = False,
+        lap_target: int = 1,
     ):
         if not 0.0 < fixed_dt <= 0.1:
             raise ValueError("fixed_dt must be in the (0, 0.1] interval")
@@ -184,6 +188,7 @@ class DrivingEnv:
             raise ValueError("max_steps must be a positive integer")
         if not isinstance(random_start_curriculum, bool):
             raise ValueError("random_start_curriculum must be a boolean")
+        self._validate_lap_target(lap_target)
         self.circuit = get_circuit(circuit) if isinstance(circuit, str) else circuit
         self.vehicle = Vehicle(build)
         self.fixed_dt = fixed_dt
@@ -191,18 +196,26 @@ class DrivingEnv:
         self.random = random.Random(seed)
         self.seed = seed
         self.random_start_curriculum = random_start_curriculum
+        self._lap_target = lap_target
         self._curriculum_unlocked = False
         self._spawn_mode = "start_line"
         self._spawn_progress = 0.0
         self._lap_origin_progress = 0.0
         self._episode_lap_progress = 0.0
         self._max_episode_lap_progress = 0.0
+        self._episode_target_progress = 0.0
+        self._max_episode_target_progress = 0.0
         self._last_curriculum_lap_completed = False
+        self._last_lap_target_completed = False
         self.steps = 0
         self.laps = 0
         self.collisions = 0
         self.current_lap_time = 0.0
         self.last_lap_time: float | None = None
+        self._episode_lap_times: list[float] = []
+        self._episode_lap_time_bonus_total = 0.0
+        self._last_lap_time_bonus = 0.0
+        self._last_lap_time_bonus_valid = False
         self._best_laps: dict[str, LapRecord] = {}
         self._current_lap_trajectory: list[LapPose] = []
         self._record_interval = fixed_dt
@@ -286,7 +299,14 @@ class DrivingEnv:
         self._lap_origin_progress = self.last_projection.progress
         self._episode_lap_progress = 0.0
         self._max_episode_lap_progress = 0.0
+        self._episode_target_progress = 0.0
+        self._max_episode_target_progress = 0.0
         self._last_curriculum_lap_completed = False
+        self._last_lap_target_completed = False
+        self._episode_lap_times = []
+        self._episode_lap_time_bonus_total = 0.0
+        self._last_lap_time_bonus = 0.0
+        self._last_lap_time_bonus_valid = False
         self.last_reward_terms = {}
         self._reset_lap_recording()
         self._usable_clearance, self._green_ray_fraction = self._clearance_snapshot(
@@ -316,6 +336,56 @@ class DrivingEnv:
 
         return self.NORMAL_START_PROBABILITY
 
+    @classmethod
+    def _validate_lap_target(cls, value: object) -> int:
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or not 1 <= value <= cls.MAX_LAP_TARGET
+        ):
+            raise ValueError(
+                f"lap_target must be an integer in [1, {cls.MAX_LAP_TARGET}]"
+            )
+        return value
+
+    @property
+    def lap_target(self) -> int:
+        """Number of valid loops required to finish a learning evaluation."""
+
+        return self._lap_target
+
+    def set_lap_target(self, value: int) -> None:
+        """Set the target at an episode or generation barrier.
+
+        The method deliberately does not reset the car so session owners can
+        update the target and timeout atomically before their next ``reset``.
+        """
+
+        self._lap_target = self._validate_lap_target(value)
+
+    @property
+    def lap_time_reference(self) -> float:
+        """Optimistic center-line time used to normalize the pace bonus."""
+
+        return self.circuit.length / max(1.0, self.vehicle.build.max_speed)
+
+    def lap_time_bonus(self, duration: float) -> tuple[float, bool]:
+        """Return a bounded bonus for one physically plausible valid lap."""
+
+        if (
+            isinstance(duration, bool)
+            or not isinstance(duration, (int, float))
+            or not math.isfinite(float(duration))
+            or float(duration) <= 0.0
+        ):
+            raise ValueError("lap duration must be finite and positive")
+        duration = float(duration)
+        reference = self.lap_time_reference
+        if duration + 1e-12 < reference * self.LAP_TIME_MINIMUM_RATIO:
+            return 0.0, False
+        bonus = self.LAP_TIME_BONUS_MAX * clamp(reference / duration, 0.0, 1.0)
+        return bonus, True
+
     @property
     def spawn_mode(self) -> str:
         return self._spawn_mode
@@ -328,10 +398,13 @@ class DrivingEnv:
     def lap_origin_progress(self) -> float:
         return self._lap_origin_progress
 
-    def curriculum_state(self) -> dict[str, bool]:
+    def curriculum_state(self) -> dict[str, object]:
         """Return the small persistent state needed by checkpoints/clones."""
 
-        return {"unlocked": self._curriculum_unlocked}
+        return {
+            "unlocked": self._curriculum_unlocked,
+            "lap_target": self._lap_target,
+        }
 
     def load_curriculum_state(self, state: Mapping[str, object]) -> None:
         """Restore curriculum progress without changing the current episode.
@@ -347,7 +420,11 @@ class DrivingEnv:
         value = state.get("unlocked", state.get("ready", False))
         if not isinstance(value, bool):
             raise ValueError("curriculum unlocked state must be a boolean")
+        lap_target = self._validate_lap_target(
+            state.get("lap_target", self._lap_target)
+        )
         self._curriculum_unlocked = value
+        self._lap_target = lap_target
 
     @property
     def best_lap_record(self) -> LapRecord | None:
@@ -780,10 +857,19 @@ class DrivingEnv:
             and self._next_lap_checkpoint == len(self.LAP_CHECKPOINTS)
             and self._lap_progress >= 1.0 - 1e-9
         )
+        lap_time_bonus = 0.0
+        lap_time_bonus_valid = False
         if lap_completed:
             self._record_lap_pose(force=True)
             self.laps += 1
             self.last_lap_time = self.current_lap_time
+            self._episode_lap_times.append(self.last_lap_time)
+            lap_time_bonus, lap_time_bonus_valid = self.lap_time_bonus(
+                self.last_lap_time
+            )
+            self._episode_lap_time_bonus_total += lap_time_bonus
+            self._last_lap_time_bonus = lap_time_bonus
+            self._last_lap_time_bonus_valid = lap_time_bonus_valid
             previous_best = self.best_lap_record
             if self._spawn_mode == "start_line" and (
                 previous_best is None
@@ -811,15 +897,32 @@ class DrivingEnv:
                 self._record_lap_pose()
 
         curriculum_lap_completed = self.random_start_curriculum and lap_completed
+        lap_target_completed = (
+            curriculum_lap_completed and self.laps >= self._lap_target
+        )
         episode_lap_progress = 1.0 if lap_completed else self._lap_progress
         self._episode_lap_progress = episode_lap_progress
         self._max_episode_lap_progress = max(
             self._max_episode_lap_progress,
             episode_lap_progress,
         )
+        self._episode_target_progress = clamp(
+            (
+                self.laps
+                + (0.0 if lap_completed else self._lap_progress)
+            )
+            / self._lap_target,
+            0.0,
+            1.0,
+        )
+        self._max_episode_target_progress = max(
+            self._max_episode_target_progress,
+            self._episode_target_progress,
+        )
         if curriculum_lap_completed:
             self._curriculum_unlocked = True
         self._last_curriculum_lap_completed = curriculum_lap_completed
+        self._last_lap_target_completed = lap_target_completed
 
         reward_progress = (
             delta_progress if abs(delta_progress) <= self.MAX_LAP_PROGRESS_STEP else 0.0
@@ -986,6 +1089,7 @@ class DrivingEnv:
                 else 0.0
             ),
             "lap": self.LAP_COMPLETION_REWARD if lap_completed else 0.0,
+            "lap_time": lap_time_bonus if lap_completed else 0.0,
         }
         reward = sum(reward_terms.values())
         self.last_reward_terms = reward_terms
@@ -1014,13 +1118,34 @@ class DrivingEnv:
             "progress": after.progress,
             "episode_lap_progress": episode_lap_progress,
             "max_episode_lap_progress": self._max_episode_lap_progress,
+            "episode_target_progress": self._episode_target_progress,
+            "max_episode_target_progress": self._max_episode_target_progress,
             "laps": self.laps,
+            "lap_target": self._lap_target,
+            "laps_remaining": max(0, self._lap_target - self.laps),
             "lap_completed": lap_completed,
+            "lap_target_completed": lap_target_completed,
             "checkpoint_advanced": ordered_checkpoint_advanced,
             "next_lap_checkpoint": self._next_lap_checkpoint,
             "current_lap_time": self.current_lap_time,
             "last_lap_time": self.last_lap_time,
             "best_lap_time": self.best_lap_time,
+            "episode_best_lap_time": (
+                min(self._episode_lap_times) if self._episode_lap_times else None
+            ),
+            "episode_mean_lap_time": (
+                sum(self._episode_lap_times) / len(self._episode_lap_times)
+                if self._episode_lap_times
+                else None
+            ),
+            "lap_time_reference": self.lap_time_reference,
+            "lap_time_bonus": lap_time_bonus if lap_completed else 0.0,
+            "episode_lap_time_bonus_total": (
+                self._episode_lap_time_bonus_total
+            ),
+            "lap_time_bonus_valid": (
+                lap_time_bonus_valid if lap_completed else False
+            ),
             "lap_candidate_valid": self._lap_candidate_armed,
             "lap_origin_progress": self._lap_origin_progress,
             "random_start_curriculum": self.random_start_curriculum,
@@ -1071,7 +1196,7 @@ class DrivingEnv:
             "telemetry": telemetry,
         }
         return StepResult(
-            self.observation(), reward, curriculum_lap_completed, truncated, info
+            self.observation(), reward, lap_target_completed, truncated, info
         )
 
     def change_circuit(self, name: str) -> tuple[float, ...]:
@@ -1091,17 +1216,36 @@ class DrivingEnv:
             "circuit": self.circuit.slug,
             "steps": self.steps,
             "laps": self.laps,
+            "lap_target": self._lap_target,
+            "laps_remaining": max(0, self._lap_target - self.laps),
             "current_lap_time": self.current_lap_time,
             "last_lap_time": self.last_lap_time,
             "best_lap_time": self.best_lap_time,
+            "episode_best_lap_time": (
+                min(self._episode_lap_times) if self._episode_lap_times else None
+            ),
+            "episode_mean_lap_time": (
+                sum(self._episode_lap_times) / len(self._episode_lap_times)
+                if self._episode_lap_times
+                else None
+            ),
+            "lap_time_reference": self.lap_time_reference,
+            "lap_time_bonus": self._last_lap_time_bonus,
+            "episode_lap_time_bonus_total": (
+                self._episode_lap_time_bonus_total
+            ),
+            "lap_time_bonus_valid": self._last_lap_time_bonus_valid,
             "lap_candidate_valid": self._lap_candidate_armed,
             "episode_lap_progress": self._episode_lap_progress,
             "max_episode_lap_progress": self._max_episode_lap_progress,
+            "episode_target_progress": self._episode_target_progress,
+            "max_episode_target_progress": self._max_episode_target_progress,
             "lap_origin_progress": self._lap_origin_progress,
             "random_start_curriculum": self.random_start_curriculum,
             "curriculum_unlocked": self._curriculum_unlocked,
             "curriculum_ready": self._curriculum_unlocked,
             "curriculum_lap_completed": self._last_curriculum_lap_completed,
+            "lap_target_completed": self._last_lap_target_completed,
             "normal_start_probability": self.NORMAL_START_PROBABILITY,
             "spawn_mode": self._spawn_mode,
             "spawn_progress": self._spawn_progress,

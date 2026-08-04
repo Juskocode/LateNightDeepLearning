@@ -15,6 +15,7 @@ from drivingGameRL.src.learning_runtime import (
 )
 from drivingGameRL.src.environment import DrivingEnv
 from drivingGameRL.src.ml import DQNConfig
+from drivingGameRL.src.ml.evolution import EvaluationResult
 from drivingGameRL.src.population_rollout import PopulationRolloutManager
 
 
@@ -23,6 +24,7 @@ def _tiny_session(
     population_size: int = 4,
     evaluation_steps: int = 8,
     algorithm: str = "genetic_dqn",
+    lap_target: int = 1,
 ):
     return DrivingLearningSession(
         LearningRuntimeConfig(
@@ -33,6 +35,8 @@ def _tiny_session(
             population_size=population_size,
             elite_count=1,
             tournament_size=2,
+            initial_lap_target=lap_target,
+            max_lap_target=lap_target,
         ),
         dqn_config=DQNConfig(
             hidden_sizes=(8,),
@@ -64,6 +68,73 @@ def _assert_nested_equal(test: unittest.TestCase, before, after) -> None:
 
 
 class PopulationRolloutManagerTests(unittest.TestCase):
+    def test_restored_evaluated_car_uses_result_summary_over_reset_pose(self):
+        source = _tiny_session(
+            population_size=2,
+            algorithm="genetic",
+            lap_target=2,
+        )
+        self.addCleanup(source.close)
+        trainer = source._population_trainer
+        member = trainer.population[0]
+        member.result = EvaluationResult(
+            generation=0,
+            member_id=member.member_id,
+            fitness=718.5,
+            total_reward=720.0,
+            steps=2_700,
+            laps=1,
+            progress=0.72,
+            max_progress=0.88,
+            collisions=3,
+            terminated=False,
+            truncated=True,
+            end_reason="collision_loop",
+            collision_recoveries=2,
+            safety_interventions=30,
+            lap_target=2,
+            lap_target_completed=False,
+            best_lap_time=19.0,
+            mean_lap_time=19.0,
+            lap_time_bonus_total=74.0,
+        )
+        trainer._environment_decisions = member.result.steps
+        checkpoint = trainer.state_dict()
+
+        restored = _tiny_session(
+            population_size=2,
+            algorithm="genetic",
+            lap_target=2,
+        )
+        self.addCleanup(restored.close)
+        restored._population_trainer.load_state_dict(checkpoint)
+        snapshots = PopulationRolloutManager(restored).telemetry(
+            include_rays=False
+        )
+
+        evaluated, active = snapshots
+        self.assertTrue(evaluated["pose_reset"])
+        self.assertEqual(evaluated["status"], "evaluated")
+        self.assertEqual(evaluated["laps"], 1)
+        self.assertEqual(evaluated["lap_target"], 2)
+        self.assertFalse(evaluated["lap_target_completed"])
+        self.assertEqual(evaluated["episode_target_progress"], 0.72)
+        self.assertEqual(evaluated["max_episode_target_progress"], 0.88)
+        self.assertEqual(evaluated["episode_best_lap_time"], 19.0)
+        self.assertEqual(evaluated["episode_lap_time_bonus_total"], 74.0)
+        self.assertEqual(evaluated["collisions"], 3)
+        self.assertEqual(evaluated["collision_recoveries"], 2)
+        self.assertEqual(evaluated["safety_interventions"], 30)
+        self.assertEqual(evaluated["safety"]["interventions"], 30)
+        self.assertAlmostEqual(evaluated["safety_intervention_penalty"], 1.5)
+        self.assertEqual(evaluated["evaluation_return"], 720.0)
+        self.assertEqual(evaluated["raw_return"], 720.0)
+        self.assertEqual(evaluated["selection_fitness"], 718.5)
+        self.assertEqual(evaluated["truncation_reason"], "collision_loop")
+        self.assertTrue(evaluated["collision_looped"])
+        self.assertFalse(active["pose_reset"])
+        self.assertEqual(active["status"], "evaluating")
+
     def test_bounds_real_scored_members_in_population_order(self):
         session = _tiny_session(population_size=4)
         manager = PopulationRolloutManager(session, max_cars=3)

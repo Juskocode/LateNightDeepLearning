@@ -63,6 +63,8 @@ class DrivingLearningSessionTests(unittest.TestCase):
                 population_size=2,
                 elite_count=1,
                 evaluation_steps=900,
+                initial_lap_target=1,
+                max_lap_target=1,
                 seed=3,
             )
         )
@@ -73,6 +75,8 @@ class DrivingLearningSessionTests(unittest.TestCase):
                 population_size=2,
                 elite_count=1,
                 evaluation_steps=900,
+                initial_lap_target=1,
+                max_lap_target=1,
                 seed=3,
             ),
             dqn_config=explicit_config,
@@ -135,6 +139,8 @@ class DrivingLearningSessionTests(unittest.TestCase):
                 population_size=2,
                 elite_count=1,
                 evaluation_steps=900,
+                initial_lap_target=1,
+                max_lap_target=1,
                 seed=101,
             )
         )
@@ -168,6 +174,8 @@ class DrivingLearningSessionTests(unittest.TestCase):
                 population_size=2,
                 elite_count=1,
                 evaluation_steps=3,
+                initial_lap_target=1,
+                max_lap_target=1,
                 seed=103,
             )
         )
@@ -237,6 +245,8 @@ class DrivingLearningSessionTests(unittest.TestCase):
             population_size=2,
             elite_count=1,
             parallel_workers=2,
+            initial_lap_target=1,
+            max_lap_target=1,
             seed=109,
         )
         source = DrivingLearningSession(config)
@@ -281,6 +291,8 @@ class DrivingLearningSessionTests(unittest.TestCase):
                 elite_count=1,
                 tournament_size=2,
                 parallel_workers=4,
+                initial_lap_target=1,
+                max_lap_target=1,
                 seed=8,
             ),
             dqn_config=tiny_dqn(seed=8),
@@ -304,6 +316,8 @@ class DrivingLearningSessionTests(unittest.TestCase):
                 evaluation_steps=2,
                 population_size=2,
                 elite_count=1,
+                initial_lap_target=1,
+                max_lap_target=1,
                 seed=13,
             ),
             dqn_config=tiny_dqn(),
@@ -320,6 +334,11 @@ class DrivingLearningSessionTests(unittest.TestCase):
         self.assertEqual(len(telemetry["q_values"]), 5)
         self.assertEqual(telemetry["network"]["architecture"], [16, 8, 5])
         self.assertEqual(telemetry["replay_size"], 2)
+        episode = telemetry["generation_history"][0]
+        self.assertEqual(episode["lap_target"], 1)
+        self.assertEqual(episode["laps_completed"], 0)
+        self.assertEqual(episode["target_finishers"], 0)
+        self.assertIn("best_target_progress", episode)
 
     def test_pure_genetic_population_evolves_after_one_lockstep_tick(self):
         session = DrivingLearningSession(
@@ -329,6 +348,8 @@ class DrivingLearningSessionTests(unittest.TestCase):
                 population_size=2,
                 elite_count=1,
                 tournament_size=2,
+                initial_lap_target=1,
+                max_lap_target=1,
                 seed=5,
             ),
             dqn_config=tiny_dqn(seed=5),
@@ -344,6 +365,15 @@ class DrivingLearningSessionTests(unittest.TestCase):
         self.assertEqual(session.completed_generations, 1)
         self.assertEqual(len(telemetry["population"]), 2)
         self.assertEqual(len(telemetry["generation_history"]), 1)
+        history = telemetry["generation_history"][0]
+        self.assertEqual(history["lap_target"], 1)
+        self.assertEqual(history["lap_finishers"], 0)
+        self.assertEqual(history["target_finishers"], 0)
+        self.assertEqual(history["target_completion_rate"], 0.0)
+        self.assertIn("best_target_progress", history)
+        self.assertIn("mean_target_progress", history)
+        self.assertIn("best_lap_time", history)
+        self.assertIn("mean_lap_time", history)
         self.assertEqual(telemetry["gradient_steps"], 0)
 
     def test_hybrid_population_performs_real_td_learning(self):
@@ -353,6 +383,8 @@ class DrivingLearningSessionTests(unittest.TestCase):
                 evaluation_steps=2,
                 population_size=2,
                 elite_count=1,
+                initial_lap_target=1,
+                max_lap_target=1,
                 seed=9,
             ),
             dqn_config=tiny_dqn(seed=9),

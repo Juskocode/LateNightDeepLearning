@@ -484,6 +484,8 @@ class SensorClearanceIntegrationTests(unittest.TestCase):
                 elite_count=1,
                 tournament_size=2,
                 evaluation_steps=1,
+                initial_lap_target=1,
+                max_lap_target=1,
                 seed=35,
             ),
             _tiny_dqn(seed=35),

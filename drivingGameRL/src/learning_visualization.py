@@ -848,6 +848,11 @@ class DrivingLearningVisualization:
         prepared: list[tuple[int, int, _PopulationVisual]] = []
         for ordinal, candidate in enumerate(raw):
             rollout = _mapping(candidate)
+            # Completed checkpoint rows retain their scorecards but not their
+            # terminal physics poses.  Suppress the reset placeholder rather
+            # than drawing it as a misleading "true pose" on the circuit.
+            if _flag(rollout.get("pose_reset")):
+                continue
             if (
                 not rollout
                 or _point(rollout.get("position", rollout.get("pos"))) is None
@@ -1086,25 +1091,38 @@ class DrivingLearningVisualization:
             2 if selected else 1,
             border_radius=4,
         )
-        progress = max(
+        target_progress = max(
             0.0,
             min(
                 1.0,
                 _finite(
                     visual.rollout.get(
-                        "max_episode_lap_progress",
+                        "max_episode_target_progress",
                         visual.rollout.get(
-                            "episode_lap_progress",
-                            visual.rollout.get("progress"),
+                            "episode_target_progress",
+                            visual.rollout.get(
+                                "max_episode_lap_progress",
+                                visual.rollout.get("episode_lap_progress"),
+                            ),
                         ),
                     )
                 ),
             ),
         )
+        laps = max(0, _integer(visual.rollout.get("laps")))
+        lap_target = max(1, _integer(visual.rollout.get("lap_target"), 1))
         state_label = (
             "REC"
             if _flag(visual.rollout.get("collision_recovery_active"))
-            else f"{progress * 100:.0f}%"
+            else (
+                "DONE"
+                if _flag(visual.rollout.get("lap_target_completed"))
+                or target_progress >= 1.0
+                else (
+                    f"{min(laps, lap_target)}/{lap_target}·"
+                    f"{target_progress * 100:.0f}%"
+                )
+            )
         )
         text = self._render_text(
             f"{visual.label} {state_label}",
@@ -1165,8 +1183,10 @@ class DrivingLearningVisualization:
             )
             action = _integer(visual.rollout.get("action"), -1)
             action_text = f"A{action}" if action >= 0 else "--"
+            laps = max(0, _integer(visual.rollout.get("laps")))
+            lap_target = max(1, _integer(visual.rollout.get("lap_target"), 1))
             self._text(
-                f"{visual.label} {action_text}",
+                f"{visual.label} {action_text} {min(laps, lap_target)}/{lap_target}",
                 (chip.x + 16, chip.y + 3),
                 size=8,
                 color=visual.color,
@@ -1224,7 +1244,7 @@ class DrivingLearningVisualization:
                 round(sum(entry[1][0] for entry in cluster) / len(cluster)),
                 round(sum(entry[1][1] for entry in cluster) / len(cluster)),
             )
-            callout_width, callout_height, gap = 66, 18, 3
+            callout_width, callout_height, gap = 82, 18, 3
             total_height = len(cluster) * (callout_height + gap) - gap
             use_right = cluster_center[0] + callout_width + 34 <= viewport.right
             callout_x = (
@@ -1629,30 +1649,61 @@ class DrivingLearningVisualization:
             if selected_safety:
                 clearance_data["safety_prior"] = selected_safety
         self._draw_clearance_hud(viewport, clearance_data)
-        terrain = str(snapshot.get("terrain", "unknown")).replace("_", " ").upper()
-        if _flag(snapshot.get("random_start_curriculum")):
-            loop_progress = max(
-                0.0, min(1.0, _finite(snapshot.get("episode_lap_progress")))
+        track_snapshot = dict(snapshot)
+        if isinstance(selected, Mapping):
+            track_snapshot.update(selected)
+        terrain = (
+            str(track_snapshot.get("terrain", "unknown"))
+            .replace("_", " ")
+            .upper()
+        )
+        if _flag(track_snapshot.get("random_start_curriculum")):
+            laps = max(0, _integer(track_snapshot.get("laps")))
+            lap_target = max(1, _integer(track_snapshot.get("lap_target"), 1))
+            target_progress = max(
+                0.0,
+                min(
+                    1.0,
+                    _finite(
+                        track_snapshot.get(
+                            "episode_target_progress",
+                            track_snapshot.get("episode_lap_progress"),
+                        )
+                    ),
+                ),
             )
             spawn = (
                 "RANDOM ORIGIN"
-                if str(snapshot.get("spawn_mode")) == "random_track"
+                if str(track_snapshot.get("spawn_mode")) == "random_track"
                 else "GRID ORIGIN"
             )
             curriculum = (
                 "80% GRID / 20% RANDOM"
-                if _flag(snapshot.get("curriculum_unlocked"))
+                if _flag(track_snapshot.get("curriculum_unlocked"))
                 else "RANDOM QUALIFIER"
             )
+            episode_best_time = _finite(
+                track_snapshot.get("episode_best_lap_time")
+            )
+            pace_bonus = _finite(
+                track_snapshot.get("episode_lap_time_bonus_total")
+            )
+            pace = (
+                f"   ·   BEST {episode_best_time:05.2f}s / +{pace_bonus:.0f}"
+                if episode_best_time > 0.0
+                else ""
+            )
             footer = (
-                f"{env.circuit.name.upper()}   ·   LOOP {loop_progress * 100:05.1f}%"
-                f"   ·   {spawn}   ·   {curriculum}"
+                f"{env.circuit.name.upper()}   ·   LAPS "
+                f"{min(laps, lap_target)}/{lap_target}   ·   "
+                f"TARGET {target_progress * 100:05.1f}%   ·   {spawn}   ·   "
+                f"{curriculum}{pace}"
             )
         else:
             footer = (
                 f"{env.circuit.name.upper()}   ·   {terrain}   ·   "
-                f"{_finite(snapshot.get('speed')):05.1f} U/S   ·   "
-                f"LAP {_integer(snapshot.get('laps')) + 1}"
+                f"{_finite(track_snapshot.get('speed')):05.1f} U/S   ·   "
+                f"LAP {_integer(track_snapshot.get('laps')) + 1}"
             )
         label_surface = self._render_text(
             footer, size=11, color=COLORS["text"], bold=True
@@ -2113,15 +2164,51 @@ class DrivingLearningVisualization:
         completed_laps = max(
             0, _integer(generation_metrics.get("laps_completed"))
         )
-        best_progress = max(
+        lap_target = max(
+            1,
+            _integer(
+                generation_metrics.get("lap_target", data.get("lap_target", 1)),
+                1,
+            ),
+        )
+        target_finishers = max(
+            0, _integer(generation_metrics.get("target_finishers"))
+        )
+        best_target_progress = max(
             0.0,
-            min(1.0, _finite(generation_metrics.get("best_progress"))),
+            min(
+                1.0,
+                _finite(
+                    generation_metrics.get(
+                        "best_target_progress",
+                        generation_metrics.get("best_progress"),
+                    )
+                ),
+            ),
         )
-        progress_detail = (
-            f"{completed_laps} LAP · {best_progress * 100:.0f}% BEST"
-            if generation_metrics
-            else f"best {_compact_number(_finite(data.get('best_fitness', fitness)))}"
-        )
+        if generation_metrics:
+            best_lap_time = _finite(generation_metrics.get("best_lap_time"))
+            lap_time_detail = (
+                f" · {best_lap_time:.1f}s" if best_lap_time > 0.0 else ""
+            )
+            progress_detail = (
+                f"{target_finishers}F · {completed_laps}L · "
+                f"{best_target_progress * 100:.0f}%{lap_time_detail}"
+            )
+        elif "lap_target" in data:
+            live_laps = max(0, _integer(data.get("laps")))
+            live_target_progress = max(
+                0.0,
+                min(1.0, _finite(data.get("episode_target_progress"))),
+            )
+            progress_detail = (
+                f"LAPS {min(live_laps, lap_target)}/{lap_target} · "
+                f"{live_target_progress * 100:.0f}%"
+            )
+        else:
+            progress_detail = (
+                f"best {_compact_number(_finite(data.get('best_fitness', fitness)))}"
+            )
         epsilon = _finite(data.get("epsilon"))
         epsilon_schedule = _mapping(data.get("epsilon_schedule"))
         exploration_enabled = _flag(epsilon_schedule.get("enabled", True))
